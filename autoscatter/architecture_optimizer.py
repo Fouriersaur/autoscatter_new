@@ -863,7 +863,7 @@ class Architecture_Optimizer():
         
         self.valid_combinations = cleaned_valid_combinations
 
-    def perform_depth_first_search(self):
+    def perform_breadth_first_search(self):
         print('prepare list of all possible graphs')
         self.prepare_all_possible_combinations()
         print('%i graphs identified'%len(self.list_of_upper_triangular_coupling_matrices))

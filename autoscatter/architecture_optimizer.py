@@ -867,7 +867,7 @@ class Architecture_Optimizer():
         print('prepare list of all possible graphs')
         self.prepare_all_possible_combinations()
         print('%i graphs identified'%len(self.list_of_upper_triangular_coupling_matrices))
-        print('start depth-first search')
+        print('start breadth-first search')
         for c in self.unique_complexity_levels:
             print('test all graphs with %i degrees of freedom:'%c)
             self.find_valid_combinations(c)

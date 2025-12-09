@@ -25,13 +25,17 @@ Alternatively, use the linked Google Colab notebooks to test our code.
 
 Are you using AutoScatter in your project or research or do some related research? Then, please cite us!
 ```
-@misc{landgraf2024automateddiscoverycoupledmode,
-      title={Automated Discovery of Coupled Mode Setups}, 
-      author={Jonas Landgraf and Vittorio Peano and Florian Marquardt},
-      year={2024},
-      eprint={2404.14887},
-      archivePrefix={arXiv},
-      primaryClass={physics.optics},
-      url={https://arxiv.org/abs/2404.14887}, 
+@article{AutoScatter,
+  title = {Automated Discovery of Coupled-Mode Setups},
+  author = {Landgraf, Jonas and Peano, Vittorio and Marquardt, Florian},
+  journal = {Physical Review X},
+  volume = {15},
+  issue = {2},
+  pages = {021038},
+  year = {2025},
+  month = {5},
+  publisher = {American Physical Society},
+  doi = {10.1103/PhysRevX.15.021038},
+  url = {https://link.aps.org/doi/10.1103/PhysRevX.15.021038}
 }
 ```

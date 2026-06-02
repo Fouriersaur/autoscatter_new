@@ -35,6 +35,7 @@ ONLY_GAUGE = 'only gauge phase variable'
 ONLY_DETECTOR_POSITION = 'only detector position variable'
 NO_GAUGE_FREEDOM = 'neither gauge phase or detector position variable'
 
+# Calculating the scattering matrix from the Hamiltonian Matrix (Coupling Matrix)
 def calc_scattering_matrix_from_coupling_matrix(coupling_matrix, kappa_int_matrix):
     num_modes = coupling_matrix.shape[0]
     identity = jnp.eye(num_modes)
@@ -51,7 +52,7 @@ def find_minimum_number_auxiliary_modes(start_value=0, max_value=5, allow_squeez
     Parameters:
     - start_value: number of auxiliary modes from which the search is started (default 0)
     - max_value: maximum number of auxiliary modes tested during the search (default 5)
-    - allow_squeezing: boolen, determins if squeezing is allowed or not (default False).
+    - allow_squeezing: boolean, determins if squeezing is allowed or not (default False).
     - **kwargs_optimizer: All those arguments will be passed directly to the optimizer.
       Typically you would like to pass S_target (and optionally enforced_constraints) to determine the target behaviour.
       See Architecture_Optimizer class for more details

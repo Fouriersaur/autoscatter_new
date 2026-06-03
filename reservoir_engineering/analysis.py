@@ -112,8 +112,29 @@ def compare_covariance(
 # If coupling_strengths is None, omit numerical values and just list types.
 # Highlight if ν/g ≈ tanh(r) for some round r (Kronwald check).
 
-def print_topology_summary(nodes, edges, coupling_strengths=None):
+def print_topology_summary(nodes, edges, coupling_strengths=None,
+                            betas=None, coupling_ratios=None, lambda_scale=None):
     pass
+# Updated for 3-stage algorithm:
+#   If betas and coupling_ratios are provided (from optimize_given_conditions info_out),
+#   the summary prints the FULL Stage 2+3 output rather than raw coupling strengths.
+#
+#   Extended output format:
+#   ── Graph Summary ──────────────────────────────────────────────────────────
+#   Nodes (2):
+#     [0] cavity      κ = 1.00
+#     [1] mechanical  γ = 0.010,  n̄ = 0.0
+#   Edges (2), λ = 1000:
+#     (0→1)  beamsplitter       β = 1.0   C̃ = 1.24    C = 1240    g = 0.558
+#     (0→1)  two_mode_squeezing β = 1.0   C̃ = 0.726   C = 726     g = 0.426
+#   Coupling ratio: C̃_ν / C̃_g = 0.585  ≈ tanh(r=0.63)²   ← Kronwald check
+#   Scaling: all β_i = 1.0 → single scale knob (take C_i >> 1 simultaneously)
+#   Physical formula: g_k = sqrt(λ^{β_k} · C̃_k · decay_i · decay_j / 4)
+#   Connected: YES   Has cavity: YES
+#   ───────────────────────────────────────────────────────────────────────────
+#
+# If betas/coupling_ratios are None: fall back to original format showing g values.
+# Highlight automatically if ν/g ≈ tanh(r) for some round r (Kronwald pattern).
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -238,4 +259,68 @@ def plot_squeezing_vs_complexity(results, ax=None):
 #   VALIDATION PASSED
 
 def validate_kronwald(result: dict, r_target: float, tol: float = 1e-3) -> bool:
+    pass
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# plot_scaling_exponents(result_or_list, ax=None)
+# ───────────────────────────────────────────────────────────────────────────
+# Visualise the Stage 2 output: which scaling exponents {β_i} were found for
+# each edge in the discovered topology.
+#
+# Parameters:
+#   result_or_list : either a single info_out dict (from optimize_given_conditions)
+#                    OR a list of such dicts (one per valid topology from BFS).
+#   ax             : matplotlib Axes or None (create new figure if None).
+#
+# Plot layout for a single result:
+#   Bar chart with one bar per active edge.
+#   x-axis: edge label ('BS(0,1)', 'TMS(0,1)', etc.)
+#   y-axis: β value (exponent), with reference lines at β = 0.5, 1.0, 1.5, 2.0, 3.0
+#   Bar colour: green for β=1 (same scaling), orange for β≠1 (different scaling).
+#   Title: 'Scaling exponents β_i  (λ = [lambda_scale])'
+#
+# Plot layout for a list of results:
+#   Grid of subplots, one per topology.  Each subplot shows the bar chart.
+#   Annotate with topology index and final loss value.
+#
+# Interpretation guide (printed as a text box):
+#   All β_i = 1:  uniform scaling → single scale knob.
+#   Mixed β_i:    the edge with larger β must be driven parametrically stronger.
+#
+# Usage:
+#   from reservoir_engineering.analysis import plot_scaling_exponents
+#   valid_combos = optimizer.perform_breadth_first_search()
+#   # After BFS, each valid topology has betas stored in the info_out dict.
+#   for triu, info in zip(valid_combos, optimizer.best_infos):
+#       plot_scaling_exponents(info)
+
+def plot_scaling_exponents(result_or_list, ax=None):
+    pass
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# plot_cooperativity_ratios(result, ax=None)
+# ───────────────────────────────────────────────────────────────────────────
+# Visualise the Stage 3 output: the coupling ratios {C̃_i} for each active edge.
+# These are the dimensionless optimisation variables that determine the physics.
+#
+# Parameters:
+#   result : info_out dict from optimize_given_conditions (contains 'coupling_ratios',
+#            'scaling_exponents', 'lambda_scale', 'cooperativities').
+#   ax     : matplotlib Axes or None.
+#
+# Plot layout:
+#   Two panels side by side:
+#   [left]  Bar chart of C̃_i per edge  (the Stage 3 output, O(1) numbers)
+#   [right] Bar chart of C_i = λ^{β_i} · C̃_i  (the actual cooperativities, large numbers)
+#   Annotate with the physical coupling formula below each bar.
+#
+# Also annotate any pairs of edges where C̃_i / C̃_j ≈ tanh(r)² or similar
+# physically meaningful ratios (auto-detected via pattern matching).
+#
+# This is the MAIN RESULT PLOT — it directly answers the experimental question:
+#   'What cooperativity do I need for each drive to achieve this quantum state?'
+
+def plot_cooperativity_ratios(result: dict, ax=None):
     pass

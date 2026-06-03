@@ -70,6 +70,18 @@ Node dict format used throughout this package:
         'kappa': float,          # used if type == 'cavity'
         'gamma': float,          # used if type == 'mechanical'
         'n_th' : float,          # used if type == 'mechanical'
+        'delta': float,          # effective detuning in the rotating frame (default 0.0)
+                                 # appears in A as a rotation on the diagonal 2×2 block:
+                                 #   A[s_i, s_i] += delta_i · [[0, 1], [-1, 0]]
+                                 # = 0 for all modes in the standard doubly-rotating frame
+                                 #   (Kronwald, Wang-Clerk: all delta_i = 0).
+                                 # ≠ 0 when two or more modes cannot simultaneously be
+                                 #   in their own rotating frames — e.g. two mechanical
+                                 #   modes with different frequencies ω_m1 ≠ ω_m2: one is
+                                 #   in its rotating frame (delta=0), the other has a
+                                 #   residual detuning delta = ω_m2 − ω_m1.
+                                 # Also ≠ 0 if the drive is intentionally off-resonance
+                                 #   (e.g. to improve stability or modify squeezing direction).
     }
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -171,6 +183,31 @@ def quadrature_slice(mode_id: int):
 #     For node i of type 'mechanical': A[s_i, s_i] += −(γ_i / 2) · I₂
 #     where s_i = quadrature_slice(i) and I₂ = identity(2)
 #
+#   Step 1b — diagonal detuning rotation blocks (one per node, if delta != 0):
+#     For every node i with detuning delta_i = node['delta'] (default 0):
+#         J₂ = [[0, 1], [-1, 0]]    (2×2 antisymmetric rotation generator)
+#         A[s_i, s_i] += delta_i · J₂
+#
+#     Physical meaning of delta_i:
+#       In the rotating frame, delta_i is the mode's frequency offset from the
+#       frame rotation frequency. It causes the quadratures to rotate at rate delta_i
+#       (analogous to a free-running oscillator precessing in phase space).
+#       For a cavity at detuning delta_i:
+#           A_ii = [[-κ/2,    delta_i],
+#                   [-delta_i, -κ/2  ]]
+#       For delta_i = 0: purely decaying (Kronwald standard case).
+#       For delta_i ≠ 0: the squeezed quadrature rotates, affecting the steady-state
+#       squeezing angle. The optimizer can use delta_i to align squeezing direction
+#       with the target covariance.
+#
+#     When to set delta_i ≠ 0:
+#       (a) Multi-mechanical-frequency systems: only one ω_m can be removed by the
+#           rotating frame; other mechanical modes get delta = ω_m_other − ω_m_ref.
+#       (b) When the scheme requires an off-resonance drive to achieve the target.
+#           (AutoScatter's Δ_i variables play this exact role.)
+#       (c) When the squeezing direction of the target covariance is rotated relative
+#           to the natural x-quadrature — a non-zero delta_i rotates the squeezing.
+#
 #   Step 2 — off-diagonal coupling blocks (one per edge):
 #     Let g = coupling_strengths[edge_idx], s_i = quadrature_slice(edge.i),
 #     s_j = quadrature_slice(edge.j), σ_z = diag(+1, -1)
@@ -265,6 +302,43 @@ def solve_lyapunov_kronecker(A: jnp.ndarray, D: jnp.ndarray) -> jnp.ndarray:
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# check_stability(A) → bool
+# ───────────────────────────────────────────────────────────────────────────
+# Purpose (Stage 1 of the main algorithm):
+#   Check whether the drift matrix A is Hurwitz — all eigenvalues have
+#   strictly negative real parts.  Called BEFORE any gradient optimisation.
+#   If False, the system has no steady state and the topology is discarded
+#   immediately without touching the Lyapunov solver.
+#
+# Parameters:
+#   A — np.ndarray or jnp.ndarray (2N, 2N) drift matrix
+#
+# Returns:
+#   bool — True if all Re(λ_k) < 0 (stable), False otherwise
+#
+# Method:
+#   eigenvalues = np.linalg.eigvals(np.asarray(A))
+#   return bool(np.all(np.real(eigenvalues) < 0))
+#
+# Usage in Stage 1:
+#   Called by check_stability_unit_cooperativity() in CovarianceOptimizer,
+#   which builds A with every cooperativity = 1.  A topology that is unstable
+#   at unit cooperativity cannot be stabilised by changing coupling ratios —
+#   the instability is structural (determined by edge TYPES and graph shape,
+#   not coupling magnitudes).  TMS edges on a cycle with no BS edges are the
+#   archetypal structurally-unstable case.
+#
+# Note:
+#   Uses numpy (not JAX) because it is called outside the differentiable
+#   computation graph — purely as a discrete topology filter.  The actual
+#   loss functions (covariance_loss, covariance_loss_from_ratios) remain
+#   fully JAX-differentiable.
+
+def check_stability(A) -> bool:
+    pass
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # get_mode_covariance(sigma, mode_ids)
 # ───────────────────────────────────────────────────────────────────────────
 # Purpose:
@@ -290,6 +364,70 @@ def solve_lyapunov_kronecker(A: jnp.ndarray, D: jnp.ndarray) -> jnp.ndarray:
 def get_mode_covariance(
     sigma: jnp.ndarray,
     mode_ids: List[int],
+) -> jnp.ndarray:
+    pass
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
+# ───────────────────────────────────────────────────────────────────────────
+# Purpose (Stage 3 of the main algorithm):
+#   Build the drift matrix A using the cooperativity reparametrisation.
+#   Instead of optimising coupling strengths g_{ij} directly, Stage 3
+#   optimises dimensionless coupling RATIOS C̃_i (order-1 numbers) at a fixed
+#   large scale λ = lambda_scale.
+#
+#   The mapping from ratios to coupling strengths is:
+#
+#       C_{ij}  = lambda_scale^{betas[k]}  ×  ratios[k]       (cooperativity)
+#       g_{ij}  = sqrt( C_{ij} × decay_i × decay_j / 4 )      (coupling strength)
+#
+#   where:
+#       decay_i = kappa_i  if node i is a cavity
+#       decay_i = gamma_i  if node i is mechanical
+#
+#   This function converts ratios → coupling strengths and calls build_drift_matrix.
+#   Fully JAX-differentiable with respect to `ratios`.
+#
+# Parameters:
+#   nodes        — list of N node dicts (same format as build_drift_matrix)
+#   edges        — list of E edge dicts (types only; edge k ↔ ratios[k], betas[k])
+#   ratios       — jnp.ndarray shape (E,), Stage 3 optimisation variables C̃_i > 0
+#   betas        — list or array, length E, scaling exponents from Stage 2.
+#                  e.g. [1.0, 1.0] for Kronwald (both edges scale identically).
+#   lambda_scale — float, the fixed scale (default LAMBDA_SCALE_DEFAULT = 1000).
+#                  Must satisfy lambda_scale >> 1 to be in the strong-coupling limit.
+#
+# Returns:
+#   A — jnp.ndarray (2N, 2N), drift matrix built from the converted g values
+#
+# Construction:
+#   For each edge k with nodes i and j:
+#       decay_i = node[i]['kappa'] if 'cavity' else node[i]['gamma']
+#       decay_j = node[j]['kappa'] if 'cavity' else node[j]['gamma']
+#       C_k  = lambda_scale ** betas[k] * ratios[k]
+#       g_k  = jnp.sqrt(C_k * decay_i * decay_j / 4.)
+#   coupling_strengths = jnp.array([g_0, g_1, ..., g_{E-1}])
+#   return build_drift_matrix(nodes, edges, coupling_strengths)
+#
+# Why this reparametrisation?
+#   At large lambda_scale, g_{ij} ~ sqrt(lambda_scale) can be very large.
+#   The ratio C̃_i = C_i / lambda_scale^{beta_i} is O(1) regardless of lambda,
+#   so the gradient landscape is well-conditioned numerically.
+#   The exponents betas[k] (found in Stage 2) encode which edges need to be
+#   parametrically stronger than others as the overall drive scale grows.
+#
+# Differentiability:
+#   All operations (jnp.sqrt, multiplication, build_drift_matrix) are differentiable.
+#   jax.grad(covariance_loss_from_ratios, argnums=0) flows through this function.
+#   Enforce ratios > 0 via L-BFGS-B lower bounds to avoid sqrt singularity.
+
+def build_drift_matrix_from_ratios(
+    nodes: List[Dict],
+    edges: List[Dict],
+    ratios: jnp.ndarray,
+    betas,
+    lambda_scale: float,
 ) -> jnp.ndarray:
     pass
 
@@ -335,6 +473,67 @@ def covariance_loss(
     coupling_strengths: jnp.ndarray,
     nodes: List[Dict],
     edges: List[Dict],
+    target_cov: jnp.ndarray,
+    target_mode_ids: List[int],
+) -> jnp.ndarray:
+    pass
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# covariance_loss_from_ratios(ratios, nodes, edges, D, betas, lambda_scale,
+#                              target_cov, target_mode_ids)
+# ───────────────────────────────────────────────────────────────────────────
+# Purpose (Stage 3 of the main algorithm):
+#   The scalar loss function for Stage 3 continuous optimisation.
+#   Optimises over coupling RATIOS C̃_i (not raw coupling strengths g_i).
+#   This is the Stage 3 replacement for covariance_loss.
+#
+# Parameters:
+#   ratios          — jnp.ndarray (E,), Stage 3 optimisation variables C̃_i > 0
+#   nodes           — list of N node dicts (types, decay rates)
+#   edges           — list of E edge dicts (types only)
+#   D               — jnp.ndarray (2N, 2N), precomputed diffusion matrix (constant).
+#                     Pass D in from outside the JIT-compiled call for efficiency.
+#   betas           — list/array, length E, scaling exponents found in Stage 2
+#   lambda_scale    — float, fixed scale (default LAMBDA_SCALE_DEFAULT = 1000)
+#   target_cov      — jnp.ndarray (2M, 2M), target covariance for signal modes
+#   target_mode_ids — list of int, which modes to compare
+#
+# Returns:
+#   scalar jnp float:  ½ · ‖ σ_sub − σ_target ‖²_F
+#
+# Steps (mirrors covariance_loss exactly, but uses ratios instead of g):
+#   1. A         = build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
+#   2. sigma     = solve_lyapunov_kronecker(A, D)
+#   3. sigma_sub = get_mode_covariance(sigma, target_mode_ids)
+#   4. diff      = sigma_sub − target_cov
+#   5. return    jnp.sum(diff ** 2) / 2.
+#
+# Usage pattern (same as covariance_loss):
+#   loss_jit  = jax.jit(covariance_loss_from_ratios, static_argnums=(1,2,5,7))
+#   grad_loss = jax.jit(jax.grad(covariance_loss_from_ratios, argnums=0),
+#                        static_argnums=(1,2,5,7))
+#   value = loss_jit(ratios, nodes, edges, D, betas, lambda_scale, sigma_target, mode_ids)
+#   grads = grad_loss(ratios, nodes, edges, D, betas, lambda_scale, sigma_target, mode_ids)
+#
+# Relationship to covariance_loss:
+#   covariance_loss(g, ...)      ← parametrised by raw coupling strengths g
+#   covariance_loss_from_ratios(C̃, ...)  ← parametrised by ratios C̃ = C / λ^β
+#   Both measure the same ½‖σ_sub − σ_target‖²_F; only the independent
+#   variables differ.  Stage 3 always uses covariance_loss_from_ratios.
+#
+# Why pass D explicitly (not recompute inside)?
+#   D depends only on node types and decay rates — constant for a fixed topology.
+#   Passing it in avoids recomputing it on every call inside the JIT loop.
+#   The same reason it is precomputed in covariance_loss.
+
+def covariance_loss_from_ratios(
+    ratios: jnp.ndarray,
+    nodes: List[Dict],
+    edges: List[Dict],
+    D: jnp.ndarray,
+    betas,
+    lambda_scale: float,
     target_cov: jnp.ndarray,
     target_mode_ids: List[int],
 ) -> jnp.ndarray:

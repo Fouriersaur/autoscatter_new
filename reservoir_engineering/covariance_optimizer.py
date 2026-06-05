@@ -18,9 +18,12 @@ It mirrors Architecture_Optimizer in AutoScatter essentially one-to-one:
     S_target (sympy Matrix)          →   sigma_target (numpy array, 2M×2M)
     mode_types (list of bool)        →   node_types (list of 'cavity'|'mechanical')
     num_auxiliary_modes (int)        →   num_auxiliary_modes (int)
-    gabs, gphases, Deltas (complex)  →   coupling_strengths (real array)
+    gabs, gphases, Deltas (complex)  →   C̃_k (ratios), Δ_i (detunings) — real
     gauge phases (complex)           →   (none — σ is gauge-invariant)
-    coupling_matrix H (complex NxN)  →   drift matrix A (real 2NxN)
+    coupling_matrix H (complex N×N)  →   H_quad (real 2N×2N) — EXPLICIT Hamiltonian matrix
+                                         (analogue of H: detuning + coupling blocks, no decay)
+    decay separate: -κ/2 in S-matrix →   A_decay separate: -decay/2·I₂ diagonal blocks
+    A = -iH - κ/2  (combined)        →   A = H_quad + A_decay  (combined drift matrix)
     kappa_int_matrix                 →   (absorbed in D via γ, n_th)
     S = I + (-iH - κ/2)⁻¹           →   Aσ + σAᵀ + D = 0
     Frobenius loss on S              →   Frobenius loss on σ_sub
@@ -88,9 +91,12 @@ For every candidate topology produced by the BFS outer loop, the algorithm
 runs three internal stages before accepting or rejecting that topology.
 
 STAGE 1 — Stability check at unit cooperativity  (fast discrete filter)
-    Build A with all cooperativities C_{ij} = 1.
-    This means g_{ij} = sqrt(decay_i × decay_j / 4) for every active edge.
-    Check whether all eigenvalues of A have strictly negative real part.
+    Build A from H with all cooperativities C_{ij} = 1.
+    "Unit cooperativity" means each Hamiltonian coupling g_{ij} is set to
+    the geometric-mean threshold: g_{ij} = sqrt(decay_i × decay_j / 4).
+    A is assembled via the H → A map (build_drift_matrix): one block per
+    Hamiltonian term.  Then check whether all eigenvalues of A have strictly
+    negative real part.
     If unstable → discard immediately.  Do NOT proceed to Stage 2 or 3.
     No gradient computation, no Lyapunov solve — just an eigenvalue check.
     Method: check_stability_unit_cooperativity(triu_array) → bool
@@ -372,7 +378,15 @@ class CovarianceOptimizer:
     #       #    (absent edges fixed to 0, free edges from the input)
     #       full_cs = expand_to_full(coupling_strengths_free, conditions)
     #
-    #       # 2. Build drift matrix A
+    #       # 2. Build drift matrix A = H_quad + A_decay.
+    #       #    H_quad = build_hamiltonian_matrix(nodes, edges, full_cs)
+    #       #      — the EXPLICIT Hamiltonian matrix (analogue of AutoScatter's H)
+    #       #      — contains ONLY coherent terms (couplings + detunings):
+    #       #          BS  edge k:  H += g_k(a†b + h.c.)  →  H_quad block += g_k · I₂
+    #       #          TMS edge k:  H += g_k(a†b† + h.c.) →  H_quad block += ±g_k · σ_z
+    #       #          Detuning:    H += Δ_i a_i†a_i      →  H_quad diag += Δ_i · J₂
+    #       #    A_decay = diagonal -decay_i/2 · I₂ blocks (dissipation, NOT from H)
+    #       #    A = H_quad + A_decay   (mirrors AutoScatter: -iH + (-κ/2))
     #       A = build_drift_matrix(self.nodes, self.edges, full_cs)
     #
     #       # 3. Solve Lyapunov for steady-state covariance
@@ -677,9 +691,11 @@ class CovarianceOptimizer:
     #        a. Extract ratios = x[:E], detunings = x[E:]
     #        b. Set node['delta'] = detunings[i] for each node i
     #        c. A = build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
-    #           (build_drift_matrix_from_ratios calls build_drift_matrix which includes
-    #            the detuning rotation term in each diagonal block — see Step 1b there)
-    #        d. sigma = solve_lyapunov_kronecker(A, D)
+    #           This builds A from the Hamiltonian H with coupling strengths
+    #           g_k = sqrt(λ^{β_k} · C̃_k · decay_i · decay_j / 4) per edge k,
+    #           and detuning rotation Δ_i · J₂ on each diagonal block.
+    #           A is the "coupling matrix" — it encodes all of H in real quadrature form.
+    #        d. sigma = solve_lyapunov_kronecker(A, D)   ← A σ + σ Aᵀ + D = 0
     #        e. return ½‖get_mode_covariance(sigma, target_mode_ids) − sigma_target‖²_F
     #      Gradient via jax.grad argnums=0 (w.r.t. full x vector).
     #   2. Sample initial guess:

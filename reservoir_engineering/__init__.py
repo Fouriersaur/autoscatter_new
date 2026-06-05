@@ -82,14 +82,17 @@ Step 3 — Run breadth-first topology search (covariance_optimizer.py):
     # For EACH candidate topology the BFS runs THREE internal stages:
     #
     # STAGE 1 — Stability at unit cooperativity (fast, no gradient):
-    #     Build A with all C_{ij}=1.  Discard if any Re(eigenvalue) ≥ 0.
+    #     Build A from H with all C_{ij}=1 (g_{ij} = sqrt(decay_i·decay_j/4)).
+    #     A is the real 2N×2N "coupling matrix" derived from H via quantum
+    #     Langevin equations.  Discard if any Re(eigenvalue of A) ≥ 0.
     #
     # STAGE 2 — Find scaling exponents {β_i} (combinatorial, no gradient):
-    #     Set C_i = λ^{β_i} and test V_system convergence at λ=10,100,1000.
-    #     Search β_i ∈ {0.5,1,2} per edge.  Discard if no convergence found.
+    #     Set C_i = λ^{β_i}, rebuild A from H at λ=10,100,1000, test V_system
+    #     convergence.  Search β_i ∈ {0.5,1,2} per edge.  Discard if none converge.
     #     Kronwald expected result: β_g = β_ν = 1 (same-scaling passes first).
     #
     # STAGE 3 — Optimise coupling ratios {C̃_i} at fixed λ=1000 (gradient):
+    #     Rebuild A from H at each step: g_k = sqrt(λ^{β_k}·C̃_k·decay_i·decay_j/4).
     #     Minimise ½‖V_system − V_target‖²_F over C̃_i > 0 using L-BFGS-B + JAX.
     #     Actual cooperativity: C_i = λ^{β_i} · C̃_i.
     #     Physical coupling: g_i = sqrt(λ^{β_i} · C̃_i · decay_i · decay_j / 4).
@@ -135,7 +138,10 @@ auxiliary modes (cavities) are the dissipative resource.
 # ── Physics layer ─────────────────────────────────────────────────────────
 # Mirrors: autoscatter/scattering.py (S-matrix physics)
 from reservoir_engineering.covariance_physics import (
-    build_drift_matrix,              # build A from nodes + edges + coupling_strengths
+    build_hamiltonian_matrix,        # H_quad (2N×2N real) — explicit Hamiltonian matrix
+                                     # analogue of AutoScatter's complex N×N coupling matrix H
+                                     # contains ONLY coherent terms (couplings + detunings, no decay)
+    build_drift_matrix,              # A = H_quad + A_decay  (full drift matrix)
     build_diffusion_matrix,          # build D from nodes (constant, no coupling dependence)
     solve_lyapunov_kronecker,        # solve Aσ + σAᵀ + D = 0 via Kronecker trick
     get_mode_covariance,             # extract σ_sub for target modes
@@ -247,6 +253,7 @@ __all__ = [
     'characterize_topology', 'find_min_number_pump_tones',
     'calc_number_of_possibilities',
     # physics helpers (Stage 1–3)
+    'build_hamiltonian_matrix',
     'check_stability', 'build_drift_matrix_from_ratios', 'covariance_loss_from_ratios',
     # optimiser
     'CovarianceOptimizer', 'find_minimum_number_auxiliary_modes',

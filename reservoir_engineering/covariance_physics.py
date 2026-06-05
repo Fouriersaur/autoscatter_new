@@ -19,12 +19,65 @@ All matrices (A, D, σ) are real-valued 2N × 2N.
 Vacuum noise level = ½ per quadrature (convention: [x, p] = i).
 
 ═══════════════════════════════════════════════════════════════════════════════
+FROM HAMILTONIAN TO DRIFT MATRIX  (how A is constructed)
+═══════════════════════════════════════════════════════════════════════════════
+
+The drift matrix A is built directly from the system Hamiltonian H via the
+quantum Langevin equations (Heisenberg-Langevin formalism):
+
+    ȧ_i = -i [a_i, H] - (κ_i / 2) a_i + sqrt(κ_i) a_in,i
+
+Converting each mode operator to real quadratures  x = (a+a†)/√2,
+p = -i(a-a†)/√2  yields a LINEAR equation of motion in vector form:
+
+    dq/dt = A · q + noise
+
+The drift matrix A is assembled block-by-block from H:
+
+  Hamiltonian term            →  block of A
+  ──────────────────────────────────────────────────────────────────
+  (system-bath coupling)      →  -κ_i/2 · I₂  (diagonal decay block)
+  Δ_i a_i†a_i  (detuning)   →  +Δ_i · J₂    (diagonal rotation block)
+  g(a†b + ab†) (beamsplitter) →  +g · I₂      (off-diagonal block)
+  ν(a†b† + ab) (TMS)         →  ±ν · σ_z     (off-diagonal block, antisym)
+
+where J₂ = [[0,1],[-1,0]], I₂ = identity(2), σ_z = diag(+1,-1).
+
+The key distinction between BS and TMS comes from the commutator:
+  [a_i, g(a_i†a_j + h.c.)] = g a_j       → g · I₂   block (energy-conserving)
+  [a_i, ν(a_i†a_j† + h.c.)] = ν a_j†     → ν · σ_z  block (parametric)
+The a_j vs a_j† difference flips the sign of the p-quadrature, giving I₂ vs σ_z.
+
+A is split into TWO parts — exactly mirroring AutoScatter's (-iH - κ/2):
+
+    A  =  H_quad  +  A_decay
+          └─ from H ─┘   └─ from dissipation ─┘
+
+  H_quad  (2N × 2N real) — the EXPLICIT Hamiltonian matrix in the quadrature basis.
+                            The direct analogue of AutoScatter's complex N×N coupling matrix H.
+                            Contains ONLY the coherent (Hamiltonian) terms:
+                              diagonal blocks:    Δ_i · J₂         (from H = Δ_i a_i†a_i)
+                              BS off-diagonal:   +g · I₂, +g · I₂  (from H = g(a†b + ab†))
+                              TMS off-diagonal:  +g · σ_z, -g · σ_z (from H = g(a†b† + ab))
+
+  A_decay (2N × 2N real) — the dissipation part.  NOT from H.  From system-bath coupling.
+                            diagonal blocks only:  -decay_i/2 · I₂  per mode i
+
+  build_hamiltonian_matrix(nodes, edges, coupling_strengths) → H_quad
+  build_drift_matrix(nodes, edges, coupling_strengths)       → A = H_quad + A_decay
+
+AutoScatter analogy:
+  AutoScatter:         -iH  (complex N×N, from Hamiltonian)  -  κ/2  (decay, separate)
+  Reservoir Eng:    H_quad  (real 2N×2N, from Hamiltonian)   + A_decay (decay, separate)
+  Both: the Hamiltonian and the decay are SEPARATE contributions combined into one matrix.
+
+═══════════════════════════════════════════════════════════════════════════════
 OPEN SYSTEM DYNAMICS  (Lyapunov equation)
 ═══════════════════════════════════════════════════════════════════════════════
 
 The system evolves under the linear quantum Langevin equation:
 
-    dq/dt = A · q + noise
+    dq/dt = A · q + noise        where A = H_quad + A_decay
 
 In steady state, the covariance matrix σ (where σ_ij = ½⟨{q_i,q_j}⟩)
 satisfies the continuous-time Lyapunov equation:
@@ -32,7 +85,9 @@ satisfies the continuous-time Lyapunov equation:
     A · σ + σ · Aᵀ + D = 0
 
 where:
-  A  — drift matrix   (2N × 2N, real) — encodes coherent couplings + decay
+  A  — drift matrix   (2N × 2N, real) — A = H_quad + A_decay
+                       H_quad encodes the coherent Hamiltonian (couplings + detunings)
+                       A_decay encodes the dissipation (-decay/2 per mode)
   D  — diffusion matrix (2N × 2N, real, diagonal) — encodes bath noise
 
 Solution via Kronecker-product vectorisation:
@@ -138,7 +193,6 @@ from typing import List, Dict
 
 jax.config.update("jax_enable_x64", True)
 
-
 # ───────────────────────────────────────────────────────────────────────────
 # quadrature_slice(mode_id)
 # ───────────────────────────────────────────────────────────────────────────
@@ -157,14 +211,120 @@ jax.config.update("jax_enable_x64", True)
 # to locate the 2×2 block for each node and each edge.
 
 def quadrature_slice(mode_id: int):
-    pass
 
+    return slice (2*mode_id, 2 * mode_id + 2)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# build_hamiltonian_matrix(nodes, edges, coupling_strengths)
+# ───────────────────────────────────────────────────────────────────────────
+# Purpose:
+#   Assemble the 2N × 2N real Hamiltonian matrix H_quad from the system
+#   Hamiltonian H in the real quadrature basis.
+#
+#   H_quad is the EXPLICIT Hamiltonian matrix — the direct analogue of
+#   AutoScatter's complex N×N coupling matrix H.
+#   It contains ONLY the coherent (Hamiltonian) contributions.
+#   Decay terms (-κ/2 · I₂) are NOT included here — they are added separately
+#   in build_drift_matrix to form A = H_quad + A_decay.
+#
+#   AutoScatter analogy:
+#     AutoScatter:       H (complex N×N)   — explicit Hamiltonian matrix
+#     Reservoir Eng: H_quad (real 2N×2N)  — explicit Hamiltonian matrix
+#     Both used as:  S = f(-iH, -κ/2)  ↔  A = H_quad + A_decay
+#
+# Parameters:
+#   nodes              — list of N node dicts (reads 'delta' field per node)
+#   edges              — list of E edge dicts (reads 'type' field per edge)
+#   coupling_strengths — jnp.ndarray shape (E,), one value per edge
+#
+# Returns:
+#   H_quad — jnp.ndarray shape (2N, 2N), real
+#            Contains detuning and coupling terms only (no decay).
+#
+# Construction:
+#
+#   Step 1 — diagonal detuning blocks (one per node, from H = Δ_i a_i†a_i):
+#     For every node i:
+#         J₂ = [[0, 1], [-1, 0]]
+#         H_quad[s_i, s_i] += delta_i · J₂
+#     If delta_i = 0 (standard doubly-rotating frame): this block is zero.
+#     If delta_i ≠ 0: the mode precesses in phase space at rate delta_i.
+#
+#   Step 2 — off-diagonal coupling blocks (one per edge, from H coupling terms):
+#     Let g = coupling_strengths[edge_idx], s_i = quadrature_slice(edge.i),
+#             s_j = quadrature_slice(edge.j)
+#
+#     'beamsplitter' (H = g(a†b + ab†)):
+#         [a_i, H] = g·a_j  →  off-diagonal block = +g · I₂
+#         H_quad[s_i, s_j] += +g · I₂
+#         H_quad[s_j, s_i] += +g · I₂        (Hermitian symmetry)
+#
+#     'two_mode_squeezing' (H = g(a†b† + ab)):
+#         [a_i, H] = g·a_j†  →  off-diagonal block = +g · σ_z
+#         H_quad[s_i, s_j] += +g · σ_z
+#         H_quad[s_j, s_i] += -g · σ_z       (antisymmetric — NOT Hermitian in block sense)
+#
+#     'parametric' (H = χ(a² + a†²), single-mode):
+#         H_quad[s_i, s_i] += χ · σ_z
+#
+# Why H_quad is real (not complex like AutoScatter's H):
+#   In the complex basis, H[i,j] = g·e^{iφ} (complex — encodes phase).
+#   In the real quadrature basis, the phase is replaced by the choice of block
+#   structure (I₂ = BS, σ_z = TMS). No complex numbers needed.
+#   This is why there is no phase optimisation variable in this project.
+
+def build_hamiltonian_matrix(
+    nodes: List[Dict],
+    edges: List[Dict],
+    coupling_strengths: jnp.ndarray,) -> jnp.ndarray:
+
+    N  = len(nodes)
+    H  = jnp.zeros((2 * N, 2 * N))
+    I2 = jnp.eye(2)
+    J2 = jnp.array([[0.,  1.], [-1., 0.]])  # detuning rotation block
+    sz = jnp.array([[1.,  0.], [ 0., -1.]]) # σ_z for TMS
+
+    # Step 1 — diagonal detuning blocks (from H = Δ_i a_i†a_i)
+    for i, node in enumerate(nodes):
+        s     = quadrature_slice(i)
+        delta = node.get('delta', 0.0)
+        H     = H.at[s, s].add(delta * J2)
+
+    # Step 2 — off-diagonal coupling blocks (from H coupling terms)
+    for k, edge in enumerate(edges):
+        si = quadrature_slice(edge['i'])
+        sj = quadrature_slice(edge['j'])
+        g  = coupling_strengths[k]
+
+        if edge['type'] == 'beamsplitter':          # H = g(a†b + ab†)
+            H = H.at[si, sj].add( g * I2)          # C_{i,j} = +g·I₂
+            H = H.at[sj, si].add( g * I2)          # C_{j,i} = +g·I₂  (symmetric)
+
+        elif edge['type'] == 'two_mode_squeezing':  # H = g(a†b† + ab)
+            H = H.at[si, sj].add( g * sz)          # C_{i,j} = +g·σ_z
+            H = H.at[sj, si].add(-g * sz)          # C_{j,i} = -g·σ_z  (antisymmetric)
+
+        elif edge['type'] == 'parametric':          # H = χ(a² + a†²), single-mode
+            H = H.at[si, si].add(g * sz)           # diagonal σ_z block
+
+    return H
 
 # ───────────────────────────────────────────────────────────────────────────
 # build_drift_matrix(nodes, edges, coupling_strengths)
 # ───────────────────────────────────────────────────────────────────────────
 # Purpose:
-#   Assemble the 2N × 2N real drift matrix A from the graph description.
+#   Assemble the full 2N × 2N drift matrix A = H_quad + A_decay.
+#
+#   H_quad  = build_hamiltonian_matrix(nodes, edges, coupling_strengths)
+#             (coherent Hamiltonian part — couplings + detunings)
+#   A_decay = diagonal -decay_i/2 · I₂ blocks
+#             (dissipation part — from system-bath coupling, NOT from H)
+#
+#   This separation mirrors AutoScatter exactly:
+#     AutoScatter uses:  -iH  (Hamiltonian)  +  -κ/2  (decay)  in S-matrix
+#     Here:           H_quad  (Hamiltonian)  +  A_decay (decay) = A
+#
 #   Must be JAX-differentiable with respect to `coupling_strengths`.
 #
 # Parameters:
@@ -176,14 +336,28 @@ def quadrature_slice(mode_id: int):
 # Returns:
 #   A — jnp.ndarray shape (2N, 2N), real
 #
-# Construction (add each contribution to a zero 2N×2N matrix):
+# Construction:
+#   A = H_quad + A_decay
 #
-#   Step 1 — diagonal decay blocks (one per node):
-#     For node i of type 'cavity':     A[s_i, s_i] += −(κ_i / 2) · I₂
-#     For node i of type 'mechanical': A[s_i, s_i] += −(γ_i / 2) · I₂
+#   Part 1 — H_quad  (call build_hamiltonian_matrix):
+#     Step 1a — diagonal detuning blocks (from H = Δ_i a_i†a_i):
+#       For every node i: H_quad[s_i, s_i] += delta_i · J₂
+#     Step 1b — off-diagonal coupling blocks (from H coupling terms):
+#       BS:  H_quad[s_i,s_j] += +g·I₂,  H_quad[s_j,s_i] += +g·I₂
+#       TMS: H_quad[s_i,s_j] += +g·σ_z, H_quad[s_j,s_i] += -g·σ_z
+#
+#   Part 2 — A_decay  (dissipation, NOT from H):
+#     Step 2 — diagonal decay blocks (one per node):
+#     For node i of type 'cavity':     A_decay[s_i, s_i] = −(κ_i / 2) · I₂
+#     For node i of type 'mechanical': A_decay[s_i, s_i] = −(γ_i / 2) · I₂
 #     where s_i = quadrature_slice(i) and I₂ = identity(2)
 #
-#   Step 1b — diagonal detuning rotation blocks (one per node, if delta != 0):
+#   Return: A = H_quad + A_decay
+#
+#   (Kept as a single function for JAX efficiency — avoids building two
+#    separate matrices and adding them. Internally assembles A in one pass.)
+#
+#   Step 1a — diagonal detuning rotation blocks (one per node, if delta != 0):
 #     For every node i with detuning delta_i = node['delta'] (default 0):
 #         J₂ = [[0, 1], [-1, 0]]    (2×2 antisymmetric rotation generator)
 #         A[s_i, s_i] += delta_i · J₂
@@ -230,13 +404,24 @@ def quadrature_slice(mode_id: int):
 #   jax.ops. The standard approach is to accumulate contributions via
 #   repeated addition on a base-zero jnp array.
 
+
 def build_drift_matrix(
     nodes: List[Dict],
     edges: List[Dict],
     coupling_strengths: jnp.ndarray,
 ) -> jnp.ndarray:
-    pass
+    
+    H_quad = build_hamiltonian_matrix(nodes=nodes, edges=edges, coupling_strengths=coupling_strengths)
+    N = len(nodes)
+    A = H_quad
+    I2 = jnp.eye(2)
 
+    for i, node in enumerate(nodes):
+        s = quadrature_slice(i)
+        decay = node["kappa"] if node["type"] == "cavity" else node["gamma"]
+        A = A.at[s, s].add((-decay/2) * I2)
+    
+    return A
 
 # ───────────────────────────────────────────────────────────────────────────
 # build_diffusion_matrix(nodes)
@@ -261,10 +446,27 @@ def build_drift_matrix(
 #       D[2i+1, 2i+1] = γ_i · (n̄_i + 0.5)
 #
 # Can be built with jnp.diag(jnp.array([...])) or np.diag + jnp.array cast.
+# 
+# Example of nodes dictionary
+# nodes = [
+# {'id': 0, 'type': 'cavity',     'kappa': 1.0, 'delta': 0.0},
+# {'id': 1, 'type': 'mechanical', 'gamma': 0.01, 'n_th': 0.0, 'delta': 0.0}]
 
-def build_diffusion_matrix(nodes: List[Dict]) -> jnp.ndarray:
-    pass
+def build_diffusion_matrix(nodes: List[Dict]) -> jnp.ndarray: 
 
+    N = len(nodes)
+
+    diag = []
+    for node in nodes: 
+        if node["type"] == "cavity":
+            noise = node["kappa"] / 2
+        else:
+            noise = node["gamma"] * (node["n_th"] + 1/2)
+        diag += [noise, noise]
+
+    D = jnp.diag(jnp.array(diag))
+
+    return D
 
 # ───────────────────────────────────────────────────────────────────────────
 # solve_lyapunov_kronecker(A, D)
@@ -298,8 +500,13 @@ def build_diffusion_matrix(nodes: List[Dict]) -> jnp.ndarray:
 #   calling this.
 
 def solve_lyapunov_kronecker(A: jnp.ndarray, D: jnp.ndarray) -> jnp.ndarray:
-    pass
 
+    n = A.shape[0]
+    I = jnp.eye(n)
+    M = jnp.kron(I,A) + jnp.kron(A,I)
+    vec_sigma = jnp.linalg.solve(M, -D.flatten())
+
+    return vec_sigma.reshape(n,n)
 
 # ───────────────────────────────────────────────────────────────────────────
 # check_stability(A) → bool
@@ -335,7 +542,10 @@ def solve_lyapunov_kronecker(A: jnp.ndarray, D: jnp.ndarray) -> jnp.ndarray:
 #   fully JAX-differentiable.
 
 def check_stability(A) -> bool:
-    pass
+    
+    eigs = np.linalg.eigvals(np.asarray(A))
+
+    return bool(np.all(np.real(eigs)) < 0)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -352,6 +562,8 @@ def check_stability(A) -> bool:
 #
 # Returns:
 #   sigma_sub — jnp.ndarray (2M, 2M)  where M = len(mode_ids)
+#   
+# => return the relavant submatrix that is the target state
 #
 # Construction:
 #   Build index list: idx = [2i, 2i+1  for i in mode_ids]
@@ -365,8 +577,12 @@ def get_mode_covariance(
     sigma: jnp.ndarray,
     mode_ids: List[int],
 ) -> jnp.ndarray:
-    pass
+    
+    idx = []
+    for m in mode_ids:
+        idx += [2*m, 2*m + 1]
 
+    return sigma[np.ix_(idx, idx)]
 
 # ───────────────────────────────────────────────────────────────────────────
 # build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
@@ -429,6 +645,12 @@ def build_drift_matrix_from_ratios(
     betas,
     lambda_scale: float,
 ) -> jnp.ndarray:
+    
+    
+    
+
+
+
     pass
 
 

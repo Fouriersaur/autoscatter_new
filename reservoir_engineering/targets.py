@@ -64,8 +64,7 @@ import numpy as np
 #   r = 1.5  →  ~13  dB squeezing  (challenging)
 
 def squeezed_vacuum(r: float) -> np.ndarray:
-    pass
-
+    return 0.5 * np.diag([np.exp(-2*r), np.exp(2*r)])
 
 # ───────────────────────────────────────────────────────────────────────────
 # two_mode_squeezed(r) → np.ndarray shape (4, 4)
@@ -112,8 +111,7 @@ def two_mode_squeezed(r: float) -> np.ndarray:
 # If the optimizer cannot achieve this target, there is a bug in the physics.
 
 def vacuum(n_modes: int = 1) -> np.ndarray:
-    pass
-
+    return 0.5 * np.eye(2 * n_modes)
 
 # ───────────────────────────────────────────────────────────────────────────
 # thermal(n_bar, n_modes=1) → np.ndarray shape (2*n_modes, 2*n_modes)
@@ -129,8 +127,7 @@ def vacuum(n_modes: int = 1) -> np.ndarray:
 # mode, and as a sanity-check target for the mechanical bath alone.
 
 def thermal(n_bar: float, n_modes: int = 1) -> np.ndarray:
-    pass
-
+    return (n_bar + 0.5) * np.eye(2 * n_modes)
 
 # ───────────────────────────────────────────────────────────────────────────
 # cluster_state(n_modes, delta) → np.ndarray shape (2*n_modes, 2*n_modes)
@@ -181,9 +178,8 @@ def cluster_state(n_modes: int, delta: float) -> np.ndarray:
 # Use this to validate user-defined target covariances before running
 # the optimizer — an unphysical target will produce meaningless results.
 
-def is_physical(sigma: np.ndarray) -> bool:
-    pass
-
+def is_physical(sigma):
+    return bool(np.all(symplectic_eigenvalues(sigma) >= 0.5 - 1e-10))
 
 # ───────────────────────────────────────────────────────────────────────────
 # symplectic_eigenvalues(sigma) → np.ndarray shape (N,)
@@ -205,8 +201,16 @@ def is_physical(sigma: np.ndarray) -> bool:
 #   ν_k > ½            ↔  mode k is mixed (thermal or non-minimum uncertainty)
 
 def symplectic_eigenvalues(sigma: np.ndarray) -> np.ndarray:
-    pass
+    N = sigma.shape[0] // 2
+    Omega = np.zeros_like(sigma)
+    # Generate the omega matrix
+    for i in range(N):
+        Omega[2*i, 2*i+1] = 1.
+        Omega[2*i+1, 2*i] = -1.
+    M = 1j * Omega @ sigma
+    eigs = np.linalg.eigvals(M)
 
+    return np.sprt(np.abs(eigs.real))[N:]
 
 # ───────────────────────────────────────────────────────────────────────────
 # squeezing_db(sigma, mode_id=0) → float

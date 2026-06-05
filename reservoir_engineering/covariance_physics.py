@@ -281,11 +281,13 @@ def build_hamiltonian_matrix(
 
     N  = len(nodes)
     H  = jnp.zeros((2 * N, 2 * N))
-    I2 = jnp.eye(2)
-    J2 = jnp.array([[0.,  1.], [-1., 0.]])  # detuning rotation block
-    sz = jnp.array([[1.,  0.], [ 0., -1.]]) # σ_z for TMS
+    J2 = jnp.array([[0.,  1.], [-1., 0.]])  # [[0,1],[-1,0]] — used for detuning AND BS
+    sx = jnp.array([[0.,  1.], [ 1., 0.]])  # σ_x = [[0,1],[1,0]] — used for TMS
+    sz = jnp.array([[1.,  0.], [ 0., -1.]]) # σ_z = [[1,0],[0,-1]] — used for parametric
 
     # Step 1 — diagonal detuning blocks (from H = Δ_i a_i†a_i)
+    # [a_i, Δ_i a_i†a_i] = Δ_i a_i  →  ȧ_i = -iΔ_i a_i
+    # → ẋ_i = +Δ_i p_i,  ṗ_i = -Δ_i x_i  →  Δ_i · J₂
     for i, node in enumerate(nodes):
         s     = quadrature_slice(i)
         delta = node.get('delta', 0.0)
@@ -297,16 +299,23 @@ def build_hamiltonian_matrix(
         sj = quadrature_slice(edge['j'])
         g  = coupling_strengths[k]
 
-        if edge['type'] == 'beamsplitter':          # H = g(a†b + ab†)
-            H = H.at[si, sj].add( g * I2)          # C_{i,j} = +g·I₂
-            H = H.at[sj, si].add( g * I2)          # C_{j,i} = +g·I₂  (symmetric)
+        if edge['type'] == 'beamsplitter':
+            # H = g(a†b + ab†)  →  [a,H] = g·b  →  ȧ = -ig·b
+            # ẋ_i = +g·p_j,  ṗ_i = -g·x_j  →  block = g·J₂
+            # ẋ_j = +g·p_i,  ṗ_j = -g·x_i  →  block = g·J₂  (same)
+            H = H.at[si, sj].add( g * J2)   # C_{i,j} = +g·J₂
+            H = H.at[sj, si].add( g * J2)   # C_{j,i} = +g·J₂  (symmetric)
 
-        elif edge['type'] == 'two_mode_squeezing':  # H = g(a†b† + ab)
-            H = H.at[si, sj].add( g * sz)          # C_{i,j} = +g·σ_z
-            H = H.at[sj, si].add(-g * sz)          # C_{j,i} = -g·σ_z  (antisymmetric)
+        elif edge['type'] == 'two_mode_squeezing':
+            # H = g(a†b† + ab)  →  [a,H] = g·b†  →  ȧ = -ig·b†
+            # ẋ_i = -g·p_j,  ṗ_i = -g·x_j  →  block = -g·σ_x
+            # ẋ_j = -g·p_i,  ṗ_j = -g·x_i  →  block = -g·σ_x  (same sign, symmetric)
+            H = H.at[si, sj].add(-g * sx)   # C_{i,j} = -g·σ_x
+            H = H.at[sj, si].add(-g * sx)   # C_{j,i} = -g·σ_x  (same sign)
 
-        elif edge['type'] == 'parametric':          # H = χ(a² + a†²), single-mode
-            H = H.at[si, si].add(g * sz)           # diagonal σ_z block
+        elif edge['type'] == 'parametric':
+            # H = χ(a² + a†²), single-mode squeezing
+            H = H.at[si, si].add(g * sz)    # diagonal σ_z block
 
     return H
 
@@ -632,6 +641,15 @@ def get_mode_covariance(
 #   so the gradient landscape is well-conditioned numerically.
 #   The exponents betas[k] (found in Stage 2) encode which edges need to be
 #   parametrically stronger than others as the overall drive scale grows.
+
+"""
+def build_drift_matrix(
+    nodes: List[Dict],
+    edges: List[Dict],
+    coupling_strengths: jnp.ndarray,
+
+"""
+
 #
 # Differentiability:
 #   All operations (jnp.sqrt, multiplication, build_drift_matrix) are differentiable.
@@ -646,14 +664,19 @@ def build_drift_matrix_from_ratios(
     lambda_scale: float,
 ) -> jnp.ndarray:
     
+    coupling_strengths = []
     
+    for k, edge in enumerate(edges):
+        i, j = edge["i"], edge["j"]
+        decay_i = nodes[i]["kappa"] if nodes[i]["type"] == "cavity" else nodes[i]["gamma"]
+        decay_j = nodes[j]["kappa"] if nodes[j]["type"] == "cavity" else nodes[j]["gamma"]
+        
+        C_k = lambda_scale ** betas[k] * ratios[k]
+        g_k = jnp.sqrt(C_k * decay_i * decay_j / 4)
+        coupling_strengths.append(g_k)
+
+    return build_drift_matrix(nodes, edges, jnp.array(coupling_strengths))
     
-
-
-
-    pass
-
-
 # ───────────────────────────────────────────────────────────────────────────
 # covariance_loss(coupling_strengths, nodes, edges, target_cov, target_mode_ids)
 # ───────────────────────────────────────────────────────────────────────────
@@ -698,8 +721,16 @@ def covariance_loss(
     target_cov: jnp.ndarray,
     target_mode_ids: List[int],
 ) -> jnp.ndarray:
-    pass
+    
+    A = build_drift_matrix(nodes=nodes, edges=edges, coupling_strengths=coupling_strengths)
+    D = build_diffusion_matrix(nodes)
 
+    sigma = solve_lyapunov_kronecker(A,D)
+    sigma_sub = get_mode_covariance(sigma, target_mode_ids)
+    diff = sigma_sub - target_cov
+    loss = jnp.sum(diff**2)/2
+
+    return loss
 
 # ───────────────────────────────────────────────────────────────────────────
 # covariance_loss_from_ratios(ratios, nodes, edges, D, betas, lambda_scale,
@@ -759,4 +790,13 @@ def covariance_loss_from_ratios(
     target_cov: jnp.ndarray,
     target_mode_ids: List[int],
 ) -> jnp.ndarray:
-    pass
+    
+    A = build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
+    D = build_diffusion_matrix(nodes)
+
+    sigma = solve_lyapunov_kronecker(A,D)
+    sigma_sub = get_mode_covariance(sigma, target_mode_ids)
+    diff = sigma_sub - target_cov
+    loss = jnp.sum(diff**2)/2
+
+    return loss

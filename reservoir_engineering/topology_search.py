@@ -106,14 +106,14 @@ PARAMETRIC = 3          # single-mode squeezing on mode i (degenerate OPA)
 # Convert a 1D upper-triangle array to a full symmetric N×N edge matrix.
 #
 # Parameters:
-#   triu_array : 1D int array, length N(N+1)/2
+#   triu_array : 1D int array, length N(N+1)/2 - [00, 01, 02, 11, 12, 22]
 #   n_nodes    : int, number of modes N
 #
 # Returns:
 #   edge_matrix : np.ndarray (N, N), symmetric
 #                 edge_matrix[i,j] = edge_matrix[j,i] = edge type for (i,j)
 #                 Diagonal: edge_matrix[i,i] = parametric type (0 or 3)
-#
+# 
 # Method:
 #   idxs_upper_triangle = np.triu_indices(n_nodes)
 #   Initialize edge_matrix = np.zeros([n_nodes, n_nodes], dtype=int)
@@ -126,8 +126,13 @@ PARAMETRIC = 3          # single-mode squeezing on mode i (degenerate OPA)
 # where k is the diagonal index. They are NOT doubled by the symmetry copy.
 
 def triu_to_edge_matrix(triu_array, n_nodes: int) -> np.ndarray:
-    pass
+    M = np.zeros((n_nodes, n_nodes), dtype=int)
+    rows, cols = np.triu_indices(n_nodes)
+    for k, (i,j) in enumerate(zip(rows, cols)):
+        M[i,j] = triu_array[k]
+        M[j,i] = triu_array[k]
 
+    return M 
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: edge_matrix_to_triu(edge_matrix) → np.ndarray (1D)
@@ -147,8 +152,9 @@ def triu_to_edge_matrix(triu_array, n_nodes: int) -> np.ndarray:
 #   return edge_matrix[triu_indices]
 
 def edge_matrix_to_triu(edge_matrix: np.ndarray) -> np.ndarray:
-    pass
-
+    n = edge_matrix.shape[0]
+    rows, cols = np.triu_indices(n)
+    return edge_matrix[rows, cols]
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: check_if_subgraph(edge_matrices, potential_subgraphs) → bool
@@ -171,10 +177,6 @@ def edge_matrix_to_triu(edge_matrix: np.ndarray) -> np.ndarray:
 # Implementation: np.any(np.sum((edge_matrices - potential_subgraphs) < 0, (-1,-2)) == 0)
 # This mirrors AutoScatter's check_if_subgraph EXACTLY (same logic, different array names).
 
-def check_if_subgraph(edge_matrices, potential_subgraphs) -> bool:
-    pass
-
-
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: check_if_subgraph_triu(triu_matrices, potential_subgraphs_triu) → bool
 # ───────────────────────────────────────────────────────────────────────────
@@ -184,11 +186,16 @@ def check_if_subgraph(edge_matrices, potential_subgraphs) -> bool:
 # instead of full N×N matrices. More memory-efficient for large searches.
 #
 # Returns True if any potential_subgraph_triu is elementwise ≤ any triu_matrix.
-# Implementation: np.any(np.sum((triu_matrices - potential_subgraphs_triu) < 0, -1) == 0)
+# A is a subgraph of B iff A[k] <= B[k] for all k.
 
 def check_if_subgraph_triu(triu_matrices, potential_subgraphs_triu) -> bool:
-    pass
-
+    triu_matrices            = np.atleast_2d(triu_matrices)
+    potential_subgraphs_triu = np.atleast_2d(potential_subgraphs_triu)
+    for sub in potential_subgraphs_triu:
+        for mat in triu_matrices:
+            if np.all(sub <= mat):
+                return True
+    return False
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: translate_triu_to_conditions(triu_array, node_types) → list
@@ -220,6 +227,14 @@ def check_if_subgraph_triu(triu_matrices, potential_subgraphs_triu) -> bool:
 #   COUPLING_WITH_PHASE → no constraint (both BS and TMS allowed in our case too)
 
 def translate_triu_to_conditions(triu_array, node_types: List[str]) -> list:
+
+    from reservoir_engineering.constraints import (
+    Constraint_coupling_absent,
+    Constraint_coupling_beamsplitter,
+    Constraint_coupling_two_mode_squeezing)
+
+    n = len(node_types)
+
     pass
 
 

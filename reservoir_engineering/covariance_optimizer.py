@@ -858,10 +858,13 @@ class CovarianceOptimizer:
         # Give the indices of the free variables that need optimising
         free_idxs = self.give_free_variable_idxs(conditions)
         E = len(free_idxs)
-
+        
+        # initializes the coupling ratios
+        # draws E random values in [lo,hi] = u_k = log(C_k) -> C_k = [e^-1, e^1]
         lo, hi = INIT_LOG_RATIO_RANGE_DEFAULT
         u_init = np.random.uniform(lo, hi, E).astype(float)
         
+        # Initilise the detunings
         if optimize_detunings:
             x0 = np.concatenate([u_init, np.zeros(self.num_modes)])
         else:
@@ -896,9 +899,15 @@ class CovarianceOptimizer:
     # Returns a full coupling array of shape (num_all_edges,).
     # Used to recover the full solution from the optimiser output.
 
+    
     def complete_variable_arrays_with_zeros(self, partial_cs, conditions: list) -> np.ndarray:
+        # List of position of the free edges within the full index list
         free_idxs = self.give_free_variable_idxs(conditions)
+
+        # List of all zeros to create a full index list (include those without edges)
         full = np.zeros(len(self.all_possible_edges))
+
+        # Update the list so that len(full) = total number of modes
         for k, idx in enumerate(free_idxs):
             full[idx] = partial_cs[k]
         return full
@@ -1001,6 +1010,7 @@ class CovarianceOptimizer:
         method: str = 'L-BFGS-B',
         **kwargs_solver,
     ):
+        
         from reservoir_engineering.topology_search import (
             TopologyGraph, translate_triu_to_conditions, translate_conditions_to_triu)
         from reservoir_engineering.covariance_physics import (
@@ -1017,6 +1027,7 @@ class CovarianceOptimizer:
         if lambda_scale is None:
             lambda_scale = LAMBDA_SCALE_DEFAULT
 
+        # == Setting up == 
         default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
         default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
         nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
@@ -1030,20 +1041,24 @@ class CovarianceOptimizer:
         enforced_constraints = self.enforced_constraints
         J2 = jnp.array([[0., 1.], [-1., 0.]])
 
-        # Build loss: x = [u_0,...,u_{E-1}, Δ_0,...,Δ_{N-1}]
+        # == Define loss Function: x = [u_0,...,u_{E-1}, Δ_0,...,Δ_{N-1}] == 
         def loss_fn(x):
             log_ratios = x[:E]
             detunings_x = x[E:]
             ratios = jnp.exp(log_ratios)
             A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
+            
             for i in range(N):
                 s = slice(2 * i, 2 * i + 2)
                 A = A.at[s, s].add(detunings_x[i] * J2)
+            
             sigma = solve_lyapunov_kronecker(A, D)
             sigma_sub = get_mode_covariance(sigma, target_mode_ids)
             loss = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
+            
             for c in enforced_constraints:
                 loss = loss + c(A, sigma)
+            
             return loss
 
         if calc_conditions_and_gradients is not None:
@@ -1052,7 +1067,11 @@ class CovarianceOptimizer:
             loss_jit = jax.jit(loss_fn)
             grad_jit = jax.jit(jax.grad(loss_fn))
 
-        # Initial guess
+        # == Initial guess == 
+        # u_warm comes from stage 2 - the check convergecne step 
+        # since there is some level of optimization in stage 2, 
+        # u_warm is the parameter which is slghly optimized in 2
+
         if u_warm is not None:
             u_init = np.array(u_warm[:E], dtype=float)
         else:
@@ -1064,13 +1083,16 @@ class CovarianceOptimizer:
         else:
             x0 = u_init
 
+        # Loss History
         loss_history = []
         def callback(x):
             loss_history.append(float(loss_jit(jnp.array(x, dtype=float))))
-
+        
+        # Optimization solver
         solver_opts = dict(self.solver_options)
         solver_opts.update(kwargs_solver)
 
+        # Run optimization
         result = sciopt.minimize(
             fun=lambda x: float(loss_jit(jnp.array(x, dtype=float))),
             jac=lambda x: np.array(grad_jit(jnp.array(x, dtype=float)), dtype=float),
@@ -1081,6 +1103,7 @@ class CovarianceOptimizer:
             callback=callback,
         )
 
+        # Solutions to Optimization and sucess or not 
         x_sol = result.x
         log_ratios_sol = x_sol[:E]
         detunings_sol = x_sol[E:] if optimize_detunings else np.zeros(N)

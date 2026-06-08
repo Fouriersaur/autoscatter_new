@@ -278,7 +278,23 @@ def find_minimum_number_auxiliary_modes(
     max_value: int = 5,
     **kwargs_optimizer,
 ):
-    pass
+    for num_aux in range(start_value, max_value + 1):
+        print(f'testing {num_aux} auxiliary modes')
+        node_types = list(node_types_signal) + ['cavity'] * num_aux
+        try:
+            optimizer = CovarianceOptimizer(
+                sigma_target=sigma_target,
+                target_mode_ids=target_mode_ids,
+                node_types=node_types,
+                num_auxiliary_modes=num_aux,
+                make_initial_test=True,
+                **kwargs_optimizer,
+            )
+            print(f'minimum auxiliary modes: {num_aux}')
+            return optimizer
+        except Exception:
+            continue
+    return None
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -564,6 +580,8 @@ class CovarianceOptimizer:
     #
     # No AutoScatter analogue (AutoScatter's passive cavities are always stable).
 
+
+    # == To Check if Matrix A satisfies the stability condition under unit coopertivity == 
     def check_stability_unit_cooperativity(self, triu_array) -> bool:
         from reservoir_engineering.topology_search import TopologyGraph
         from reservoir_engineering.covariance_physics import build_drift_matrix, check_stability
@@ -575,12 +593,22 @@ class CovarianceOptimizer:
         # Creates Edges List: {'i': 0, 'j': 1, 'type': 'beamsplitter'}
         nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
             default_kappa=default_kappa, default_gamma=default_gamma,)
+
+        unit_gs = [] # Coupling strength given unit coopertivity
+
+        for edge in edges:
+            # Obtain the two nodes for each edge
+            ni, nj = nodes[edge["i"]], nodes[edge["j"]]
+
+            # Decay rates of the two modes with the edge connected
+            di = ni.get('kappa', ni.get('gamma'))
+            dj = nj.get('kappa', nj.get('gamma'))
+
+            unit_gs.append(float(np.sqrt(di * dj / 4.)))
         
-
-
-
-    
-        pass
+        A = build_drift_matrix(nodes, edges, jnp.array(unit_gs))
+        
+        return check_stability(A)
 
     # -----------------------------------------------------------------------
     # check_convergence(triu_array, lambda_values=None, short_iter=None,
@@ -705,8 +733,16 @@ class CovarianceOptimizer:
     # Used by create_initial_guess, setup_bounds, and
     # give_conditions_func_with_conditions to handle topology constraints.
 
+    # == see which edges are free to optimize? == 
     def give_free_variable_idxs(self, conditions: list) -> list:
-        pass
+        from reservoir_engineering.constraints import Constraint_coupling_absent
+        
+        # Check which edges are absent 
+        absent = {tuple(c.idxs) for c in conditions
+                  if isinstance(c, Constraint_coupling_absent)}
+        
+        # return a list of indicies k which output edges which are present
+        return [k for k, (i, j) in enumerate(self.all_possible_edges) if (min(i,j), max(i,j)) not in absent]
 
     # -----------------------------------------------------------------------
     # give_conditions_func_with_conditions(conditions) → (loss_fn, grad_fn, _)
@@ -728,8 +764,59 @@ class CovarianceOptimizer:
     # parameter array padded with zeros for constrained variables, then
     # extracts the relevant gradient components.
 
+    # == Returns the loss function and its gradient for a specific toplogy found == 
+
     def give_conditions_func_with_conditions(self, conditions: list):
-        pass
+        from reservoir_engineering.topology_search import translate_conditions_to_triu, TopologyGraph
+        from reservoir_engineering.covariance_physics import (
+            build_drift_matrix_from_ratios, solve_lyapunov_kronecker, get_mode_covariance)
+        
+        # == When topology is found -> what is the triu array, nodes and edges of the topology == 
+        triu_array = translate_conditions_to_triu(conditions, self.num_modes, self.node_types)
+        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
+        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
+        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
+            default_kappa=default_kappa, default_gamma=default_gamma)
+        
+        E = len(edges)
+        N = self.num_modes
+        D = self.D
+        sigma_target_jnp = jnp.array(self.sigma_target)
+        target_mode_ids = self.target_mode_ids
+        enforced_constraints = self.enforced_constraints
+        J2 = jnp.array([[0., 1.], [-1., 0.]])
+        lambda_scale = LAMBDA_SCALE_DEFAULT
+
+        def loss_fn(x):
+            """
+            x is a flat vector of all free parameters:
+            x = [u_0, u_1, ..., u_{E-1}, Δ_0, Δ_1, ..., Δ_{N-1}]
+                ←── log coupling ratios ──→  ←──── detunings ────→
+            """
+            log_ratios = x[:E]
+            detunings_x = x[E:]
+            ratios = jnp.exp(log_ratios)
+
+            A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
+            
+            for i in range(N):
+                s = slice(2 * i, 2 * i + 2)
+                A = A.at[s, s].add(detunings_x[i] * J2)
+            
+            # construct the cov matrix -> loss function
+            sigma = solve_lyapunov_kronecker(A, D)
+            sigma_sub = get_mode_covariance(sigma, target_mode_ids)
+            loss = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
+            
+            # Add the contraints f into the loss function
+            for c in enforced_constraints:
+                loss = loss + c(A, sigma)
+            
+            return loss
+
+        loss_jit = jax.jit(loss_fn)
+        grad_jit = jax.jit(jax.grad(loss_fn))
+        return loss_jit, grad_jit, None
 
     # -----------------------------------------------------------------------
     # create_initial_guess(conditions=[], u_warm=None, optimize_detunings=True)
@@ -759,13 +846,28 @@ class CovarianceOptimizer:
     #
     # If optimize_detunings=False: return only Group 1 (u_k only), shape (E_free,).
 
+    # === Create initial guesses for the 1. log ratios and 2. mode detunings ===
+
     def create_initial_guess(
         self,
         conditions: list = [],
         betas=None,
         optimize_detunings: bool = True,
     ):
-        pass
+        
+        # Give the indices of the free variables that need optimising
+        free_idxs = self.give_free_variable_idxs(conditions)
+        E = len(free_idxs)
+
+        lo, hi = INIT_LOG_RATIO_RANGE_DEFAULT
+        u_init = np.random.uniform(lo, hi, E).astype(float)
+        
+        if optimize_detunings:
+            x0 = np.concatenate([u_init, np.zeros(self.num_modes)])
+        else:
+            x0 = u_init
+        
+        return x0, free_idxs
 
     # -----------------------------------------------------------------------
     # setup_bounds(conditions) → np.ndarray or None
@@ -783,7 +885,7 @@ class CovarianceOptimizer:
     # Here the log reparametrisation eliminates that requirement entirely.
 
     def setup_bounds(self, conditions: list):
-        pass
+        return None  # log-space: u_k and Δ_i are both unconstrained reals
 
     # -----------------------------------------------------------------------
     # complete_variable_arrays_with_zeros(partial_cs, conditions) → np.ndarray
@@ -795,7 +897,11 @@ class CovarianceOptimizer:
     # Used to recover the full solution from the optimiser output.
 
     def complete_variable_arrays_with_zeros(self, partial_cs, conditions: list) -> np.ndarray:
-        pass
+        free_idxs = self.give_free_variable_idxs(conditions)
+        full = np.zeros(len(self.all_possible_edges))
+        for k, idx in enumerate(free_idxs):
+            full[idx] = partial_cs[k]
+        return full
 
     # -----------------------------------------------------------------------
     # optimize_given_conditions(conditions, ..., lambda_scale, u_warm) → (success, info_out)
@@ -895,7 +1001,143 @@ class CovarianceOptimizer:
         method: str = 'L-BFGS-B',
         **kwargs_solver,
     ):
-        pass
+        from reservoir_engineering.topology_search import (
+            TopologyGraph, translate_triu_to_conditions, translate_conditions_to_triu)
+        from reservoir_engineering.covariance_physics import (
+            build_drift_matrix_from_ratios, solve_lyapunov_kronecker, get_mode_covariance)
+
+        # Resolve: need both conditions and triu_array
+        if triu_array is not None and conditions is None:
+            conditions = translate_triu_to_conditions(triu_array, self.node_types)
+        elif conditions is not None and triu_array is None:
+            triu_array = translate_conditions_to_triu(conditions, self.num_modes, self.node_types)
+        elif conditions is None and triu_array is None:
+            raise ValueError("Must provide conditions or triu_array")
+
+        if lambda_scale is None:
+            lambda_scale = LAMBDA_SCALE_DEFAULT
+
+        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
+        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
+        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
+            default_kappa=default_kappa, default_gamma=default_gamma)
+        E = len(edges)
+        N = self.num_modes
+
+        sigma_target_jnp = jnp.array(self.sigma_target)
+        D = self.D
+        target_mode_ids = self.target_mode_ids
+        enforced_constraints = self.enforced_constraints
+        J2 = jnp.array([[0., 1.], [-1., 0.]])
+
+        # Build loss: x = [u_0,...,u_{E-1}, Δ_0,...,Δ_{N-1}]
+        def loss_fn(x):
+            log_ratios = x[:E]
+            detunings_x = x[E:]
+            ratios = jnp.exp(log_ratios)
+            A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
+            for i in range(N):
+                s = slice(2 * i, 2 * i + 2)
+                A = A.at[s, s].add(detunings_x[i] * J2)
+            sigma = solve_lyapunov_kronecker(A, D)
+            sigma_sub = get_mode_covariance(sigma, target_mode_ids)
+            loss = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
+            for c in enforced_constraints:
+                loss = loss + c(A, sigma)
+            return loss
+
+        if calc_conditions_and_gradients is not None:
+            loss_jit, grad_jit, _ = calc_conditions_and_gradients
+        else:
+            loss_jit = jax.jit(loss_fn)
+            grad_jit = jax.jit(jax.grad(loss_fn))
+
+        # Initial guess
+        if u_warm is not None:
+            u_init = np.array(u_warm[:E], dtype=float)
+        else:
+            lo, hi = INIT_LOG_RATIO_RANGE_DEFAULT
+            u_init = np.random.uniform(lo, hi, E).astype(float)
+
+        if optimize_detunings:
+            x0 = np.concatenate([u_init, np.zeros(N)])
+        else:
+            x0 = u_init
+
+        loss_history = []
+        def callback(x):
+            loss_history.append(float(loss_jit(jnp.array(x, dtype=float))))
+
+        solver_opts = dict(self.solver_options)
+        solver_opts.update(kwargs_solver)
+
+        result = sciopt.minimize(
+            fun=lambda x: float(loss_jit(jnp.array(x, dtype=float))),
+            jac=lambda x: np.array(grad_jit(jnp.array(x, dtype=float)), dtype=float),
+            x0=x0,
+            method=method,
+            bounds=None,
+            options=solver_opts,
+            callback=callback,
+        )
+
+        x_sol = result.x
+        log_ratios_sol = x_sol[:E]
+        detunings_sol = x_sol[E:] if optimize_detunings else np.zeros(N)
+        final_loss = float(loss_jit(jnp.array(x_sol, dtype=float)))
+        success = final_loss < max_violation_success
+
+        # Reconstruct A and sigma at solution
+        ratios_sol = jnp.exp(jnp.array(log_ratios_sol))
+        A_sol = build_drift_matrix_from_ratios(nodes, edges, ratios_sol, lambda_scale)
+        for i in range(N):
+            s = slice(2 * i, 2 * i + 2)
+            A_sol = A_sol.at[s, s].add(float(detunings_sol[i]) * J2)
+        sigma_full_sol = solve_lyapunov_kronecker(A_sol, D)
+        sigma_achieved = get_mode_covariance(sigma_full_sol, target_mode_ids)
+
+        # Physical quantities per edge
+        coupling_strengths_sol = []
+        cooperativities = {}
+        coupling_ratios_dict = {}
+        for k, edge in enumerate(edges):
+            ni, nj = nodes[edge['i']], nodes[edge['j']]
+            di = ni.get('kappa', ni.get('gamma'))
+            dj = nj.get('kappa', nj.get('gamma'))
+            u_k = float(log_ratios_sol[k])
+            C_tilde = float(np.exp(u_k))
+            C_k = lambda_scale * C_tilde
+            g_k = float(np.sqrt(max(C_k * di * dj / 4., 0.)))
+            coupling_strengths_sol.append(g_k)
+            label = f"({edge['i']},{edge['j']},{edge['type'][:3]})"
+            cooperativities[label] = C_k
+            coupling_ratios_dict[f'C~_{label}'] = C_tilde
+
+        if verbosity:
+            print(f'  loss={final_loss:.3e}  success={success}  nit={result.nit}')
+
+        info_out = {
+            'initial_guess'      : x0,
+            'free_idxs'          : self.give_free_variable_idxs(conditions),
+            'solution'           : x_sol,
+            'log_ratios'         : log_ratios_sol,
+            'coupling_ratios'    : coupling_ratios_dict,
+            'detunings'          : {f'Delta_{i}': float(detunings_sol[i]) for i in range(N)},
+            'lambda_scale'       : lambda_scale,
+            'coupling_strengths' : np.array(coupling_strengths_sol),
+            'cooperativities'    : cooperativities,
+            'physical_formula'   : 'g_k = sqrt(lambda * C~_k * decay_i * decay_j / 4)',
+            'final_cost'         : final_loss,
+            'success'            : success,
+            'optimizer_message'  : result.message,
+            'A'                  : np.array(A_sol),
+            'sigma_full'         : np.array(sigma_full_sol),
+            'sigma_achieved'     : np.array(sigma_achieved),
+            'sigma_target'       : self.sigma_target,
+            'nit'                : result.nit,
+            'loss_history'       : loss_history,
+        }
+        return success, info_out
 
     # -----------------------------------------------------------------------
     # repeated_optimization(num_tests, conditions, ...) → (success, infos, where)
@@ -931,7 +1173,38 @@ class CovarianceOptimizer:
         interrupt_if_successful: bool = True,
         **kwargs_solver,
     ):
-        pass
+        if lambda_scale is None:
+            lambda_scale = LAMBDA_SCALE_DEFAULT
+
+        # Build the JIT-compiled functions once, reuse across restarts
+        from reservoir_engineering.topology_search import translate_triu_to_conditions
+        if conditions is not None:
+            calc_cag = self.give_conditions_func_with_conditions(conditions)
+        elif triu_array is not None:
+            conds = translate_triu_to_conditions(triu_array, self.node_types)
+            calc_cag = self.give_conditions_func_with_conditions(conds)
+        else:
+            calc_cag = None
+
+        successes = []
+        infos = []
+        for _ in range(num_tests):
+            success, info = self.optimize_given_conditions(
+                conditions=conditions,
+                triu_array=triu_array,
+                lambda_scale=lambda_scale,
+                u_warm=u_warm,
+                verbosity=verbosity,
+                max_violation_success=max_violation_success,
+                calc_conditions_and_gradients=calc_cag,
+                **kwargs_solver,
+            )
+            successes.append(success)
+            infos.append(info)
+            if success and interrupt_if_successful:
+                break
+
+        return bool(np.any(successes)), infos, np.where(successes)
 
     # -----------------------------------------------------------------------
     # check_all_constraints(A, loss) → triu_array
@@ -956,7 +1229,23 @@ class CovarianceOptimizer:
     # topology. Same role here: find the sparsest graph that actually works.
 
     def check_all_constraints(self, A, sigma, threshold=None) -> np.ndarray:
-        pass
+        from reservoir_engineering.topology_search import translate_conditions_to_triu
+
+        if threshold is None:
+            threshold = 1e-6
+
+        fulfilled = []
+        A_jnp = jnp.array(A)
+        sigma_jnp = jnp.array(sigma)
+        for c in self.all_possible_constraints:
+            try:
+                residual = float(c(A_jnp, sigma_jnp))
+                if abs(residual) < threshold:
+                    fulfilled.append(c)
+            except Exception:
+                pass
+
+        return translate_conditions_to_triu(fulfilled, self.num_modes, self.node_types)
 
     # -----------------------------------------------------------------------
     # prepare_all_possible_combinations()
@@ -995,7 +1284,33 @@ class CovarianceOptimizer:
     # which uses itertools.product over possible coupling matrix entries.
 
     def prepare_all_possible_combinations(self):
-        pass
+        from reservoir_engineering.constraints import Constraint_coupling_absent
+        from reservoir_engineering.topology_search import (
+            NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
+            PARAMETRIC, BEAMSPLITTER_AND_TWO_MODE_SQUEEZING)
+
+        possible_entry_lists = []
+        for i, j in self.all_possible_edges:
+            forced_absent = any(
+                isinstance(c, Constraint_coupling_absent) and
+                c.idxs == [min(i, j), max(i, j)]
+                for c in self.enforced_constraints)
+            if forced_absent:
+                possible_entry_lists.append([NO_COUPLING])
+            elif i == j:
+                possible_entry_lists.append([NO_COUPLING, PARAMETRIC])
+            else:
+                possible_entry_lists.append([
+                    NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
+                    BEAMSPLITTER_AND_TWO_MODE_SQUEEZING])
+
+        self.possible_entry_lists = possible_entry_lists
+        self.list_of_triu_arrays = [
+            np.array(combo, dtype=np.int8)
+            for combo in itertools_product(*possible_entry_lists)]
+        self.complexity_levels = [int(np.sum(t)) for t in self.list_of_triu_arrays]
+        self.unique_complexity_levels = sorted(set(self.complexity_levels))
+        self.num_possible_graphs = len(self.list_of_triu_arrays)
 
     # -----------------------------------------------------------------------
     # identify_potential_combinations(complexity_level,
@@ -1027,7 +1342,22 @@ class CovarianceOptimizer:
         complexity_level: int,
         skip_check_for_valid_subgraphs: bool = False,
     ) -> list:
-        pass
+        from reservoir_engineering.topology_search import check_if_subgraph_triu
+
+        potential = []
+        for triu, c in zip(self.list_of_triu_arrays, self.complexity_levels):
+            if c != complexity_level:
+                continue
+            # Skip if this triu is a superset of a known invalid
+            if self.invalid_combinations:
+                if check_if_subgraph_triu([triu], self.invalid_combinations):
+                    continue
+            # Skip if a known valid is already a subgraph of this triu (redundant)
+            if not skip_check_for_valid_subgraphs and self.valid_combinations:
+                if check_if_subgraph_triu([triu], self.valid_combinations):
+                    continue
+            potential.append(triu)
+        return potential
 
     # -----------------------------------------------------------------------
     # find_valid_combinations(complexity_level, combinations_to_test=None,
@@ -1103,7 +1433,67 @@ class CovarianceOptimizer:
         combinations_to_test=None,
         perform_graph_reduction: bool = True,
     ):
-        pass
+        from reservoir_engineering.topology_search import (
+            translate_triu_to_conditions, check_if_subgraph_triu)
+
+        if combinations_to_test is None:
+            combinations_to_test = self.identify_potential_combinations(complexity_level)
+
+        newly_added = []
+        num_tested = 0
+        num_skipped = 0
+
+        for triu_array in combinations_to_test:
+
+            # STAGE 1: stability at unit cooperativity (fast filter, no gradient)
+            if not self.check_stability_unit_cooperativity(triu_array):
+                num_skipped += 1
+                continue  # DO NOT add to invalid_combinations
+
+            # STAGE 2: convergence test (prototype: always returns (None, True))
+            u_warm, stage2_ok = self.check_convergence(triu_array)
+            if not stage2_ok:
+                self.invalid_combinations.append(triu_array)
+                num_skipped += 1
+                continue
+
+            # Skip if a newly-found valid is already a subgraph of this triu
+            if newly_added and check_if_subgraph_triu([triu_array], newly_added):
+                num_skipped += 1
+                continue
+
+            # STAGE 3: gradient optimisation of log coupling ratios
+            conditions = translate_triu_to_conditions(triu_array, self.node_types)
+            success, infos, _ = self.repeated_optimization(
+                num_tests=self.kwargs_optimization['num_tests'],
+                conditions=conditions,
+                lambda_scale=LAMBDA_SCALE_DEFAULT,
+                u_warm=u_warm,
+                max_violation_success=self.kwargs_optimization['max_violation_success'],
+                interrupt_if_successful=self.kwargs_optimization['interrupt_if_successful'],
+            )
+            num_tested += 1
+
+            if success:
+                best_info = min(infos, key=lambda x: x['final_cost'])
+                if perform_graph_reduction:
+                    try:
+                        minimal_triu = self.check_all_constraints(
+                            best_info['A'], best_info['sigma_full'])
+                    except Exception:
+                        minimal_triu = triu_array
+                else:
+                    minimal_triu = triu_array
+                self.valid_combinations.append(minimal_triu)
+                self.best_info_list.append(best_info)
+                newly_added.append(minimal_triu)
+            else:
+                self.invalid_combinations.append(triu_array)
+                num_skipped += 1
+
+        self.tested_complexities.append(complexity_level)
+        self.num_tested_graphs.append(num_tested)
+        self.num_tested_invalid_graphs.append(num_skipped)
 
     # -----------------------------------------------------------------------
     # cleanup_valid_combinations()
@@ -1125,7 +1515,29 @@ class CovarianceOptimizer:
     # Mirrors AutoScatter's cleanup_valid_combinations exactly.
 
     def cleanup_valid_combinations(self):
-        pass
+        from reservoir_engineering.topology_search import check_if_subgraph_triu
+
+        if not self.valid_combinations:
+            return
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for t in self.valid_combinations:
+            key = tuple(t)
+            if key not in seen:
+                seen.add(key)
+                unique.append(t)
+
+        # Remove any triu that has a simpler valid triu as a subgraph (redundant)
+        kept = []
+        for i, t in enumerate(unique):
+            others = unique[:i] + unique[i + 1:]
+            if others and check_if_subgraph_triu([t], others):
+                continue  # a simpler valid topology is contained in t → discard t
+            kept.append(t)
+
+        self.valid_combinations = kept
 
     # -----------------------------------------------------------------------
     # perform_breadth_first_search() → np.ndarray of valid triu_arrays
@@ -1154,7 +1566,19 @@ class CovarianceOptimizer:
     #   (complexity 1 or 2) because neither BS alone nor TMS alone works.
 
     def perform_breadth_first_search(self) -> np.ndarray:
-        pass
+        self.prepare_all_possible_combinations()
+        print(f'{self.num_possible_graphs} graphs identified')
+
+        for c in self.unique_complexity_levels:
+            print(f'testing complexity {c}')
+            self.find_valid_combinations(c)
+            self.cleanup_valid_combinations()
+            if self.valid_combinations:
+                print(f'  found {len(self.valid_combinations)} valid topology/topologies')
+
+        if self.valid_combinations:
+            return np.array(self.valid_combinations, dtype=np.int8)
+        return np.array([], dtype=np.int8)
 
     # -----------------------------------------------------------------------
     # count_valid_invalid_graphs_layers() → (complexities, valid_counts, invalid_counts)
@@ -1166,7 +1590,14 @@ class CovarianceOptimizer:
     # Returns arrays of counts per complexity level, for analysis.py to plot.
 
     def count_valid_invalid_graphs_layers(self):
-        pass
+        complexities = getattr(self, 'unique_complexity_levels', [])
+        valid_counts = [
+            sum(1 for t in self.valid_combinations if int(np.sum(t)) == c)
+            for c in complexities]
+        invalid_counts = [
+            sum(1 for t in self.invalid_combinations if int(np.sum(t)) == c)
+            for c in complexities]
+        return complexities, valid_counts, invalid_counts
 
     # -----------------------------------------------------------------------
     # extract_cooperativities(conditions, solution_log_ratios, lambda_scale=None) → dict
@@ -1206,7 +1637,33 @@ class CovarianceOptimizer:
         solution_log_ratios,
         lambda_scale=None,
     ) -> dict:
-        pass
+        from reservoir_engineering.topology_search import translate_conditions_to_triu, TopologyGraph
+
+        if lambda_scale is None:
+            lambda_scale = LAMBDA_SCALE_DEFAULT
+
+        triu_array = translate_conditions_to_triu(conditions, self.num_modes, self.node_types)
+        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
+        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
+        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
+            default_kappa=default_kappa, default_gamma=default_gamma)
+
+        result = {}
+        for k, edge in enumerate(edges):
+            ni, nj = nodes[edge['i']], nodes[edge['j']]
+            di = ni.get('kappa', ni.get('gamma'))
+            dj = nj.get('kappa', nj.get('gamma'))
+            u_k = float(solution_log_ratios[k])
+            C_tilde = float(np.exp(u_k))
+            C_k = lambda_scale * C_tilde
+            g_k = float(np.sqrt(max(C_k * di * dj / 4., 0.)))
+            label = f"({edge['i']},{edge['j']},{edge['type'][:3]})"
+            result[f'u_{label}']  = u_k
+            result[f'C~_{label}'] = C_tilde
+            result[f'C_{label}']  = C_k
+            result[f'g_{label}']  = g_k
+        result['formula'] = 'g_k = sqrt(lambda * C~_k * decay_i * decay_j / 4)'
+        return result
 
     # -----------------------------------------------------------------------
     # dict_extract_relevant_information(solution_cs, conditions) → dict
@@ -1221,4 +1678,9 @@ class CovarianceOptimizer:
     # Called inside optimize_given_conditions to build solution_dict.
 
     def dict_extract_relevant_information(self, solution_cs, conditions: list) -> dict:
-        pass
+        free_idxs = self.give_free_variable_idxs(conditions)
+        result = {}
+        for k, idx in enumerate(free_idxs):
+            i, j = self.all_possible_edges[idx]
+            result[f'g_{i}{j}'] = float(solution_cs[k])
+        return result

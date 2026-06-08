@@ -259,15 +259,10 @@ def squeezing_db(sigma: np.ndarray, mode_id: int = 0) -> float:
 # Only defined for 2-mode states (4×4 covariance matrices).
 # Raise ValueError for other sizes.
 
-def log_negativity(sigma: np.ndarray) -> float:
-    if sigma.shape != (4, 4):
-        raise ValueError("log_negativity requires a 4x4 (2-mode) covariance matrix")
-    T = np.diag([1., 1., 1., -1.])       # partial transpose: flip p of mode 1
-    sigma_pt = T @ sigma @ T
-    nus = symplectic_eigenvalues(sigma_pt)
-    nu_min = float(np.min(nus))
-    return float(max(0., -np.log2(2 * nu_min)))
-
+def duan_criterion(sigma: np.ndarray) -> bool:
+    duan_sum = (sigma[0, 0] + sigma[2, 2] - 2 * sigma[0, 2]
+                + sigma[1, 1] + sigma[3, 3] + 2 * sigma[1, 3])
+    return bool(duan_sum < 1.0)
 
 # ───────────────────────────────────────────────────────────────────────────
 # duan_criterion(sigma) → bool

@@ -272,8 +272,8 @@ try:
 
     # fully_connected classmethod
     g_full = TopologyGraph.fully_connected(['cavity', 'mechanical'])
-    check('fully_connected: off-diagonal is TMS',
-          g_full.triu_array[1] == TWO_MODE_SQUEEZING)
+    check('fully_connected: off-diagonal is BS+TMS',
+          g_full.triu_array[1] == BEAMSPLITTER_AND_TWO_MODE_SQUEEZING)
 
     # empty classmethod
     g_empty = TopologyGraph.empty(['cavity', 'mechanical'])

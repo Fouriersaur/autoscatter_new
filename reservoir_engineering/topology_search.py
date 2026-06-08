@@ -682,7 +682,7 @@ class TopologyGraph:
     def fully_connected(cls, node_types: List[str]) -> 'TopologyGraph':
         n = len(node_types)
         rows, cols = np.triu_indices(n)
-        triu = np.array([NO_COUPLING if i == j else TWO_MODE_SQUEEZING
+        triu = np.array([PARAMETRIC if i == j else BEAMSPLITTER_AND_TWO_MODE_SQUEEZING
                          for i, j in zip(rows, cols)], dtype=int)
         return cls(node_types, triu)
 

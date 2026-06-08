@@ -96,7 +96,13 @@ def squeezed_vacuum(r: float) -> np.ndarray:
 # Usage: target for 3-mode systems with 2 signal modes (cavity mediates).
 
 def two_mode_squeezed(r: float) -> np.ndarray:
-    pass
+    c  = np.cosh(2*r)
+    s  = np.sinh(2*r)
+    sz = np.diag([1., -1.])
+    I2 = np.eye(2)
+    return 0.5 * np.block([[c*I2, s*sz],
+                            [s*sz, c*I2]])
+
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -203,14 +209,14 @@ def is_physical(sigma):
 def symplectic_eigenvalues(sigma: np.ndarray) -> np.ndarray:
     N = sigma.shape[0] // 2
     Omega = np.zeros_like(sigma)
-    # Generate the omega matrix
     for i in range(N):
         Omega[2*i, 2*i+1] = 1.
         Omega[2*i+1, 2*i] = -1.
     M = 1j * Omega @ sigma
     eigs = np.linalg.eigvals(M)
+    nus = np.sort(np.abs(eigs.real))   # ±ν_k pairs → take abs, sort
+    return nus[N:]                     # last N are the N distinct positive values
 
-    return np.sprt(np.abs(eigs.real))[N:]
 
 # ───────────────────────────────────────────────────────────────────────────
 # squeezing_db(sigma, mode_id=0) → float
@@ -229,7 +235,8 @@ def symplectic_eigenvalues(sigma: np.ndarray) -> np.ndarray:
 # of the mode and take the minimum eigenvalue.
 
 def squeezing_db(sigma: np.ndarray, mode_id: int = 0) -> float:
-    pass
+    sigma_xx = sigma[2*mode_id, 2*mode_id]
+    return float(-10 * np.log10(2 * sigma_xx))
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -253,7 +260,13 @@ def squeezing_db(sigma: np.ndarray, mode_id: int = 0) -> float:
 # Raise ValueError for other sizes.
 
 def log_negativity(sigma: np.ndarray) -> float:
-    pass
+    if sigma.shape != (4, 4):
+        raise ValueError("log_negativity requires a 4x4 (2-mode) covariance matrix")
+    T = np.diag([1., 1., 1., -1.])       # partial transpose: flip p of mode 1
+    sigma_pt = T @ sigma @ T
+    nus = symplectic_eigenvalues(sigma_pt)
+    nu_min = float(np.min(nus))
+    return float(max(0., -np.log2(2 * nu_min)))
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -274,5 +287,12 @@ def log_negativity(sigma: np.ndarray) -> float:
 # Only valid for 2-mode states (4×4 covariance matrix).
 # Simpler to compute than log_negativity; use as a quick entanglement check.
 
-def duan_criterion(sigma: np.ndarray) -> bool:
-    pass
+def log_negativity(sigma: np.ndarray) -> float:
+    if sigma.shape != (4, 4):
+        raise ValueError("log_negativity requires a 4x4 (2-mode) covariance matrix")
+    T = np.diag([1., 1., 1., -1.])       # partial transpose: flip p of mode 1
+    sigma_pt = T @ sigma @ T
+    nus = symplectic_eigenvalues(sigma_pt)
+    nu_min = float(np.min(nus))
+    return float(max(0., -np.log2(2 * nu_min)))
+

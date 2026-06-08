@@ -91,11 +91,51 @@ from typing import List, Optional
 # Edge type integer constants — mirrors:
 #   NO_COUPLING = 0, DETUNING = 1, COUPLING_WITHOUT_PHASE = 1, COUPLING_WITH_PHASE = 2
 # in autoscatter/architecture.py
+#
+# OFF-DIAGONAL slots (i ≠ j) allowed values: 0, 1, 2, 4
+# DIAGONAL slots    (i == j) allowed values: 0, 3
+#
+# BEAMSPLITTER_AND_TWO_MODE_SQUEEZING (4) means BOTH a red-sideband (BS) drive
+# AND a blue-sideband (TMS) drive exist between the same pair of modes.
+# This is the Kronwald topology: one cavity coupled to one mechanical mode by
+# two simultaneous drives. It requires value=4 because value=1 (BS only) and
+# value=2 (TMS only) cannot represent both drives on the same slot.
+#
+# Subgraph containment (used by check_if_subgraph_triu):
+#   0 ⊆ {0, 1, 2, 4}    (no coupling is a subgraph of anything)
+#   1 ⊆ {1, 4}           (BS is a subgraph of BS or BS+TMS)
+#   2 ⊆ {2, 4}           (TMS is a subgraph of TMS or BS+TMS)
+#   4 ⊆ {4}              (BS+TMS only a subgraph of itself)
+#   3 ⊆ {3}              (PARAMETRIC only a subgraph of itself, diagonal only)
+# Note: 1 (BS) is NOT a subgraph of 2 (TMS) and vice versa.
+# Simple integer comparison A[k] <= B[k] is therefore WRONG for this encoding.
+# Use _is_subgraph_slot() / check_if_subgraph_triu() which implement set logic.
 
-NO_COUPLING = 0         # no edge between modes i and j
-BEAMSPLITTER = 1        # beam-splitter (energy-conserving, red-sideband drive)
-TWO_MODE_SQUEEZING = 2  # two-mode squeezing (parametric, blue-sideband drive)
-PARAMETRIC = 3          # single-mode squeezing on mode i (degenerate OPA)
+NO_COUPLING                       = 0  # no edge between modes i and j
+BEAMSPLITTER                      = 1  # BS only (red-sideband drive)
+TWO_MODE_SQUEEZING                = 2  # TMS only (blue-sideband drive)
+PARAMETRIC                        = 3  # single-mode squeezing on mode i (diagonal only)
+BEAMSPLITTER_AND_TWO_MODE_SQUEEZING = 4  # BOTH BS and TMS drives on the same mode pair
+                                         # Kronwald/Wang-Clerk topology uses this.
+                                         # Creates TWO edges in the edges list:
+                                         #   {'i':i,'j':j,'type':'beamsplitter'}
+                                         #   {'i':i,'j':j,'type':'two_mode_squeezing'}
+                                         # and TWO coupling strengths per slot.
+
+# Subgraph containment lookup: _SUBGRAPH_SUPERSETS[a] = set of values b such that
+# edge type a is contained in edge type b (i.e., a is a subgraph of b).
+_SUBGRAPH_SUPERSETS = {
+    NO_COUPLING                       : {NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
+                                         BEAMSPLITTER_AND_TWO_MODE_SQUEEZING, PARAMETRIC},
+    BEAMSPLITTER                      : {BEAMSPLITTER, BEAMSPLITTER_AND_TWO_MODE_SQUEEZING},
+    TWO_MODE_SQUEEZING                : {TWO_MODE_SQUEEZING, BEAMSPLITTER_AND_TWO_MODE_SQUEEZING},
+    BEAMSPLITTER_AND_TWO_MODE_SQUEEZING: {BEAMSPLITTER_AND_TWO_MODE_SQUEEZING},
+    PARAMETRIC                        : {PARAMETRIC},
+}
+
+def _is_subgraph_slot(a: int, b: int) -> bool:
+    """Return True if edge type a is a subgraph of edge type b at a single slot."""
+    return b in _SUBGRAPH_SUPERSETS.get(a, {a})
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -165,35 +205,52 @@ def edge_matrix_to_triu(edge_matrix: np.ndarray) -> np.ndarray:
 # Check whether any graph in `potential_subgraphs` is a subgraph of any
 # graph in `edge_matrices`.
 #
-# Graph A is a subgraph of graph B iff A[i,j] ≤ B[i,j] for all (i,j).
-# (Lower edge type ≤ higher edge type — absence is a subgraph of anything.)
+# IMPORTANT: Do NOT use simple integer comparison A[i,j] <= B[i,j].
+# That is wrong because BS(1) <= TMS(2) by integer, but BS is NOT a subgraph
+# of TMS. Use _is_subgraph_slot() for correct set-based containment.
 #
 # Parameters:
 #   edge_matrices        : np.ndarray shape (M, N, N) OR (N, N)
 #   potential_subgraphs  : np.ndarray shape (K, N, N) OR (N, N)
 #
 # Returns True if any potential subgraph is a subgraph of any edge_matrix.
-#
-# Implementation: np.any(np.sum((edge_matrices - potential_subgraphs) < 0, (-1,-2)) == 0)
-# This mirrors AutoScatter's check_if_subgraph EXACTLY (same logic, different array names).
+# Uses _is_subgraph_slot() per entry to respect multi-edge containment.
+
+def check_if_subgraph(edge_matrices, potential_subgraphs) -> bool:
+    edge_matrices       = np.atleast_3d(np.array(edge_matrices))
+    potential_subgraphs = np.atleast_3d(np.array(potential_subgraphs))
+    for sub in potential_subgraphs:
+        for mat in edge_matrices:
+            if all(_is_subgraph_slot(int(sub[i,j]), int(mat[i,j]))
+                   for i in range(sub.shape[0])
+                   for j in range(sub.shape[1])):
+                return True
+    return False
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: check_if_subgraph_triu(triu_matrices, potential_subgraphs_triu) → bool
 # ───────────────────────────────────────────────────────────────────────────
 # MIRRORS: check_if_subgraph_upper_triangle in autoscatter/architecture.py
 #
-# Same as check_if_subgraph but operates on 1D upper-triangle arrays
-# instead of full N×N matrices. More memory-efficient for large searches.
+# Same as check_if_subgraph but operates on 1D upper-triangle arrays.
 #
-# Returns True if any potential_subgraph_triu is elementwise ≤ any triu_matrix.
-# A is a subgraph of B iff A[k] <= B[k] for all k.
+# IMPORTANT: Uses _is_subgraph_slot() for correct set-based containment.
+# Simple integer comparison (sub[k] <= mat[k]) is WRONG because it would
+# treat BS(1) as a subgraph of TMS(2) (since 1 <= 2), which is incorrect.
+# The correct containment is:
+#   BS(1) ⊆ BS(1) or BS+TMS(4) only — NOT TMS(2).
+#   TMS(2) ⊆ TMS(2) or BS+TMS(4) only — NOT BS(1).
+#
+# Returns True if any potential_subgraph_triu is a subgraph of any triu_matrix.
 
 def check_if_subgraph_triu(triu_matrices, potential_subgraphs_triu) -> bool:
     triu_matrices            = np.atleast_2d(triu_matrices)
     potential_subgraphs_triu = np.atleast_2d(potential_subgraphs_triu)
     for sub in potential_subgraphs_triu:
         for mat in triu_matrices:
-            if np.all(sub <= mat):
+            if all(_is_subgraph_slot(int(sub[k]), int(mat[k]))
+                   for k in range(len(sub))):
                 return True
     return False
 
@@ -210,33 +267,56 @@ def check_if_subgraph_triu(triu_matrices, potential_subgraphs_triu) -> bool:
 #   val == NO_COUPLING (0):
 #       → append Constraint_coupling_absent(i, j)
 #   val == BEAMSPLITTER (1):
-#       → append Constraint_coupling_beamsplitter(i, j)   ← only BS allowed
+#       → append Constraint_coupling_beamsplitter(i, j)    ← BS edge only
 #   val == TWO_MODE_SQUEEZING (2):
-#       → append Constraint_coupling_two_mode_squeezing(i, j)   ← only TMS allowed
+#       → append Constraint_coupling_two_mode_squeezing(i, j)  ← TMS edge only
+#   val == BEAMSPLITTER_AND_TWO_MODE_SQUEEZING (4):
+#       → append Constraint_coupling_beamsplitter(i, j)    ← BS edge present
+#       → append Constraint_coupling_two_mode_squeezing(i, j)  ← TMS edge present
+#       BOTH constraints added. This creates TWO edges between (i,j) in the
+#       optimizer's edge list and TWO free coupling strength variables.
+#       This is the Kronwald topology: one slot, two drives.
 #   val == PARAMETRIC (3) and i == j:
 #       → no constraint (parametric squeezing allowed on diagonal)
 #   val == NO_COUPLING (0) and i == j:
 #       → append Constraint_coupling_absent(i, i)   ← no self-squeezing
-#
-# The returned list tells the optimizer which edges are absent (→ strength=0)
-# and which edge types are enforced (→ constrained block structure in A).
-#
-# AutoScatter analogue:
-#   NO_COUPLING → Constraint_coupling_zero(i,j)
-#   COUPLING_WITHOUT_PHASE → Constraint_coupling_phase_zero(i,j)
-#   COUPLING_WITH_PHASE → no constraint (both BS and TMS allowed in our case too)
 
 def translate_triu_to_conditions(triu_array, node_types: List[str]) -> list:
-
-    from reservoir_engineering.constraints import (
-    Constraint_coupling_absent,
-    Constraint_coupling_beamsplitter,
-    Constraint_coupling_two_mode_squeezing)
+    try:
+        from reservoir_engineering.constraints import (
+            Constraint_coupling_absent,
+            Constraint_coupling_beamsplitter,
+            Constraint_coupling_two_mode_squeezing)
+    except ImportError:
+        from constraints import (
+            Constraint_coupling_absent,
+            Constraint_coupling_beamsplitter,
+            Constraint_coupling_two_mode_squeezing)
 
     n = len(node_types)
+    rows, cols = np.triu_indices(n)
+    conditions = []
 
-    pass
+    for k, (i, j) in enumerate(zip(rows, cols)):
+        val = int(triu_array[k])
+        # For the diagonal terms in the triu matrix
+        if i == j:
+            if val == NO_COUPLING:
+                conditions.append(Constraint_coupling_absent(i, j))
 
+        # For the off-diagonal terms in the triu matrix
+        else:
+            if val == NO_COUPLING:
+                conditions.append(Constraint_coupling_absent(i, j))
+            elif val == BEAMSPLITTER:
+                conditions.append(Constraint_coupling_beamsplitter(i, j))
+            elif val == TWO_MODE_SQUEEZING:
+                conditions.append(Constraint_coupling_two_mode_squeezing(i, j))
+            elif val == BEAMSPLITTER_AND_TWO_MODE_SQUEEZING:
+                conditions.append(Constraint_coupling_beamsplitter(i, j))
+                conditions.append(Constraint_coupling_two_mode_squeezing(i, j))
+
+    return conditions
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: translate_conditions_to_triu(conditions, n_nodes, node_types) → np.ndarray
@@ -262,7 +342,36 @@ def translate_triu_to_conditions(triu_array, node_types: List[str]) -> list:
 # the inferred constraints from a solution to a triu_array for storage.
 
 def translate_conditions_to_triu(conditions: list, n_nodes: int, node_types: List[str]) -> np.ndarray:
-    pass
+    try:
+        from reservoir_engineering.constraints import (
+            Constraint_coupling_absent,
+            Constraint_coupling_beamsplitter,
+            Constraint_coupling_two_mode_squeezing)
+    except ImportError:
+        from constraints import (
+            Constraint_coupling_absent,
+            Constraint_coupling_beamsplitter,
+            Constraint_coupling_two_mode_squeezing)
+
+    rows, cols = np.triu_indices(n_nodes)
+    triu = np.zeros(len(rows), dtype=int)
+
+    for k, (i, j) in enumerate(zip(rows, cols)):
+        key = [min(i,j), max(i,j)]
+        absent = any(isinstance(c, Constraint_coupling_absent) and c.idxs == key
+                     for c in conditions)
+        bs     = any(isinstance(c, Constraint_coupling_beamsplitter) and c.idxs == key
+                     for c in conditions)
+        tms    = any(isinstance(c, Constraint_coupling_two_mode_squeezing) and c.idxs == key
+                     for c in conditions)
+
+        if absent:               triu[k] = NO_COUPLING
+        elif bs and tms:         triu[k] = BEAMSPLITTER_AND_TWO_MODE_SQUEEZING
+        elif bs:                 triu[k] = BEAMSPLITTER
+        elif tms:                triu[k] = TWO_MODE_SQUEEZING
+        else:                    triu[k] = NO_COUPLING
+
+    return triu
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -289,8 +398,33 @@ def translate_conditions_to_triu(conditions: list, n_nodes: int, node_types: Lis
 #   num_complex_couplings_and_squeezings. Our dict is the same spirit.
 
 def characterize_topology(triu_array, node_types: List[str]) -> dict:
-    pass
+    
+    n = len(node_types)
+    rows, cols = np.triu_indices(n)
 
+    num_bs   = sum(1 for v in triu_array if v in (BEAMSPLITTER, BEAMSPLITTER_AND_TWO_MODE_SQUEEZING))
+    num_tms  = sum(1 for v in triu_array if v in (TWO_MODE_SQUEEZING, BEAMSPLITTER_AND_TWO_MODE_SQUEEZING))
+    num_para = sum(1 for k, v in enumerate(triu_array) if v == PARAMETRIC and rows[k] == cols[k])
+    
+    # Check for connectivity
+    adj = triu_to_edge_matrix(triu_array, n) > 0
+    visited, stack = set(), [0]
+    while stack:
+        nd = stack.pop()
+        if nd not in visited:
+            visited.add(nd)
+            stack.extend(j for j in range(n) if adj[nd, j] and j not in visited)
+    
+    return {
+        'num_bs_couplings':    num_bs,
+        'num_tms_couplings':   num_tms,
+        'num_parametric':      num_para,
+        'num_couplings':       num_bs + num_tms + num_para,
+        'num_active_couplings':num_tms + num_para,
+        'complexity':          int(np.sum(triu_array)),
+        'has_cavity':          any(t == 'cavity' for t in node_types),
+        'is_connected':        len(visited) == n,
+    }
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: find_min_number_pump_tones(triu_array, node_types, mode_freqs=None) → (int, list)
@@ -352,8 +486,10 @@ def find_min_number_pump_tones(triu_array, node_types: List[str], mode_freqs=Non
 # constraints (at least one cavity, connectedness, stability) prune most of it.
 
 def calc_number_of_possibilities(node_types: List[str]) -> int:
-    pass
-
+    # Calculate how many distinct topologies exist for N modes of the given types.
+    N = len(node_types)
+    off_diag = N * (N - 1) // 2
+    return 4**off_diag * 2**N
 
 # ───────────────────────────────────────────────────────────────────────────
 # CLASS: TopologyGraph
@@ -384,7 +520,16 @@ class TopologyGraph:
     #   self.triu_array    : 1D compact form (derived via edge_matrix_to_triu)
 
     def __init__(self, node_types: List[str], edge_matrix_or_triu):
-        pass
+        self.node_types = list(node_types)
+        self.num_nodes = len(node_types)
+        arr = np.array(edge_matrix_or_triu)
+
+        if arr.ndim == 1:
+            self.triu_array = arr
+            self.edge_matrix = triu_to_edge_matrix(arr, self.num_nodes)
+        else:
+            self.edge_matrix = arr
+            self.triu_array = edge_matrix_to_triu(arr)
 
     # -----------------------------------------------------------------------
     # Property: num_edges → int
@@ -394,7 +539,7 @@ class TopologyGraph:
 
     @property
     def num_edges(self) -> int:
-        pass
+        return int(np.sum(self.triu_array > 0))
 
     # -----------------------------------------------------------------------
     # Property: complexity → int
@@ -407,7 +552,7 @@ class TopologyGraph:
 
     @property
     def complexity(self) -> int:
-        pass
+        return(int(np.sum(self.triu_array)))
 
     # -----------------------------------------------------------------------
     # to_nodes_edges_dicts(default_kappa, default_gamma, default_n_th)
@@ -420,14 +565,42 @@ class TopologyGraph:
     #   type='mechanical' → {'id':i, 'type':'mechanical', 'kappa':0., 'gamma':default_gamma, 'n_th':default_n_th}
     #
     # edges — one dict per non-zero triu entry (i, j):
-    #   val=1 → {'i':i, 'j':j, 'type':'beamsplitter',      'strength':1.}
-    #   val=2 → {'i':i, 'j':j, 'type':'two_mode_squeezing', 'strength':1.}
-    #   val=3 → {'i':i, 'j':i, 'type':'parametric',         'strength':1.}
+    #   val=1 → one edge:  {'i':i, 'j':j, 'type':'beamsplitter',       'strength':1.}
+    #   val=2 → one edge:  {'i':i, 'j':j, 'type':'two_mode_squeezing',  'strength':1.}
+    #   val=3 → one edge:  {'i':i, 'j':i, 'type':'parametric',          'strength':1.}
+    #   val=4 → TWO edges: {'i':i, 'j':j, 'type':'beamsplitter',        'strength':1.}
+    #                      {'i':i, 'j':j, 'type':'two_mode_squeezing',   'strength':1.}
+    #           BEAMSPLITTER_AND_TWO_MODE_SQUEEZING creates TWO separate edge dicts.
+    #           The optimizer assigns TWO separate coupling_strengths to this slot.
+    #           This is the Kronwald topology: one cavity-mechanical pair, two drives.
     #
     # 'strength' is a placeholder; CovarianceOptimizer uses coupling_strengths array.
 
     def to_nodes_edges_dicts(self, default_kappa=1.0, default_gamma=0.01, default_n_th=0.0):
-        pass
+        nodes = []
+        for i, t in enumerate(self.node_types):
+            if t == 'cavity':
+                nodes.append({'id': i, 'type': 'cavity',
+                               'kappa': default_kappa, 'delta': 0.0})
+            else:
+                nodes.append({'id': i, 'type': 'mechanical',
+                               'gamma': default_gamma, 'n_th': default_n_th, 'delta': 0.0})
+        edges = []
+        rows, cols = np.triu_indices(self.num_nodes)
+        for k, (i, j) in enumerate(zip(rows, cols)):
+            val = int(self.triu_array[k])
+            if val == BEAMSPLITTER:
+                edges.append({'i': i, 'j': j, 'type': 'beamsplitter',        'strength': 1.0})
+            elif val == TWO_MODE_SQUEEZING:
+                edges.append({'i': i, 'j': j, 'type': 'two_mode_squeezing',  'strength': 1.0})
+            elif val == PARAMETRIC:
+                edges.append({'i': i, 'j': i, 'type': 'parametric',          'strength': 1.0})
+            elif val == BEAMSPLITTER_AND_TWO_MODE_SQUEEZING:
+                edges.append({'i': i, 'j': j, 'type': 'beamsplitter',        'strength': 1.0})
+                edges.append({'i': i, 'j': j, 'type': 'two_mode_squeezing',  'strength': 1.0})
+        
+        return nodes, edges
+     
 
     # -----------------------------------------------------------------------
     # to_conditions() → list of constraint objects
@@ -437,7 +610,7 @@ class TopologyGraph:
     # Returns the condition list used by CovarianceOptimizer.
 
     def to_conditions(self) -> list:
-        pass
+        return translate_triu_to_conditions(self.triu_array, self.node_types)
 
     # -----------------------------------------------------------------------
     # is_subgraph_of(other_topology) → bool
@@ -449,7 +622,7 @@ class TopologyGraph:
     # Uses check_if_subgraph_triu(self.triu_array, other_topology.triu_array).
 
     def is_subgraph_of(self, other: 'TopologyGraph') -> bool:
-        pass
+        return check_if_subgraph_triu([other.triu_array], [self.triu_array])
 
     # -----------------------------------------------------------------------
     # has_cavity() → bool
@@ -459,7 +632,7 @@ class TopologyGraph:
     # CovarianceOptimizer skips topologies where has_cavity() returns False.
 
     def has_cavity(self) -> bool:
-        pass
+        return any(t == 'cavity' for t in self.node_types)
 
     # -----------------------------------------------------------------------
     # is_connected() → bool
@@ -470,7 +643,15 @@ class TopologyGraph:
     # BFS/DFS from node 0 — check all N nodes are reachable.
 
     def is_connected(self) -> bool:
-        pass
+        adj = self.edge_matrix > 0
+        visited, stack = set(), [0]
+        while stack:
+            nd = stack.pop()
+            if nd not in visited:
+                visited.add(nd)
+                stack.extend(j for j in range(self.num_nodes)
+                              if adj[nd, j] and j not in visited)
+        return len(visited) == self.num_nodes
 
     # -----------------------------------------------------------------------
     # __eq__(other) → bool  and  __hash__() → int
@@ -481,11 +662,13 @@ class TopologyGraph:
     # __hash__ based on (tuple(node_types), triu_array.tobytes()).
     # Required for use in sets and as dict keys (deduplication in BFS).
 
+    # Check if the node types and the entries in the triu array are identical
     def __eq__(self, other) -> bool:
-        pass
+        return (self.node_types == other.node_types and
+                np.array_equal(self.triu_array, other.triu_array))
 
     def __hash__(self) -> int:
-        pass
+        return hash((tuple(self.node_types), self.triu_array.tobytes()))
 
     # -----------------------------------------------------------------------
     # classmethod: fully_connected(node_types) → TopologyGraph
@@ -497,7 +680,11 @@ class TopologyGraph:
 
     @classmethod
     def fully_connected(cls, node_types: List[str]) -> 'TopologyGraph':
-        pass
+        n = len(node_types)
+        rows, cols = np.triu_indices(n)
+        triu = np.array([NO_COUPLING if i == j else TWO_MODE_SQUEEZING
+                         for i, j in zip(rows, cols)], dtype=int)
+        return cls(node_types, triu)
 
     # -----------------------------------------------------------------------
     # classmethod: empty(node_types) → TopologyGraph
@@ -507,4 +694,5 @@ class TopologyGraph:
 
     @classmethod
     def empty(cls, node_types: List[str]) -> 'TopologyGraph':
-        pass
+        n = len(node_types)
+        return cls(node_types, np.zeros(n*(n+1)//2, dtype=int))

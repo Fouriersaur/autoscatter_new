@@ -5,6 +5,12 @@ Constraint objects for encoding graph topology and physics requirements.
 
 MIRRORS: autoscatter/constraints.py  (1-to-1 conceptual mapping)
 
+The core idea
+Every candidate topology in your BFS needs to answer two questions:
+
+What is the graph structure? — which edges exist, and what type (BS or TMS)?
+Is the physics valid? — is the system stable? Does it produce a physical quantum state?
+
 ═══════════════════════════════════════════════════════════════════════════════
 ROLE IN THE PIPELINE
 ═══════════════════════════════════════════════════════════════════════════════
@@ -113,7 +119,8 @@ EDGETYPE_PARAMETRIC = 'parametric'
 # Simplified because: A encodes all coupling info directly (no separate coupling matrix).
 
 class Base_Constraint:
-    pass
+    def __call__(self, A, sigma):
+        raise NotImplementedError
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -138,8 +145,14 @@ class Base_Constraint:
 #   AutoScatter's constraints.py defines __hash__ on the subclasses — do the same.
 
 class Coupling_Constraint(Base_Constraint):
-    pass
+    def __init__(self, i, j):
+        self.idxs = [min(i, j), max(i, j)]
 
+    def __eq__(self, other):
+        return type(self) == type(other) and self.idxs == other.idxs
+
+    def __hash__(self):
+        return hash((type(self).__name__, self.idxs[0], self.idxs[1]))
 
 # ───────────────────────────────────────────────────────────────────────────
 # CLASS: Constraint_coupling_absent(i, j)
@@ -167,8 +180,17 @@ class Coupling_Constraint(Base_Constraint):
 #   and fixed to 0. Mirrors give_free_variable_idxs in Architecture_Optimizer.
 
 class Constraint_coupling_absent(Coupling_Constraint):
-    pass
+    def __call__(self, A, sigma):
+        from covariance_physics import quadrature_slice
+        # Get the index to slice the needed part of the Drift Matrix A
+        si = quadrature_slice(self.idxs[0])
+        sj = quadrature_slice(self.idxs[1])
+        # Returns 0 if there is no coupling between modes i and j
+        # Returns > 0 if there is coupling between modes i and j
+        return jnp.sum(jnp.abs(A[si, sj]))
 
+    def __str__(self):
+        return f'No coupling between mode {self.idxs[0]} and mode {self.idxs[1]}'
 
 # ───────────────────────────────────────────────────────────────────────────
 # CLASS: Constraint_coupling_beamsplitter(i, j)
@@ -209,8 +231,13 @@ class Constraint_coupling_absent(Coupling_Constraint):
 #   'Edge (%i, %i) is a beamsplitter (no TMS component)' % (idx1, idx2)
 
 class Constraint_coupling_beamsplitter(Coupling_Constraint):
-    pass
-
+    def __call__(self, A, sigma):
+        from covariance_physics import quadrature_slice
+        si = quadrature_slice(self.idxs[0])
+        sj = quadrature_slice(self.idxs[1])
+        block = A[si, sj]
+        sym = (block + block.T) / 2        # TMS component — must be zero for pure BS
+        return jnp.sum(sym ** 2)
 
 # ───────────────────────────────────────────────────────────────────────────
 # CLASS: Constraint_coupling_two_mode_squeezing(i, j)
@@ -231,8 +258,16 @@ class Constraint_coupling_beamsplitter(Coupling_Constraint):
 # physical experiment, or to restrict the search space.
 
 class Constraint_coupling_two_mode_squeezing(Coupling_Constraint):
-    pass
+    def __call__(self, A, sigma):
+        from covariance_physics import quadrature_slice
+        si = quadrature_slice(self.idxs[0])
+        sj = quadrature_slice(self.idxs[1])
+        block = A[si, sj]
+        asym = (block - block.T) / 2       # BS component — must be zero for pure TMS
+        return jnp.sum(asym ** 2)
 
+    def __str__(self):
+        return f'Edge ({self.idxs[0]},{self.idxs[1]}) is two-mode squeezing'
 
 # ───────────────────────────────────────────────────────────────────────────
 # CLASS: Constraint_stability(penalty_strength=50.0)
@@ -266,8 +301,13 @@ class Constraint_coupling_two_mode_squeezing(Coupling_Constraint):
 #   (also a hard physics requirement, soft-enforced via penalty).
 
 class Constraint_stability(Base_Constraint):
-    pass
-
+    # To satisfy the stability condition
+    def __init__(self, penalty_strength=50.0):
+        self.penalty_strength = penalty_strength
+    
+    def __call__(self, A, sigma):
+        eigs = jnp.linalg.eigvals(A)
+        return self.penalty_strength * jnp.sum(jnp.maximum(0., jnp.real(eigs)))
 
 # ───────────────────────────────────────────────────────────────────────────
 # CLASS: Constraint_physical_state(target_mode_ids)
@@ -293,9 +333,21 @@ class Constraint_stability(Base_Constraint):
 # precision issues in near-unstable cases.
 
 class Constraint_physical_state(Base_Constraint):
-    pass
+    def __init__(self, target_mode_ids):
+        self.target_mode_ids = target_mode_ids
 
-
+    def __call__(self, A, sigma):
+        from covariance_physics import get_mode_covariance
+        s = get_mode_covariance(sigma, self.target_mode_ids)
+        N = s.shape[0] // 2
+        Omega = jnp.zeros_like(s)
+        for i in range(N):
+            Omega = Omega.at[2*i, 2*i+1].set(1.)
+            Omega = Omega.at[2*i+1, 2*i].set(-1.)
+        eigs = jnp.linalg.eigvals(1j * Omega @ s)
+        nu_min = jnp.min(jnp.abs(jnp.real(eigs)))
+        return jnp.maximum(0., 0.5 - nu_min)
+        
 # ───────────────────────────────────────────────────────────────────────────
 # CLASS: Constraint_target_squeezing(mode_id, r_min)
 # ───────────────────────────────────────────────────────────────────────────
@@ -315,8 +367,14 @@ class Constraint_physical_state(Base_Constraint):
 # level — this is a "reach at least this squeezing" floor constraint.
 
 class Constraint_target_squeezing(Base_Constraint):
-    pass
+    def __init__(self, mode_id, r_min):
+        self.mode_id = mode_id
+        self.r_min = r_min
 
+    def __call__(self, A, sigma):
+        sigma_xx = sigma[2*self.mode_id, 2*self.mode_id]
+        r_achieved = -0.5 * jnp.log(2. * sigma_xx)
+        return jnp.maximum(0., self.r_min - r_achieved)
 
 # ───────────────────────────────────────────────────────────────────────────
 # CLASS: Constraint_entanglement(mode_ids)
@@ -338,8 +396,15 @@ class Constraint_target_squeezing(Base_Constraint):
 # two-mode squeezed vacuum, cluster states).
 
 class Constraint_entanglement(Base_Constraint):
-    pass
+    def __init__(self, mode_ids):
+        self.mode_ids = mode_ids
 
+    def __call__(self, A, sigma):
+        from covariance_physics import get_mode_covariance
+        s = get_mode_covariance(sigma, self.mode_ids)
+        duan_sum = (s[0,0] + s[2,2] - 2*s[0,2] +
+                    s[1,1] + s[3,3] + 2*s[1,3])
+        return jnp.maximum(0., duan_sum - 1.0)
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: return_edge_type(A, i, j) → str or None
@@ -368,8 +433,20 @@ class Constraint_entanglement(Base_Constraint):
 #   Else: return None (only decay, no active squeezing self-coupling)
 
 def return_edge_type(A, i, j, threshold=1e-4):
-    pass
-
+    from covariance_physics import quadrature_slice
+    si = quadrature_slice(i)
+    sj = quadrature_slice(j)
+    if i == j:
+        diff = abs(float(A[2*i, 2*i]) - float(A[2*i+1, 2*i+1]))
+        return EDGETYPE_PARAMETRIC if diff > threshold else None
+    block = np.array(A[si, sj])
+    if np.linalg.norm(block, 'fro') < threshold:
+        return EDGETYPE_ABSENT
+    sym  = (block + block.T) / 2
+    asym = (block - block.T) / 2
+    if np.linalg.norm(sym) > np.linalg.norm(asym):
+        return EDGETYPE_TWO_MODE_SQUEEZING
+    return EDGETYPE_BEAMSPLITTER
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: setup_constraints(edges_absent, edges_beamsplitter, edges_tms) → list
@@ -395,8 +472,14 @@ def return_edge_type(A, i, j, threshold=1e-4):
 #   )
 
 def setup_constraints(edges_absent=None, edges_beamsplitter=None, edges_tms=None):
-    pass
-
+    conditions = []
+    for (i,j) in (edges_absent or []):
+        conditions.append(Constraint_coupling_absent(i, j))
+    for (i,j) in (edges_beamsplitter or []):
+        conditions.append(Constraint_coupling_beamsplitter(i, j))
+    for (i,j) in (edges_tms or []):
+        conditions.append(Constraint_coupling_two_mode_squeezing(i, j))
+    return conditions
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: check_overlapping_constraints(list_of_constraints)
@@ -412,8 +495,14 @@ def setup_constraints(edges_absent=None, edges_beamsplitter=None, edges_tms=None
 # Used at the start of optimize_given_conditions to fail fast on bad input.
 
 def check_overlapping_constraints(list_of_constraints):
-    pass
-
+    from collections import defaultdict
+    by_edge = defaultdict(list)
+    for c in list_of_constraints:
+        if isinstance(c, Coupling_Constraint):
+            by_edge[tuple(c.idxs)].append(type(c).__name__)
+    for edge, types in by_edge.items():
+        if 'Constraint_coupling_absent' in types and len(types) > 1:
+            raise ValueError(f"Contradictory constraints on edge {edge}: absent + type")
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: cleanup_list_of_constraints(combo) → list
@@ -428,8 +517,11 @@ def check_overlapping_constraints(list_of_constraints):
 # Used by cleanup_valid_combinations to canonicalise discovered topologies.
 
 def cleanup_list_of_constraints(combo):
-    pass
-
+    absent = {tuple(c.idxs) for c in combo if isinstance(c, Constraint_coupling_absent)}
+    return [c for c in combo
+            if not (isinstance(c, (Constraint_coupling_beamsplitter,
+                                   Constraint_coupling_two_mode_squeezing))
+                    and tuple(c.idxs) in absent)]
 
 # ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: plot_graph(nodes, edges_or_triu, coupling_strengths, node_colors,

@@ -84,11 +84,17 @@ The cooperativity dict is returned alongside the solution dict in the
 result of optimize_given_conditions, exactly as in AutoScatter.
 
 ═══════════════════════════════════════════════════════════════════════════════
-THREE-STAGE ALGORITHM  (the full pipeline inside find_valid_combinations)
+TWO-STAGE ALGORITHM  (prototype — Stage 2 scaling discovery commented out)
 ═══════════════════════════════════════════════════════════════════════════════
 
+PROTOTYPE SIMPLIFICATION:
+    Stage 2 (convergence test / scaling discovery) is currently disabled.
+    All cooperativity ratios C̃_k are assumed equal at initialisation (u_k=0).
+    Stage 3 optimises from this flat starting point directly.
+    Stage 2 should be re-enabled once the prototype recovers the Kronwald scheme.
+
 For every candidate topology produced by the BFS outer loop, the algorithm
-runs three internal stages before accepting or rejecting that topology.
+runs two internal stages before accepting or rejecting that topology.
 
 STAGE 1 — Stability check at unit cooperativity  (fast discrete filter)
     Build A from H with all cooperativities C_{ij} = 1.
@@ -97,76 +103,95 @@ STAGE 1 — Stability check at unit cooperativity  (fast discrete filter)
     A is assembled via the H → A map (build_drift_matrix): one block per
     Hamiltonian term.  Then check whether all eigenvalues of A have strictly
     negative real part.
-    If unstable → discard immediately.  Do NOT proceed to Stage 2 or 3.
+    If unstable → SKIP this topology (do not proceed to Stage 2 or 3).
     No gradient computation, no Lyapunov solve — just an eigenvalue check.
     Method: check_stability_unit_cooperativity(triu_array) → bool
 
-STAGE 2 — Find scaling exponents {β_i}  (combinatorial, no gradient)
-    Set C_i = λ^{β_i} (placeholder ratios C̃_i = 1) and solve the Lyapunov
-    equation at λ ∈ [10, 100, 1000].  Extract V_system(λ) each time.
-    Convergence criterion: V_system(λ=100) ≈ V_system(λ=1000) to within 5%.
-    Start with same-scaling: all β_i = 1.  If convergence → done.
-    If not: search over β_i ∈ EXPONENT_SEARCH_GRID_1 = {0.5, 1.0, 2.0}.
-    If still no convergence: try EXPONENT_SEARCH_GRID_2 = {0.5, 1.0, 1.5, 2.0, 3.0}.
-    If no combination converges → topology cannot realise a pure Gaussian state.
-    Discard and add to self.invalid_combinations.
-    Method: find_scaling_exponents(triu_array) → (betas, success)
+    CRITICAL — Stage 1 failures do NOT go into self.invalid_combinations.
+    Reason: a topology that is unstable at unit cooperativity may become
+    stable at a different coupling ratio. Adding MORE edges (a supergraph)
+    can add stabilising BS couplings that fix the instability.
+    Example: TMS-only is marginally unstable at C=1, but BS+TMS (Kronwald)
+    is stable. If TMS-only were added to invalid_combinations, its superset
+    BS+TMS would be pruned and never found.
+    Stage 1 is a SPEED FILTER only — it avoids expensive Stage 2/3 computation
+    for topologies that cannot even be stable at unit cooperativity, but it
+    does not make any claim about whether their supersets are valid.
 
-STAGE 3 — Find coupling ratios {C̃_i} AND detunings {Δ_i}  (continuous optimisation)
+# ── STAGE 2 DISABLED (prototype) ─────────────────────────────────────────────
+# STAGE 2 — Convergence test  (short optimisation at multiple scales)
+#     For λ in [10, 100, 1000]:
+#         Run a SHORT optimisation (~30 steps of L-BFGS-B) over log_ratios u_k:
+#             u_k* = argmin_{u_k} loss(λ, u_k)
+#             where C̃_k = exp(u_k),  g_k = sqrt(λ · C̃_k · decay_i · decay_j / 4)
+#         Record L*(λ) = loss at the short optimum.
+#     Accept topology if:
+#         L*(10) > L*(100) > L*(1000)   (loss strictly decreasing — converging)
+#         AND L*(1000) < CONVERGENCE_LOSS_THRESHOLD
+#     If accepted: warm-start Stage 3 from u_k* found at λ=1000.
+#     If rejected: add to self.invalid_combinations.
+#         Stage 2 failures CAN prune supersets — structural incompatibility
+#         with σ_target is not fixed by adding more edges.
+#     Method: check_convergence(triu_array) → (u_warm, success)
+#
+#     Key design choice: tests convergence at the OPTIMAL ratio for each λ,
+#     not an arbitrary placeholder (e.g. C̃_k=1 would give wrong ratios and
+#     incorrectly reject valid topologies like Kronwald).
+# ─────────────────────────────────────────────────────────────────────────────
+
+STAGE 2 (prototype) — Optimise log coupling ratios {u_k} AND detunings {Δ_i}
     Fix λ = LAMBDA_SCALE_DEFAULT = 1000.
     Free variables — TWO GROUPS (mirrors AutoScatter's gabs + Deltas):
-      Group 1 — coupling ratios:  C̃_i ∈ (0, ∞), one per active edge.
-          Actual cooperativity:  C_i = λ^{β_i} · C̃_i
-          Coupling strength:     g_i = sqrt(λ^{β_i} · C̃_i · decay_i · decay_j / 4)
-          Initial guess:         C̃_i ~ Uniform(INIT_RATIO_RANGE_DEFAULT)
-          Bounds:                C̃_i > 0 (enforced via L-BFGS-B lower bound)
+      Group 1 — LOG coupling ratios:  u_k = log(C̃_k) ∈ (−∞, +∞), one per active edge.
+          C̃_k = exp(u_k) > 0 automatically (no lower bound needed)
+          Cooperativity:   C_k = λ · exp(u_k)
+          Coupling:        g_k = sqrt(λ · exp(u_k) · decay_i · decay_j / 4)
+          Initial guess:   u_k = 0 for all k  (C̃_k = 1, all ratios equal — prototype)
+                           [future: warm-start from Stage 2 result u_k* at λ=1000]
+          Bounds:          none (log space handles positivity)
       Group 2 — mode detunings:  Δ_i ∈ (−∞, +∞), one per mode i.
-          Enter A as:            A[s_i, s_i] += Δ_i · [[0,1],[−1,0]]
-          Initial guess:         Δ_i = 0 (resonant driving — zero detuning start)
-          Bounds:                unbounded (Δ_i can be positive or negative)
-    Loss: ½‖V_system − V_target‖²_F  (Frobenius on signal modes only)
+          Enter A as:  A[s_i, s_i] += Δ_i · J₂   where J₂ = [[0,1],[-1,0]]
+          Initial guess: Δ_i = 0 (resonant driving start)
+          Bounds:        none (unbounded)
+    Loss: ½‖σ_system − σ_target‖²_F  (Frobenius on signal modes only)
+    Gradient flows: loss → σ_sub → Lyapunov solve → A → g_k → exp(u_k)
     Optimiser: L-BFGS-B + JAX autodiff (same as AutoScatter).
-    Multiple random initialisations for Group 1; Group 2 always starts at 0.
-    Method: optimize_given_conditions(conditions, betas, lambda_scale) → (success, info_out)
+    Multiple random restarts for Group 1; Group 2 always starts at 0.
+    Method: optimize_given_conditions(conditions, lambda_scale) → (success, info_out)
+
+    Why log parametrisation?
+      exp(u_k) > 0 automatically — no bounds needed.
+      Gradient steps are multiplicative: Δu_k=0.1 → 10% change at any scale.
+      Runaway prevented naturally: instability increases loss before exp(u_k) → ∞.
 
     Why include detunings?
       AutoScatter optimises over Δ_i explicitly (they are in all_variables_list).
       Here, Δ_i are needed whenever:
         (a) The target covariance has a squeezed quadrature at a non-zero angle
-            (Δ_i rotates the squeezing direction).
+            (Δ_i rotates the squeezing direction in phase space).
         (b) Multiple mechanical modes have different frequencies (only one can be in
             its own rotating frame; the others need residual detuning Δ ≠ 0).
         (c) Off-resonance driving improves stability or squeezing magnitude.
-      For Kronwald / Wang-Clerk: Stage 3 optimizer will converge to Δ_i ≈ 0
+      For Kronwald / Wang-Clerk: Stage 2 optimizer converges to Δ_i ≈ 0
       (confirming the resonant condition). This is a non-trivial output.
 
-    Stage 2 uses Δ_i = 0 for all modes (resonant assumption).
     Stage 1 uses Δ_i = 0 for all modes (resonant stability check).
 
 OUTPUT per successful topology:
-    topology:          graph (nodes, edges, edge types)
-    scaling_exponents: {β_i} per active edge  (from Stage 2)
-    coupling_ratios:   {C̃_i} per active edge (from Stage 3, Group 1)
-    detunings:         {Δ_i} per mode         (from Stage 3, Group 2)
-    lambda_scale:      λ = 1000 (fixed)
-    physical_formula:  g_i = sqrt(λ^{β_i} · C̃_i · decay_i · decay_j / 4)
-    cooperativities:   C_i = λ^{β_i} · C̃_i  (the hardware requirement)
+    topology:        graph (nodes, edges, edge types)
+    log_ratios:      {u_k} per active edge      (Stage 2 Group 1 raw output)
+    coupling_ratios: {C̃_k = exp(u_k)} per edge (Stage 2 Group 1 interpreted)
+    detunings:       {Δ_i} per mode             (Stage 2 Group 2 output)
+    lambda_scale:    λ = 1000 (fixed)
+    physical_formula: g_k = sqrt(λ · exp(u_k) · decay_i · decay_j / 4)
+    cooperativities: C_k = λ · exp(u_k)          (the hardware requirement)
 
 INTERPRETATION:
-    If all β_i are equal (typically β_i = 1):
-        Single overall scale knob — take all C_i >> 1 simultaneously.
-        Squeezing / entanglement is set purely by the RATIOS {C̃_i}.
-    If β_i differ across edges:
-        Edges with larger β_i must be made parametrically stronger as
-        the overall drive scale grows.  The physical coupling on edge i is
-        g_i = sqrt(λ^{β_i} · C̃_i · κ_i · γ_i).
+    All cooperativities are large (C_k = λ · C̃_k with λ=1000).
+    The RATIOS {C̃_k} determine which state is produced.
+    The absolute scale λ=1000 ensures the strong-coupling limit is reached.
     If all Δ_i ≈ 0:  resonant driving suffices (Kronwald, Wang-Clerk cases).
-    If some Δ_i ≠ 0: the scheme requires off-resonance driving — this is a
-        non-trivial prediction about the laser frequency required.
-
-No AutoScatter analogue for Stage 2.  AutoScatter optimises directly over
-complex coupling magnitudes and phases; the scaling structure is implicit.
-Here we make it explicit and discover it automatically in Stage 2.
+    If some Δ_i ≠ 0: off-resonance driving is required — a non-trivial prediction.
 """
 
 import jax
@@ -189,15 +214,15 @@ INIT_STRENGTH_RANGE_DEFAULT  = [0.01, 3.0]   # initial coupling strengths [g_lo,
 BOUNDS_STRENGTH_DEFAULT      = [0., np.inf]   # lower bound = 0 (strengths are non-negative)
 
 # ── Stage 2 & 3 hyperparameters (no AutoScatter analogue) ─────────────────
-LAMBDA_SCALE_DEFAULT    = 1000.               # fixed large scale λ for Stage 3
-INIT_RATIO_RANGE_DEFAULT = [0.1, 5.0]         # initial C̃_i draw range for Stage 3
-BOUNDS_RATIO_DEFAULT    = [1e-6, np.inf]      # Stage 3 bounds: C̃_i > 0 strictly
+LAMBDA_SCALE_DEFAULT         = 1000.          # fixed large scale λ for optimisation
+INIT_LOG_RATIO_RANGE_DEFAULT = [-1.0, 1.0]   # initial u_k = log(C̃_k) draw range
+#                                              (corresponds to C̃_k ∈ [e^{-1}, e^1] ≈ [0.37, 2.72])
 
-# Exponent search grids for Stage 2 (β_i values to try per edge):
-EXPONENT_SEARCH_GRID_1 = [0.5, 1.0, 2.0]            # first pass (3 values, fast)
-EXPONENT_SEARCH_GRID_2 = [0.5, 1.0, 1.5, 2.0, 3.0]  # expanded (5 values, slower)
-# Stage 2 convergence tolerance: relative change in V_system between λ=100 and λ=1000
-CONVERGENCE_TOL_DEFAULT = 0.05   # 5% relative tolerance
+# ── Stage 2 scaling-discovery constants (disabled in prototype) ────────────
+# Re-enable when implementing check_convergence for automated scale finding.
+# LAMBDA_VALUES_STAGE2       = [10., 100., 1000.]  # scales for convergence test
+# STAGE2_SHORT_OPT_ITER      = 30                  # L-BFGS-B steps per scale
+# CONVERGENCE_LOSS_THRESHOLD = 1e-4                # accept if L*(λ=1000) < this
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -337,9 +362,79 @@ class CovarianceOptimizer:
         kwargs_optimization: dict = {},
         solver_options: dict = {},
         enforced_constraints: list = [],
-        make_initial_test: bool = True,
-    ):
-        pass
+        make_initial_test: bool = True,):
+
+            
+        from reservoir_engineering.covariance_physics import build_diffusion_matrix
+
+        self.sigma_target         = np.array(sigma_target) # 2M x 2M target covariance matrix
+        self.target_mode_ids      = list(target_mode_ids) # which modes are the squeezed modes ("Mechanical modes")
+        self.node_types           = list(node_types) 
+        self.num_modes            = len(node_types)
+        self.num_auxiliary_modes  = num_auxiliary_modes
+        self.gradient_method      = gradient_method
+        self.enforced_constraints = list(enforced_constraints)
+
+        # Optimization hyperparameters
+
+        self.kwargs_optimization = dict(num_tests=10, verbosity=0,
+                                    max_violation_success=1e-8,
+                                    interrupt_if_successful=True)
+        self.kwargs_optimization.update(kwargs_optimization)
+
+        self.solver_options = dict(maxiter=2000, ftol=0, gtol=1e-12)
+        self.solver_options.update(solver_options)
+
+        # Initilise the node dictionary
+        self.nodes = []
+        for i, t in enumerate(node_types):
+            if t == 'cavity':
+                self.nodes.append({'id': i, 'type': 'cavity',
+                                'kappa': 1.0, 'delta': 0.0})
+            else:
+                self.nodes.append({'id': i, 'type': 'mechanical',
+                                'gamma': 0.01, 'n_th': 0.0, 'delta': 0.0})
+
+        self.D = build_diffusion_matrix(self.nodes)
+
+        # All the upper-triangle edge slots 
+        self.all_possible_edges = [(i, j)
+                               for i in range(self.num_modes)
+                               for j in range(i, self.num_modes)]
+        
+        # BFS state
+        self.valid_combinations         = []
+        self.invalid_combinations       = []
+        self.best_info_list             = []
+        self.tested_complexities        = []
+        self.num_tested_graphs          = []
+        self.num_tested_invalid_graphs  = []
+
+        # initilise all constraints on all the modes
+
+        self.__setup_all_constraints__()
+
+        # See if the fully-connected graph can achieve sigma_target
+        # if failed -> the subgraphs of the fully connected graph cannot either
+
+        if make_initial_test:
+            from reservoir_engineering.topology_search import TopologyGraph
+            from reservoir_engineering.topology_search import translate_triu_to_conditions
+
+            full_triu = TopologyGraph.fully_connected(node_types).triu_array
+
+            # Optimization
+            conditions_full = translate_triu_to_conditions(full_triu, node_types)
+            success, _, _ = self.repeated_optimization(
+                num_tests=self.kwargs_optimization['num_tests'],
+                conditions=conditions_full,
+                lambda_scale=LAMBDA_SCALE_DEFAULT,
+            )
+            if not success:
+                raise Exception(
+                    "Fully-connected graph failed to achieve sigma_target. "
+                    "Check that the target is physically reachable with these node types.")
+            
 
     # -----------------------------------------------------------------------
     # __setup_all_constraints__()
@@ -361,7 +456,19 @@ class CovarianceOptimizer:
     # "accidentally" satisfied in a dense-graph solution.
 
     def __setup_all_constraints__(self):
-        pass
+        
+        from reservoir_engineering.constraints import (
+            Constraint_coupling_absent, Constraint_coupling_beamsplitter)
+        
+        self.all_possible_constraints = []
+        
+        for i in range(self.num_modes):
+            for j in range(i, self.num_modes):
+                # There is no self-coupling within a mode i,i
+                self.all_possible_constraints.append(Constraint_coupling_absent(i, j))
+                if i != j:
+                    # Initialising all the off-digonal interactions i,j to be BS 
+                    self.all_possible_constraints.append(Constraint_coupling_beamsplitter(i, j))
 
     # -----------------------------------------------------------------------
     # __initialize_conditions_func__()
@@ -442,103 +549,144 @@ class CovarianceOptimizer:
     #   5. return check_stability(A)       ← from covariance_physics.py
     #
     # If this returns False:
-    #   Log the topology as structurally unstable.
-    #   Append triu_array to self.invalid_combinations.
+    #   Do NOT append to self.invalid_combinations.
     #   Do NOT call find_scaling_exponents or optimize_given_conditions.
+    #   Just continue to the next topology (skip silently).
     #
-    # Physical intuition:
-    #   TMS (blue-sideband) couplings on a cycle with no stabilising BS
-    #   (red-sideband) couplings produce a runaway parametric amplifier.
-    #   This is structural — no choice of coupling magnitude fixes it.
-    #   Only a different edge type or graph topology resolves it.
+    #   WHY NOT add to invalid_combinations?
+    #   Adding more edges (a supergraph) can STABILISE a previously unstable
+    #   topology. Example: TMS-only has a zero eigenvalue at unit cooperativity
+    #   (marginally unstable), but adding a BS edge (→ BS+TMS = Kronwald) makes
+    #   it stable. If TMS-only were added to invalid_combinations, the BFS prune
+    #   rule "skip supersets of invalid topologies" would skip BS+TMS entirely,
+    #   and the algorithm would NEVER find the Kronwald topology.
+    #   Stage 1 is a SPEED FILTER only, not a structural impossibility proof.
     #
     # No AutoScatter analogue (AutoScatter's passive cavities are always stable).
 
     def check_stability_unit_cooperativity(self, triu_array) -> bool:
+        from reservoir_engineering.topology_search import TopologyGraph
+        from reservoir_engineering.covariance_physics import build_drift_matrix, check_stability
+
+        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
+        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
+        
+        # Creates Nodes List: {'id': 0, 'type': 'cavity', 'kappa': 1.0}
+        # Creates Edges List: {'i': 0, 'j': 1, 'type': 'beamsplitter'}
+        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
+            default_kappa=default_kappa, default_gamma=default_gamma,)
+        
+
+
+
+    
         pass
 
     # -----------------------------------------------------------------------
-    # find_scaling_exponents(triu_array, lambda_values=None, beta_grid_1=None,
-    #                         beta_grid_2=None, convergence_tol=None) → (betas, success)
+    # check_convergence(triu_array, lambda_values=None, short_iter=None,
+    #                   loss_threshold=None) → (u_warm, success)
     # -----------------------------------------------------------------------
-    # STAGE 2 of the main algorithm.  Discover the scaling exponents {β_i}.
-    # No gradient computation — only forward Lyapunov solves.
-    #
-    # For each candidate exponent combination {β_i}, set C_i = λ^{β_i} × 1
-    # (unit ratios C̃_i = 1) and solve the Lyapunov equation at three values
-    # of λ.  Extract V_system(λ) each time.  Check whether V_system converges:
-    # all entries approach finite, non-zero values as λ grows.
+    # STAGE 2 of the main algorithm.  Test whether this topology can approach
+    # σ_target as the coupling scale λ grows, using short optimisations at
+    # multiple scales rather than a fixed placeholder ratio.
     #
     # Parameters:
     #   triu_array      — 1D int array encoding the topology
-    #   lambda_values   — list of 3 floats, default [10., 100., 1000.].
-    #                     Must be increasing; convergence checked at last two values.
-    #   beta_grid_1     — first search grid, default EXPONENT_SEARCH_GRID_1 = [0.5,1.0,2.0]
-    #   beta_grid_2     — expanded grid, default EXPONENT_SEARCH_GRID_2 = [0.5,1.0,1.5,2.0,3.0]
-    #   convergence_tol — float, relative tolerance for convergence, default CONVERGENCE_TOL_DEFAULT = 0.05
+    #   lambda_values   — list of 3 increasing floats, default LAMBDA_VALUES_STAGE2 = [10, 100, 1000]
+    #   short_iter      — int, L-BFGS-B iterations per scale, default STAGE2_SHORT_OPT_ITER = 30
+    #   loss_threshold  — float, accept if L*(λ_max) < threshold,
+    #                     default CONVERGENCE_LOSS_THRESHOLD = 1e-4
     #
     # Returns:
-    #   (betas, success):
-    #     betas   — list of E floats (β_i per active edge) if found, else None
-    #     success — bool: True if a valid exponent combination was found
+    #   (u_warm, success):
+    #     u_warm   — jnp.ndarray (E,), log_ratios at λ_max after short optimisation
+    #                (warm-start for Stage 3, or None on failure)
+    #     success  — bool: True if loss is decreasing AND below threshold
     #
     # Algorithm:
-    #   Step A — same-scaling test (β_i = 1 for all edges):
-    #       Set C_i = λ^1 for all edges.
-    #       For λ in lambda_values:
-    #           g_k = np.sqrt(λ * decay_k_i * decay_k_j / 4.)
-    #           Build A, solve Lyapunov, extract V_system = get_mode_covariance(σ, target_mode_ids)
-    #       convergence = (max|V_sys(λ_mid) − V_sys(λ_hi)| / max|V_sys(λ_hi)| < tol)
-    #                   AND max|V_sys(λ_hi)| > 1e-12      ← not identically zero
-    #       If converges: return ([1.0]*E, True)
+    #   losses = []
+    #   u_current = jnp.zeros(E)   ← initial log_ratios = 0 → C̃_k = 1
+    #   for λ in lambda_values:
+    #       u_opt = short_optimise(covariance_loss_from_ratios,
+    #                              init=u_current, lambda_scale=λ,
+    #                              max_iter=short_iter)
+    #       losses.append(covariance_loss_from_ratios(u_opt, ..., λ, ...))
+    #       u_current = u_opt          ← warm-start each scale from the previous
     #
-    #   Step B — grid search over beta_grid_1^E (first pass):
-    #       For each combination (β_0, β_1, ..., β_{E-1}) in itertools.product(beta_grid_1, repeat=E):
-    #           For λ in lambda_values:
-    #               g_k = np.sqrt(λ^{β_k} * decay_k_i * decay_k_j / 4.)
-    #               Build A.
-    #               If not check_stability(A): skip this (β, λ) pair immediately.
-    #               Else: solve Lyapunov, extract V_system.
-    #           If converges: return (list(combination), True)
+    #   converging = losses[0] > losses[1] > losses[2]  AND losses[2] < loss_threshold
+    #   if converging: return (u_current, True)
+    #   else:          return (None, False)
     #
-    #   Step C — expanded grid search over beta_grid_2^E:
-    #       Same as Step B but with the larger grid.
-    #       (Only reached if Step B exhausts without convergence.)
+    # Why this works:
+    #   Tests convergence at the OPTIMAL ratio for each λ, not an arbitrary 1:1 ratio.
+    #   Correctly handles topologies where the convergent direction requires specific
+    #   coupling ratios — e.g. Kronwald needs ν < g, not ν = g.
+    #   With C̃_k=1 (old approach), Kronwald would have σ_pm diverging and be rejected.
+    #   With this approach, the short optimiser finds ν/g ≈ tanh(r) at each λ and
+    #   confirms the loss is decreasing.
     #
-    #   Step D — failure:
-    #       return (None, False)
-    #       Log: 'topology has no finite pure-Gaussian steady state'
-    #
-    # Convergence check (used in Steps A, B, C):
-    #   V_mid  = V_system at second-to-last λ (e.g. 100)
-    #   V_hi   = V_system at last λ (e.g. 1000)
-    #   scale  = max(np.abs(V_hi))
-    #   converged = (max(np.abs(V_mid - V_hi)) / scale < convergence_tol)
-    #               AND scale > 1e-12
-    #
-    # Complexity (E = number of active edges):
-    #   Step A: 3 Lyapunov solves → negligible
-    #   Step B: |grid_1|^E × 3 solves.  For E=2: 9×3=27.  For E=4: 81×3=243.
-    #   Step C: |grid_2|^E × 3 solves.  For E=2: 25×3=75.  For E=6: ~47k (slow).
-    #   Add early stopping: break as soon as convergence is found.
+    # Cost:
+    #   3 × short_iter gradient steps = 90 gradient evaluations total.
+    #   Each gradient evaluation ≈ 1 Lyapunov solve + 1 backprop.
+    #   Comparable to the old β-grid search (which did 3^E × 3 forward solves)
+    #   but correct for all topologies including Kronwald.
     #
     # Called by: find_valid_combinations, AFTER Stage 1 (stability check) passes.
     # If success=False: add triu_array to self.invalid_combinations, skip Stage 3.
-    # If success=True:  pass betas to optimize_given_conditions for Stage 3.
+    # If success=True:  pass u_warm to optimize_given_conditions as warm start.
     #
     # No AutoScatter analogue — unique to Reservoir Engineering.
-    # Corresponds to discovering the "scaling structure" of the solution
-    # before committing to continuous optimisation.
 
-    def find_scaling_exponents(
+    # ── PROTOTYPE: check_convergence is disabled ──────────────────────────────
+    # Stage 2 (automated scaling discovery) is not used in the prototype.
+    # find_valid_combinations skips directly from Stage 1 to optimize_given_conditions.
+    # Re-enable by uncommenting the body below and restoring the Stage 2 constants.
+    #
+    # def check_convergence(
+    #     self,
+    #     triu_array,
+    #     lambda_values=None,        # default: LAMBDA_VALUES_STAGE2 = [10, 100, 1000]
+    #     short_iter: int = None,    # default: STAGE2_SHORT_OPT_ITER = 30
+    #     loss_threshold: float = None,  # default: CONVERGENCE_LOSS_THRESHOLD = 1e-4
+    # ) -> tuple:
+    #     lambda_values  = lambda_values  or LAMBDA_VALUES_STAGE2
+    #     short_iter     = short_iter     or STAGE2_SHORT_OPT_ITER
+    #     loss_threshold = loss_threshold or CONVERGENCE_LOSS_THRESHOLD
+    #
+    #     nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts()
+    #     E = len(edges)
+    #     losses = []
+    #     u_current = jnp.zeros(E)
+    #
+    #     for lam in lambda_values:
+    #         def loss_fn(u):
+    #             return covariance_loss_from_ratios(
+    #                 u, nodes, edges, self.D, lam,
+    #                 jnp.array(self.sigma_target), self.target_mode_ids)
+    #         grad_fn = jax.jit(jax.grad(loss_fn))
+    #         result = sciopt.minimize(
+    #             fun=jax.jit(loss_fn), jac=grad_fn,
+    #             x0=np.array(u_current), method='L-BFGS-B',
+    #             options={'maxiter': short_iter})
+    #         u_current = jnp.array(result.x)
+    #         losses.append(float(loss_fn(u_current)))
+    #
+    #     converging = (losses[0] > losses[1] > losses[2]) and (losses[2] < loss_threshold)
+    #     if converging:
+    #         return (u_current, True)
+    #     else:
+    #         return (None, False)
+
+    def check_convergence(
         self,
         triu_array,
         lambda_values=None,
-        beta_grid_1=None,
-        beta_grid_2=None,
-        convergence_tol: float = None,
+        short_iter: int = None,
+        loss_threshold: float = None,
     ) -> tuple:
-        pass
+        # PROTOTYPE: Stage 2 disabled. Always returns (None, True) to skip straight to Stage 3.
+        # No filtering on convergence — every Stage-1-stable topology proceeds to optimisation.
+        return (None, True)
 
     # -----------------------------------------------------------------------
     # give_free_variable_idxs(conditions) → list of int
@@ -584,33 +732,32 @@ class CovarianceOptimizer:
         pass
 
     # -----------------------------------------------------------------------
-    # create_initial_guess(conditions=[], betas=None, optimize_detunings=True)
+    # create_initial_guess(conditions=[], u_warm=None, optimize_detunings=True)
     #     → (initial_x, free_idxs)
     # -----------------------------------------------------------------------
     # MIRRORS: create_initial_guess(conditions, init_abs_range, ...)
     #          in Architecture_Optimizer
     #
-    # Sample the initial parameter vector x = [C̃_i..., Δ_i...] for Stage 3.
+    # Sample the initial parameter vector x = [u_k..., Δ_i...] for Stage 3.
     # Two groups of variables (mirrors AutoScatter's gabs + Deltas initial guess):
     #
-    # Group 1 — coupling ratios (E_free entries):
-    #   Draw C̃_i uniformly in INIT_RATIO_RANGE_DEFAULT = [0.1, 5.0].
-    #   (Mirrors AutoScatter's uniform draw of |g_{ij}| in [init_abs_range[0], init_abs_range[1]].)
-    #   Note: AutoScatter also draws gphases ∈ [-π, π]; here no phases needed
+    # Group 1 — LOG coupling ratios (E_free entries):
+    #   If u_warm provided (from Stage 2): use u_warm as initial guess.
+    #   Otherwise: draw u_k uniformly in INIT_LOG_RATIO_RANGE_DEFAULT = [-1.0, 1.0].
+    #   (Corresponds to C̃_k = exp(u_k) ∈ [e^{-1}, e^1] ≈ [0.37, 2.72].)
+    #   Note: AutoScatter draws gphases ∈ [-π, π]; here no phases needed
     #         (real quadrature basis = real A matrix, no phase degree of freedom).
     #
     # Group 2 — mode detunings (N entries, one per node):
     #   Δ_i = 0 for ALL modes (always start at resonance).
-    #   Rationale: resonant driving is the physical default.  The optimizer
-    #   will move Δ_i away from 0 if the target requires off-resonance driving.
-    #   For Kronwald / Wang-Clerk: expect Δ_i ≈ 0 at convergence (confirming resonance).
-    #   (Mirrors AutoScatter: Deltas initialised to 0 or to known resonance values.)
+    #   The optimizer moves Δ_i away from 0 if the target requires off-resonance driving.
+    #   For Kronwald / Wang-Clerk: expect Δ_i ≈ 0 at convergence.
     #
     # Returns:
-    #   initial_x  : np.ndarray (E_free + N,) — concatenated [C̃..., Δ...]
+    #   initial_x  : np.ndarray (E_free + N,) — concatenated [u_k..., Δ_i...]
     #   free_idxs  : list of int — indices of free edge slots (Group 1)
     #
-    # If optimize_detunings=False: return only Group 1 (C̃_i only), shape (E_free,).
+    # If optimize_detunings=False: return only Group 1 (u_k only), shape (E_free,).
 
     def create_initial_guess(
         self,
@@ -627,12 +774,13 @@ class CovarianceOptimizer:
     #          in Architecture_Optimizer
     #
     # Build the bounds array for L-BFGS-B.
-    # Each free coupling strength is bounded below by 0 (physical: non-negative).
-    # No upper bound (inf).
-    # Returns array of shape (num_free_edges, 2) with columns [lower, upper].
+    # With the log parametrisation, ALL variables are unconstrained:
+    #   u_k = log(C̃_k) ∈ (−∞, +∞)  — exp(u_k) > 0 automatically
+    #   Δ_i             ∈ (−∞, +∞)  — detuning is unbounded
+    # Returns None (no bounds needed) or an array of (None, None) pairs.
     #
-    # In AutoScatter, bounds are set for intrinsic_loss variables.
-    # Here, bounds enforce non-negativity of all coupling strengths.
+    # Contrast with AutoScatter: gabs ≥ 0 required explicit lower bounds.
+    # Here the log reparametrisation eliminates that requirement entirely.
 
     def setup_bounds(self, conditions: list):
         pass
@@ -650,80 +798,74 @@ class CovarianceOptimizer:
         pass
 
     # -----------------------------------------------------------------------
-    # optimize_given_conditions(conditions, ..., betas, lambda_scale) → (success, info_out)
+    # optimize_given_conditions(conditions, ..., lambda_scale, u_warm) → (success, info_out)
     # -----------------------------------------------------------------------
     # MIRRORS: optimize_given_conditions(conditions, triu_matrix, verbosity, ...)
     #          in Architecture_Optimizer  (EXACT analogue — this is the core method)
     #
     # STAGE 3 of the main algorithm.
-    # Run ONE optimisation (single random start) for a FIXED topology and
-    # FIXED scaling exponents {β_i}.
+    # Run ONE optimisation (single random start) for a FIXED topology.
     # The independent variables are:
-    #   Group 1 — coupling RATIOS C̃_i > 0 (one per active edge)
-    #   Group 2 — mode DETUNINGS Δ_i ∈ ℝ (one per mode)
-    # These are concatenated into a single vector for scipy: [C̃_0,...,C̃_E, Δ_0,...,Δ_N].
+    #   Group 1 — LOG coupling ratios u_k = log(C̃_k) ∈ (−∞, +∞), one per active edge
+    #   Group 2 — mode DETUNINGS Δ_i ∈ ℝ, one per mode
+    # Concatenated into a single vector: x = [u_0,...,u_{E-1}, Δ_0,...,Δ_{N-1}].
     # Mirrors AutoScatter's (gabs, Deltas) as the two groups of free variables.
     #
     # Parameters:
     #   conditions               : list of constraint objects encoding the topology.
     #                              If None, use translate_triu_to_conditions(triu_array).
     #   triu_array               : alternative to conditions (1D encoding).
-    #   betas                    : list of E floats, scaling exponents from Stage 2.
-    #                              Default: [1.0] * num_free_edges  (same scaling).
-    #                              Passed from find_scaling_exponents result.
     #   lambda_scale             : float, fixed large scale. Default LAMBDA_SCALE_DEFAULT=1000.
-    #                              All cooperativities are C_i = lambda_scale^{β_i} · C̃_i.
+    #                              All cooperativities are C_k = lambda_scale · exp(u_k).
+    #   u_warm                   : jnp.ndarray (E,), warm-start log_ratios from Stage 2.
+    #                              If None, draw u_k ~ Uniform(INIT_LOG_RATIO_RANGE_DEFAULT).
     #   optimize_detunings       : bool, default True.
     #                              If True, Δ_i are free variables (initialised to 0).
-    #                              If False, all Δ_i = 0 fixed (resonant case — faster,
-    #                              sufficient for Kronwald/Wang-Clerk in sideband limit).
+    #                              If False, all Δ_i = 0 fixed (resonant case — faster).
     #   verbosity                : print progress if True.
-    #   init_ratio_range         : [lo, hi] for initial C̃_i draw (default [0.1, 5.0]).
     #   max_violation_success    : success threshold on loss (default 1e-8).
     #   calc_conditions_and_gradients: pre-computed (loss_fn, grad_fn, _) to reuse.
     #   method                   : scipy optimizer method (default 'L-BFGS-B').
     #   **kwargs_solver          : passed to scipy.optimize.minimize options.
     #
-    # Steps (Stage 3 — mirrors Architecture_Optimizer.optimize_given_conditions):
-    #   1. Build loss and gradient functions:
-    #      The free variable vector is x = [C̃_0,...,C̃_{E-1}, Δ_0,...,Δ_{N-1}].
+    # Steps (Stage 3):
+    #   1. Build loss and gradient functions.
+    #      Free variable vector x = [u_0,...,u_{E-1}, Δ_0,...,Δ_{N-1}].
     #      The loss function:
-    #        a. Extract ratios = x[:E], detunings = x[E:]
+    #        a. Extract log_ratios = x[:E], detunings = x[E:]
     #        b. Set node['delta'] = detunings[i] for each node i
-    #        c. A = build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
-    #           This builds A from the Hamiltonian H with coupling strengths
-    #           g_k = sqrt(λ^{β_k} · C̃_k · decay_i · decay_j / 4) per edge k,
+    #        c. ratios = jnp.exp(log_ratios)   ← C̃_k = exp(u_k) > 0 always
+    #        d. A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
+    #           Builds A from H with g_k = sqrt(λ · C̃_k · decay_i · decay_j / 4)
     #           and detuning rotation Δ_i · J₂ on each diagonal block.
-    #           A is the "coupling matrix" — it encodes all of H in real quadrature form.
-    #        d. sigma = solve_lyapunov_kronecker(A, D)   ← A σ + σ Aᵀ + D = 0
-    #        e. return ½‖get_mode_covariance(sigma, target_mode_ids) − sigma_target‖²_F
+    #        e. sigma = solve_lyapunov_kronecker(A, D)
+    #        f. return ½‖get_mode_covariance(sigma, target_mode_ids) − sigma_target‖²_F
     #      Gradient via jax.grad argnums=0 (w.r.t. full x vector).
-    #   2. Sample initial guess:
-    #        C̃_i ~ Uniform(init_ratio_range[0], init_ratio_range[1]) for free edges
-    #        Δ_i = 0 for all modes  (always start at resonance)
-    #   3. Bounds:
-    #        C̃_i ∈ [BOUNDS_RATIO_DEFAULT[0], ∞]  (positive)
-    #        Δ_i ∈ (−∞, +∞)                       (unbounded)
-    #   4. Run scipy.optimize.minimize(fun=loss, jac=grad, bounds=bounds,
-    #                                  method='L-BFGS-B', callback=callback, ...).
+    #   2. Initial guess:
+    #        u_k = u_warm[k] if provided, else u_k ~ Uniform(INIT_LOG_RATIO_RANGE_DEFAULT)
+    #        Δ_i = 0 for all modes (always start at resonance)
+    #   3. Bounds: NONE — x is unconstrained.
+    #        u_k ∈ (−∞, +∞): exp(u_k) > 0 automatically
+    #        Δ_i ∈ (−∞, +∞): unbounded
+    #   4. Run scipy.optimize.minimize(fun=loss, jac=grad, method='L-BFGS-B', ...).
     #   5. Build solution dict and info dict.
     #
     # Returns:
     #   success : bool — loss < max_violation_success
-    #   info_out : dict — mirrors AutoScatter's info_out, extended with Stage 2+3:
+    #   info_out : dict — mirrors AutoScatter's info_out:
     #     {
-    #       'initial_guess'       : full x vector at start [C̃_i..., Δ_i...]
+    #       'initial_guess'       : full x vector at start [u_k..., Δ_i...]
     #       'free_idxs'           : list of free edge indices
     #       'solution'            : full x vector at end
-    #       'coupling_ratios'     : dict {'C̃_{i,j}': float} — Group 1 output
+    #       'log_ratios'          : np.ndarray (E,) — u_k values (Group 1 raw)
+    #       'coupling_ratios'     : dict {'C̃_{i,j}': exp(u_k)} — Group 1 interpreted
     #       'detunings'           : dict {'Δ_i': float} — Group 2 output
     #                               ≈ 0 for Kronwald/Wang-Clerk; ≠ 0 for multi-ω_m schemes
-    #       'scaling_exponents'   : dict {'β_{i,j}': float} — from Stage 2 input
     #       'lambda_scale'        : float — λ used in Stage 3
-    #       'coupling_strengths'  : np.ndarray (E,) — recovered g values:
-    #                               g_k = sqrt(λ^{β_k} · C̃_k · decay_i · decay_j / 4)
-    #       'parameters_for_analysis': cooperativities dict — C_i = λ^{β_i} · C̃_i
-    #       'physical_coupling_formula': str — 'g_k = sqrt(λ^β · C̃ · decay_i · decay_j/4)'
+    #       'coupling_strengths'  : np.ndarray (E,) — physical g values:
+    #                               g_k = sqrt(λ · exp(u_k) · decay_i · decay_j / 4)
+    #       'cooperativities'     : dict — C_k = λ · exp(u_k) per edge
+    #       'physical_formula'    : 'g_k = sqrt(λ · C̃_k · decay_i · decay_j / 4)'
     #       'final_cost'          : float
     #       'success'             : bool
     #       'optimizer_message'   : str from scipy
@@ -733,25 +875,21 @@ class CovarianceOptimizer:
     #       'sigma_target'        : self.sigma_target
     #       'nit'                 : number of iterations
     #       'loss_history'        : list of loss values per callback step
-    #       'bounds'              : bounds array used
     #     }
     #
     # Relationship to AutoScatter's optimize_given_conditions:
     #   AutoScatter free variables: gabs (|g_{ij}|) + gphases (arg(g_{ij})) + Deltas (Δ_i)
-    #   Here:                       C̃_i (ratios, replaces gabs)  +  Δ_i (detunings)
-    #   No phases needed (real quadrature basis = real A matrix).
-    #   The betas + lambda_scale parametrisation is new; detunings are the same concept.
-    #   AutoScatter note: Δ_i = ±1 for far-detuned modes (Schur complement).
-    #   Here: Δ_i = 0 for most modes; non-zero only for multi-ω_m schemes.
+    #   Here: u_k = log(C̃_k) (replaces gabs, no phases) + Δ_i (detunings, same concept)
+    #   No phases needed — real quadrature basis means A is real (no phase freedom).
 
     def optimize_given_conditions(
         self,
         conditions: list = None,
         triu_array=None,
-        betas=None,
         lambda_scale: float = None,
+        u_warm=None,
+        optimize_detunings: bool = True,
         verbosity: bool = False,
-        init_ratio_range=None,
         max_violation_success: float = 1e-8,
         calc_conditions_and_gradients=None,
         method: str = 'L-BFGS-B',
@@ -786,8 +924,9 @@ class CovarianceOptimizer:
         num_tests: int,
         conditions: list = None,
         triu_array=None,
+        lambda_scale: float = None,
+        u_warm=None,
         verbosity: bool = False,
-        init_strength_range=None,
         max_violation_success: float = 1e-8,
         interrupt_if_successful: bool = True,
         **kwargs_solver,
@@ -835,7 +974,10 @@ class CovarianceOptimizer:
     #   Elif i == j:
     #       allowed_entries = [NO_COUPLING, PARAMETRIC]
     #   Else:
-    #       allowed_entries = [NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING]
+    #       allowed_entries = [NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
+    #                          BEAMSPLITTER_AND_TWO_MODE_SQUEEZING]
+    #       Four off-diagonal choices. BEAMSPLITTER_AND_TWO_MODE_SQUEEZING(4)
+    #       represents both drives simultaneously (e.g. Kronwald topology).
     #
     # Compute:
     #   self.possible_entry_lists   = list of allowed_entries per slot
@@ -911,20 +1053,25 @@ class CovarianceOptimizer:
     #       ── STAGE 1: Stability at unit cooperativity ────────────────────
     #       stable = check_stability_unit_cooperativity(triu_array)
     #       If not stable:
-    #           self.invalid_combinations.append(triu_array)
-    #           continue   ← skip to next topology immediately
+    #           continue   ← skip silently. DO NOT add to invalid_combinations.
+    #           Reason: a supergraph (more edges) can be stable even if this
+    #           topology is not. Adding to invalid_combinations would prune
+    #           valid supersets (e.g., TMS-only unstable → would prune BS+TMS).
     #
-    #       ── STAGE 2: Find scaling exponents ─────────────────────────────
-    #       betas, stage2_ok = find_scaling_exponents(triu_array)
-    #       If not stage2_ok:
-    #           self.invalid_combinations.append(triu_array)
-    #           continue   ← topology cannot realise a finite Gaussian state
+    #       ── STAGE 2: Convergence test (DISABLED in prototype) ────────────
+    #       # u_warm, stage2_ok = check_convergence(triu_array)
+    #       # In prototype: check_convergence always returns (None, True).
+    #       # u_warm = None → Stage 3 starts from random initialisation.
+    #       # No pruning based on convergence in the prototype.
+    #       u_warm, stage2_ok = check_convergence(triu_array)   # returns (None, True)
+    #       # stage2_ok is always True in prototype — no topology is pruned here.
     #
-    #       ── STAGE 3: Optimise coupling ratios ───────────────────────────
+    #       ── STAGE 3: Optimise log coupling ratios ────────────────────────
     #       conditions = translate_triu_to_conditions(triu_array)
     #       If check_if_subgraph_triu(triu_array, newly_added_combos): skip
     #       success, all_infos, _ = repeated_optimization(
-    #           conditions=conditions, betas=betas, lambda_scale=LAMBDA_SCALE_DEFAULT, ...)
+    #           conditions=conditions, lambda_scale=LAMBDA_SCALE_DEFAULT,
+    #           u_warm=u_warm, ...)
     #
     #       If success:
     #           If perform_graph_reduction:
@@ -1022,51 +1169,41 @@ class CovarianceOptimizer:
         pass
 
     # -----------------------------------------------------------------------
-    # extract_cooperativities(conditions, solution_ratios, betas=None,
-    #                          lambda_scale=None) → dict
+    # extract_cooperativities(conditions, solution_log_ratios, lambda_scale=None) → dict
     # -----------------------------------------------------------------------
     # MIRRORS: extract_cooperativities_and_human_defined_parameters(conditions, solution_dict)
-    #          in Architecture_Optimizer  (EXACT analogue, EXTENDED for Stage 2+3)
+    #          in Architecture_Optimizer  (EXACT analogue)
     #
     # Compute and report all physically relevant quantities for the solution.
-    # Accepts coupling RATIOS C̃_i (Stage 3 output) rather than raw g values.
+    # Accepts LOG coupling ratios u_k (Stage 3 raw output) and converts to
+    # physical quantities.
     #
     # Parameters:
-    #   conditions     : list of constraint objects (defines which edges are active)
-    #   solution_ratios: np.ndarray (E_free,), the Stage 3 solution C̃_i per free edge
-    #   betas          : list of floats, scaling exponents β_i from Stage 2 (or None if
-    #                    not run, in which case defaults to β_i = 1 for all edges)
-    #   lambda_scale   : float, the λ used in Stage 3 (default LAMBDA_SCALE_DEFAULT)
+    #   conditions          : list of constraint objects (defines which edges are active)
+    #   solution_log_ratios : np.ndarray (E_free,), u_k = log(C̃_k) per free edge
+    #   lambda_scale        : float, the λ used in Stage 3 (default LAMBDA_SCALE_DEFAULT)
     #
     # Returns:
     #   dict with the following keys per active edge (i, j):
-    #     'C̃_{i,j}'    : float — dimensionless coupling ratio (Stage 3 output)
-    #     'β_{i,j}'    : float — scaling exponent (Stage 2 output)
-    #     'C_{i,j}'    : float — actual cooperativity C = λ^β · C̃
-    #     'g_{i,j}'    : float — physical coupling strength g = sqrt(C · κ_i · γ_j / 4)
-    #     'formula'    : str — 'g = sqrt(λ^β · C̃ · decay_i · decay_j / 4)'
+    #     'u_{i,j}'     : float — log ratio u_k (raw Stage 3 output)
+    #     'C̃_{i,j}'    : float — dimensionless ratio C̃_k = exp(u_k)
+    #     'C_{i,j}'     : float — actual cooperativity C_k = λ · C̃_k
+    #     'g_{i,j}'     : float — physical coupling g_k = sqrt(C_k · decay_i · decay_j / 4)
+    #     'formula'     : str — 'g = sqrt(λ · exp(u) · decay_i · decay_j / 4)'
     #
-    # For the Kronwald scheme (β_g = β_ν = 1):
-    #   C̃_g, C̃_ν are the Stage 3 output (dimensionless ratios)
-    #   C_g = λ · C̃_g,  C_ν = λ · C̃_ν  (with λ=1000, these are the actual cooperativities)
-    #   squeezing r = atanh(sqrt(C_ν/C_g)) = atanh(sqrt(C̃_ν/C̃_g))  ← ratio is λ-independent
-    #   g = sqrt(λ · C̃_g · κ · γ / 4)  ← the required coupling strength for given κ, γ
+    # For the Kronwald scheme:
+    #   C̃_g = exp(u_BS),  C̃_ν = exp(u_TMS)
+    #   C_g = λ · C̃_g,   C_ν = λ · C̃_ν   (both large at λ=1000)
+    #   squeezing r = atanh(sqrt(C̃_ν / C̃_g))  ← ratio is λ-independent
+    #   g = sqrt(λ · C̃_g · κ · γ / 4)          ← physical coupling for given κ, γ
     #
     # AutoScatter uses:  C_{i,j} = 4 * |g_{i,j}|²  (κ_ext normalised to 1).
-    # Here:              C_{i,j} = λ^{β_i} · C̃_i = 4 g² / (decay_i · decay_j).
-    #
-    # INTERPRETATION OF ALL-EQUAL-β CASE (most common):
-    #   If all β_i = 1: single scale knob — to realise the scheme experimentally,
-    #   take λ >> 1 (strong cooperativity).  The ratios C̃_i determine the squeezing.
-    # INTERPRETATION OF UNEQUAL-β CASE:
-    #   Edge with β=2 must have cooperativity growing as λ² (parametrically stronger
-    #   than β=1 edges).  The experiment has two independently adjustable drives.
+    # Here:              C_{i,j} = λ · C̃_i = λ · exp(u_i).
 
     def extract_cooperativities(
         self,
         conditions: list,
-        solution_ratios,
-        betas=None,
+        solution_log_ratios,
         lambda_scale=None,
     ) -> dict:
         pass

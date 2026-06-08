@@ -153,11 +153,14 @@ from reservoir_engineering.covariance_physics import (
 
 # ── Constraint objects ────────────────────────────────────────────────────
 # Mirrors: autoscatter/constraints.py (constraint objects + graph plotting)
+from reservoir_engineering.topology_search import (
+    BEAMSPLITTER_AND_TWO_MODE_SQUEEZING, # edge type constant = 4 (both drives on same pair)
+)
 from reservoir_engineering.constraints import (
     NO_COUPLING,                        # edge type constant = 0
     BEAMSPLITTER,                       # edge type constant = 1
     TWO_MODE_SQUEEZING,                 # edge type constant = 2
-    PARAMETRIC,                         # edge type constant = 3
+    PARAMETRIC,                         # edge type constant = 3 (diagonal only)
     Constraint_coupling_absent,         # mirrors Constraint_coupling_zero
     Constraint_coupling_beamsplitter,   # mirrors Constraint_coupling_phase_zero
     Constraint_coupling_two_mode_squeezing,
@@ -192,9 +195,11 @@ from reservoir_engineering.covariance_optimizer import (
     find_minimum_number_auxiliary_modes,    # mirrors find_minimum_number_auxiliary_modes
     AUTODIFF_FORWARD,
     AUTODIFF_REVERSE,
-    LAMBDA_SCALE_DEFAULT,                   # Stage 3 fixed scale λ = 1000
-    EXPONENT_SEARCH_GRID_1,                 # Stage 2 β search: {0.5, 1.0, 2.0}
-    EXPONENT_SEARCH_GRID_2,                 # Stage 2 β search: {0.5, 1.0, 1.5, 2.0, 3.0}
+    LAMBDA_SCALE_DEFAULT,                   # fixed scale λ = 1000 for optimisation
+    # Stage 2 scaling-discovery constants (disabled in prototype — see covariance_optimizer.py):
+    # LAMBDA_VALUES_STAGE2,                 # convergence test scales [10, 100, 1000]
+    # STAGE2_SHORT_OPT_ITER,               # short optimisation iterations per scale (30)
+    # CONVERGENCE_LOSS_THRESHOLD,          # acceptance threshold on L*(λ_max)
 )
 
 # ── Target covariance matrices ────────────────────────────────────────────
@@ -241,6 +246,7 @@ __all__ = [
     'solve_lyapunov_kronecker', 'get_mode_covariance', 'covariance_loss',
     # constraints
     'NO_COUPLING', 'BEAMSPLITTER', 'TWO_MODE_SQUEEZING', 'PARAMETRIC',
+    'BEAMSPLITTER_AND_TWO_MODE_SQUEEZING',
     'Constraint_coupling_absent', 'Constraint_coupling_beamsplitter',
     'Constraint_coupling_two_mode_squeezing',
     'Constraint_stability', 'Constraint_physical_state',
@@ -258,7 +264,8 @@ __all__ = [
     # optimiser
     'CovarianceOptimizer', 'find_minimum_number_auxiliary_modes',
     'AUTODIFF_FORWARD', 'AUTODIFF_REVERSE',
-    'LAMBDA_SCALE_DEFAULT', 'EXPONENT_SEARCH_GRID_1', 'EXPONENT_SEARCH_GRID_2',
+    'LAMBDA_SCALE_DEFAULT',
+    # 'LAMBDA_VALUES_STAGE2', 'STAGE2_SHORT_OPT_ITER', 'CONVERGENCE_LOSS_THRESHOLD',  # Stage 2 disabled
     # targets
     'squeezed_vacuum', 'two_mode_squeezed', 'vacuum', 'thermal',
     'cluster_state', 'is_physical', 'symplectic_eigenvalues',

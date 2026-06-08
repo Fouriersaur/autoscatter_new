@@ -38,15 +38,16 @@ The drift matrix A is assembled block-by-block from H:
   ──────────────────────────────────────────────────────────────────
   (system-bath coupling)      →  -κ_i/2 · I₂  (diagonal decay block)
   Δ_i a_i†a_i  (detuning)   →  +Δ_i · J₂    (diagonal rotation block)
-  g(a†b + ab†) (beamsplitter) →  +g · I₂      (off-diagonal block)
-  ν(a†b† + ab) (TMS)         →  ±ν · σ_z     (off-diagonal block, antisym)
+  g(a†b + ab†) (beamsplitter) →  g · J₂       (off-diagonal block, both sides symmetric)
+  ν(a†b† + ab) (TMS)         →  -ν · σ_x    (both off-diagonal blocks, same sign, symmetric)
 
-where J₂ = [[0,1],[-1,0]], I₂ = identity(2), σ_z = diag(+1,-1).
+where J₂ = [[0,1],[-1,0]], σ_x = [[0,1],[1,0]].
 
 The key distinction between BS and TMS comes from the commutator:
-  [a_i, g(a_i†a_j + h.c.)] = g a_j       → g · I₂   block (energy-conserving)
-  [a_i, ν(a_i†a_j† + h.c.)] = ν a_j†     → ν · σ_z  block (parametric)
-The a_j vs a_j† difference flips the sign of the p-quadrature, giving I₂ vs σ_z.
+  [a_i, g(a_i†a_j + h.c.)] = g a_j    → ȧ_i = -ig·a_j
+    ẋ_i = +g·p_j,  ṗ_i = -g·x_j      → g · J₂ block (antisymmetric rotation)
+  [a_i, ν(a_i†a_j† + h.c.)] = ν a_j† → ȧ_i = -iν·a_j†
+    ẋ_i = -ν·p_j,  ṗ_i = -ν·x_j      → -ν · σ_x block (SAME sign in both off-diagonal blocks)
 
 A is split into TWO parts — exactly mirroring AutoScatter's (-iH - κ/2):
 
@@ -57,8 +58,8 @@ A is split into TWO parts — exactly mirroring AutoScatter's (-iH - κ/2):
                             The direct analogue of AutoScatter's complex N×N coupling matrix H.
                             Contains ONLY the coherent (Hamiltonian) terms:
                               diagonal blocks:    Δ_i · J₂         (from H = Δ_i a_i†a_i)
-                              BS off-diagonal:   +g · I₂, +g · I₂  (from H = g(a†b + ab†))
-                              TMS off-diagonal:  +g · σ_z, -g · σ_z (from H = g(a†b† + ab))
+                              BS off-diagonal:   +g · J₂, +g · J₂    (from H = g(a†b + ab†), symmetric)
+                              TMS off-diagonal:  -g · σ_x, -g · σ_x  (from H = g(a†b† + ab), symmetric)
 
   A_decay (2N × 2N real) — the dissipation part.  NOT from H.  From system-bath coupling.
                             diagonal blocks only:  -decay_i/2 · I₂  per mode i
@@ -145,17 +146,18 @@ EDGE TYPES  (what kind of coupling connects two graph nodes?)
 
 'beamsplitter'  (BS)  — Hamiltonian H = g (a†b + ab†)
     Energy-conserving swap interaction (two-tone red sideband drive).
-    In the real quadrature basis:
-        A[2i:2i+2, 2j:2j+2] +=  g · I₂     (i → j block)
-        A[2j:2j+2, 2i:2i+2] +=  g · I₂     (j → i block)
-    Both off-diagonal 2×2 blocks are  +g · I₂.
+    In the real quadrature basis (J₂ = [[0,1],[-1,0]]):
+        H_quad[2i:2i+2, 2j:2j+2] +=  g · J₂     (i → j block)
+        H_quad[2j:2j+2, 2i:2i+2] +=  g · J₂     (j → i block, symmetric — same matrix)
+    [a,H] = g·b → ȧ = -ig·b → ẋ_i = g·p_j, ṗ_i = -g·x_j → g·J₂ block.
     Physical effect: swaps state between modes i and j.
 
 'two_mode_squeezing'  (TMS)  — H = ν (a†b† + ab)
     Parametric amplification interaction (two-tone blue sideband drive).
-    Uses σ_z = diag(+1, −1):
-        A[2i:2i+2, 2j:2j+2] +=  +ν · σ_z   (i → j block)
-        A[2j:2j+2, 2i:2i+2] +=  −ν · σ_z   (j → i block)
+    In the real quadrature basis (σ_x = [[0,1],[1,0]]):
+        H_quad[2i:2i+2, 2j:2j+2] +=  -ν · σ_x   (i → j block)
+        H_quad[2j:2j+2, 2i:2i+2] +=  -ν · σ_x   (j → i block, same sign — symmetric)
+    [a,H] = ν·b† → ȧ = -iν·b† → ẋ_i = -ν·p_j, ṗ_i = -ν·x_j → -ν·σ_x block.
     Physical effect: generates squeezing and entanglement between i and j.
 
 'parametric'  (SQ)  — H = χ (a² + a†²)    (single-mode, i == j only)
@@ -256,14 +258,16 @@ def quadrature_slice(mode_id: int):
 #             s_j = quadrature_slice(edge.j)
 #
 #     'beamsplitter' (H = g(a†b + ab†)):
-#         [a_i, H] = g·a_j  →  off-diagonal block = +g · I₂
-#         H_quad[s_i, s_j] += +g · I₂
-#         H_quad[s_j, s_i] += +g · I₂        (Hermitian symmetry)
+#         [a_i, H] = g·a_j  →  ȧ_i = -ig·a_j
+#         ẋ_i = +g·p_j,  ṗ_i = -g·x_j  →  block = g · J₂
+#         H_quad[s_i, s_j] += g · J₂
+#         H_quad[s_j, s_i] += g · J₂         (same matrix both sides — symmetric)
 #
 #     'two_mode_squeezing' (H = g(a†b† + ab)):
-#         [a_i, H] = g·a_j†  →  off-diagonal block = +g · σ_z
-#         H_quad[s_i, s_j] += +g · σ_z
-#         H_quad[s_j, s_i] += -g · σ_z       (antisymmetric — NOT Hermitian in block sense)
+#         [a_i, H] = g·a_j†  →  ȧ_i = -ig·a_j†
+#         ẋ_i = -g·p_j,  ṗ_i = -g·x_j  →  block = -g · σ_x
+#         H_quad[s_i, s_j] += -g · σ_x
+#         H_quad[s_j, s_i] += -g · σ_x       (same sign in both blocks — symmetric)
 #
 #     'parametric' (H = χ(a² + a†²), single-mode):
 #         H_quad[s_i, s_i] += χ · σ_z
@@ -396,12 +400,12 @@ def build_hamiltonian_matrix(
 #     s_j = quadrature_slice(edge.j), σ_z = diag(+1, -1)
 #
 #     'beamsplitter':
-#         A[s_i, s_j] +=  g · I₂
-#         A[s_j, s_i] +=  g · I₂
+#         H_quad[s_i, s_j] +=  g · J₂
+#         H_quad[s_j, s_i] +=  g · J₂        (symmetric — same block both sides)
 #
 #     'two_mode_squeezing':
-#         A[s_i, s_j] +=  g · σ_z
-#         A[s_j, s_i] += -g · σ_z
+#         H_quad[s_i, s_j] += -g · σ_x
+#         H_quad[s_j, s_i] += -g · σ_x       (same sign — symmetric)
 #
 #     'parametric' (i == j):
 #         A[s_i, s_i] +=  g · σ_z
@@ -554,7 +558,7 @@ def check_stability(A) -> bool:
     
     eigs = np.linalg.eigvals(np.asarray(A))
 
-    return bool(np.all(np.real(eigs)) < 0)
+    return bool(np.all(np.real(eigs) < 0))
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -594,34 +598,39 @@ def get_mode_covariance(
     return sigma[np.ix_(idx, idx)]
 
 # ───────────────────────────────────────────────────────────────────────────
-# build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
+# build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
 # ───────────────────────────────────────────────────────────────────────────
-# Purpose (Stage 3 of the main algorithm):
+# Purpose (Stages 2 and 3 of the main algorithm):
 #   Build the drift matrix A using the cooperativity reparametrisation.
-#   Instead of optimising coupling strengths g_{ij} directly, Stage 3
-#   optimises dimensionless coupling RATIOS C̃_i (order-1 numbers) at a fixed
+#   Instead of optimising coupling strengths g_{ij} directly, the optimiser
+#   works with dimensionless coupling RATIOS C̃_i = exp(u_i) at a fixed
 #   large scale λ = lambda_scale.
 #
 #   The mapping from ratios to coupling strengths is:
 #
-#       C_{ij}  = lambda_scale^{betas[k]}  ×  ratios[k]       (cooperativity)
-#       g_{ij}  = sqrt( C_{ij} × decay_i × decay_j / 4 )      (coupling strength)
+#       C_{ij}  = lambda_scale  ×  ratios[k]              (cooperativity)
+#       g_{ij}  = sqrt( C_{ij} × decay_i × decay_j / 4 ) (coupling strength)
 #
 #   where:
 #       decay_i = kappa_i  if node i is a cavity
 #       decay_i = gamma_i  if node i is mechanical
+#
+#   In the log parametrisation used by the optimiser:
+#       u_k   = log(C̃_k)         — the actual free variable (unconstrained real)
+#       ratios[k] = exp(u_k)      — caller computes exp before passing in
+#       C_k   = lambda_scale · exp(u_k)
+#       g_k   = sqrt(lambda_scale · exp(u_k) · decay_i · decay_j / 4)
 #
 #   This function converts ratios → coupling strengths and calls build_drift_matrix.
 #   Fully JAX-differentiable with respect to `ratios`.
 #
 # Parameters:
 #   nodes        — list of N node dicts (same format as build_drift_matrix)
-#   edges        — list of E edge dicts (types only; edge k ↔ ratios[k], betas[k])
-#   ratios       — jnp.ndarray shape (E,), Stage 3 optimisation variables C̃_i > 0
-#   betas        — list or array, length E, scaling exponents from Stage 2.
-#                  e.g. [1.0, 1.0] for Kronwald (both edges scale identically).
+#   edges        — list of E edge dicts (types only; edge k ↔ ratios[k])
+#   ratios       — jnp.ndarray shape (E,), C̃_i > 0 (pass jnp.exp(u) from optimiser)
 #   lambda_scale — float, the fixed scale (default LAMBDA_SCALE_DEFAULT = 1000).
 #                  Must satisfy lambda_scale >> 1 to be in the strong-coupling limit.
+#                  Also used at λ=10,100 during Stage 2 convergence test.
 #
 # Returns:
 #   A — jnp.ndarray (2N, 2N), drift matrix built from the converted g values
@@ -630,17 +639,17 @@ def get_mode_covariance(
 #   For each edge k with nodes i and j:
 #       decay_i = node[i]['kappa'] if 'cavity' else node[i]['gamma']
 #       decay_j = node[j]['kappa'] if 'cavity' else node[j]['gamma']
-#       C_k  = lambda_scale ** betas[k] * ratios[k]
+#       C_k  = lambda_scale * ratios[k]
 #       g_k  = jnp.sqrt(C_k * decay_i * decay_j / 4.)
 #   coupling_strengths = jnp.array([g_0, g_1, ..., g_{E-1}])
 #   return build_drift_matrix(nodes, edges, coupling_strengths)
 #
 # Why this reparametrisation?
 #   At large lambda_scale, g_{ij} ~ sqrt(lambda_scale) can be very large.
-#   The ratio C̃_i = C_i / lambda_scale^{beta_i} is O(1) regardless of lambda,
-#   so the gradient landscape is well-conditioned numerically.
-#   The exponents betas[k] (found in Stage 2) encode which edges need to be
-#   parametrically stronger than others as the overall drive scale grows.
+#   C̃_i = C_i / lambda_scale is O(1) regardless of lambda, so the gradient
+#   landscape is well-conditioned numerically.
+#   The log parametrisation u_k = log(C̃_k) makes C̃_k automatically positive
+#   and gives multiplicative gradient steps — no lower bounds needed.
 
 """
 def build_drift_matrix(
@@ -660,18 +669,17 @@ def build_drift_matrix_from_ratios(
     nodes: List[Dict],
     edges: List[Dict],
     ratios: jnp.ndarray,
-    betas,
     lambda_scale: float,
 ) -> jnp.ndarray:
-    
+
     coupling_strengths = []
-    
+
     for k, edge in enumerate(edges):
         i, j = edge["i"], edge["j"]
         decay_i = nodes[i]["kappa"] if nodes[i]["type"] == "cavity" else nodes[i]["gamma"]
         decay_j = nodes[j]["kappa"] if nodes[j]["type"] == "cavity" else nodes[j]["gamma"]
-        
-        C_k = lambda_scale ** betas[k] * ratios[k]
+
+        C_k = lambda_scale * ratios[k]
         g_k = jnp.sqrt(C_k * decay_i * decay_j / 4)
         coupling_strengths.append(g_k)
 
@@ -733,65 +741,62 @@ def covariance_loss(
     return loss
 
 # ───────────────────────────────────────────────────────────────────────────
-# covariance_loss_from_ratios(ratios, nodes, edges, D, betas, lambda_scale,
+# covariance_loss_from_ratios(log_ratios, nodes, edges, D, lambda_scale,
 #                              target_cov, target_mode_ids)
 # ───────────────────────────────────────────────────────────────────────────
-# Purpose (Stage 3 of the main algorithm):
-#   The scalar loss function for Stage 3 continuous optimisation.
-#   Optimises over coupling RATIOS C̃_i (not raw coupling strengths g_i).
-#   This is the Stage 3 replacement for covariance_loss.
+# Purpose (Stages 2 and 3 of the main algorithm):
+#   The scalar loss function for continuous optimisation over coupling ratios.
+#   The optimiser works in LOG SPACE: free variable u_k = log(C̃_k).
+#   Passing log_ratios = u_k, this function computes ratios = exp(u_k) then
+#   calls build_drift_matrix_from_ratios. Fully JAX-differentiable.
 #
 # Parameters:
-#   ratios          — jnp.ndarray (E,), Stage 3 optimisation variables C̃_i > 0
+#   log_ratios      — jnp.ndarray (E,), u_k = log(C̃_k), unconstrained reals.
+#                     C̃_k = exp(u_k) > 0 automatically.
 #   nodes           — list of N node dicts (types, decay rates)
 #   edges           — list of E edge dicts (types only)
 #   D               — jnp.ndarray (2N, 2N), precomputed diffusion matrix (constant).
 #                     Pass D in from outside the JIT-compiled call for efficiency.
-#   betas           — list/array, length E, scaling exponents found in Stage 2
-#   lambda_scale    — float, fixed scale (default LAMBDA_SCALE_DEFAULT = 1000)
+#   lambda_scale    — float, fixed scale (LAMBDA_SCALE_DEFAULT=1000 for Stage 3;
+#                     smaller values [10, 100] used in Stage 2 convergence test)
 #   target_cov      — jnp.ndarray (2M, 2M), target covariance for signal modes
 #   target_mode_ids — list of int, which modes to compare
 #
 # Returns:
 #   scalar jnp float:  ½ · ‖ σ_sub − σ_target ‖²_F
 #
-# Steps (mirrors covariance_loss exactly, but uses ratios instead of g):
-#   1. A         = build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
-#   2. sigma     = solve_lyapunov_kronecker(A, D)
-#   3. sigma_sub = get_mode_covariance(sigma, target_mode_ids)
-#   4. diff      = sigma_sub − target_cov
-#   5. return    jnp.sum(diff ** 2) / 2.
+# Steps:
+#   1. ratios    = jnp.exp(log_ratios)                          ← log → linear
+#   2. A         = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
+#   3. sigma     = solve_lyapunov_kronecker(A, D)
+#   4. sigma_sub = get_mode_covariance(sigma, target_mode_ids)
+#   5. diff      = sigma_sub − target_cov
+#   6. return    jnp.sum(diff ** 2) / 2.
 #
-# Usage pattern (same as covariance_loss):
-#   loss_jit  = jax.jit(covariance_loss_from_ratios, static_argnums=(1,2,5,7))
+# Log parametrisation benefits:
+#   • C̃_k = exp(u_k) > 0 always — no bounds or clipping needed
+#   • Gradient steps are multiplicative (10% change regardless of scale)
+#   • No runaway: instability raises the loss before exp(u_k) diverges
+#
+# Usage pattern:
+#   loss_jit  = jax.jit(covariance_loss_from_ratios, static_argnums=(1,2,5,6))
 #   grad_loss = jax.jit(jax.grad(covariance_loss_from_ratios, argnums=0),
-#                        static_argnums=(1,2,5,7))
-#   value = loss_jit(ratios, nodes, edges, D, betas, lambda_scale, sigma_target, mode_ids)
-#   grads = grad_loss(ratios, nodes, edges, D, betas, lambda_scale, sigma_target, mode_ids)
-#
-# Relationship to covariance_loss:
-#   covariance_loss(g, ...)      ← parametrised by raw coupling strengths g
-#   covariance_loss_from_ratios(C̃, ...)  ← parametrised by ratios C̃ = C / λ^β
-#   Both measure the same ½‖σ_sub − σ_target‖²_F; only the independent
-#   variables differ.  Stage 3 always uses covariance_loss_from_ratios.
-#
-# Why pass D explicitly (not recompute inside)?
-#   D depends only on node types and decay rates — constant for a fixed topology.
-#   Passing it in avoids recomputing it on every call inside the JIT loop.
-#   The same reason it is precomputed in covariance_loss.
+#                        static_argnums=(1,2,5,6))
+#   value = loss_jit(log_ratios, nodes, edges, D, lambda_scale, sigma_target, mode_ids)
+#   grads = grad_loss(log_ratios, nodes, edges, D, lambda_scale, sigma_target, mode_ids)
 
 def covariance_loss_from_ratios(
-    ratios: jnp.ndarray,
+    log_ratios: jnp.ndarray,
     nodes: List[Dict],
     edges: List[Dict],
     D: jnp.ndarray,
-    betas,
     lambda_scale: float,
     target_cov: jnp.ndarray,
     target_mode_ids: List[int],
 ) -> jnp.ndarray:
-    
-    A = build_drift_matrix_from_ratios(nodes, edges, ratios, betas, lambda_scale)
+
+    ratios = jnp.exp(log_ratios)
+    A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
     D = build_diffusion_matrix(nodes)
 
     sigma = solve_lyapunov_kronecker(A,D)

@@ -20,6 +20,9 @@ Physical interpretation of the solution
   Squeezing parameter r recovered via: r = atanh(sqrt(C_nu / C_g))
 """
 
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 import numpy as np
 
 from reservoir_engineering.targets import squeezed_vacuum
@@ -138,7 +141,6 @@ def run_kronwald_test(r=1.0, num_tests=10, verbosity=False):
         print('  SOME CHECKS FAILED — see [FAIL] lines above')
     print(f'{"─"*60}\n')
     return all_pass
-
 
 if __name__ == '__main__':
     run_kronwald_test(r=1.0, num_tests=10)

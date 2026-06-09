@@ -181,7 +181,10 @@ class Coupling_Constraint(Base_Constraint):
 
 class Constraint_coupling_absent(Coupling_Constraint):
     def __call__(self, A, sigma):
-        from covariance_physics import quadrature_slice
+        try:
+            from reservoir_engineering.covariance_physics import quadrature_slice
+        except ImportError:
+            from covariance_physics import quadrature_slice
         # Get the index to slice the needed part of the Drift Matrix A
         si = quadrature_slice(self.idxs[0])
         sj = quadrature_slice(self.idxs[1])
@@ -232,7 +235,10 @@ class Constraint_coupling_absent(Coupling_Constraint):
 
 class Constraint_coupling_beamsplitter(Coupling_Constraint):
     def __call__(self, A, sigma):
-        from covariance_physics import quadrature_slice
+        try:
+            from reservoir_engineering.covariance_physics import quadrature_slice
+        except ImportError:
+            from covariance_physics import quadrature_slice
         si = quadrature_slice(self.idxs[0])
         sj = quadrature_slice(self.idxs[1])
         block = A[si, sj]
@@ -259,7 +265,10 @@ class Constraint_coupling_beamsplitter(Coupling_Constraint):
 
 class Constraint_coupling_two_mode_squeezing(Coupling_Constraint):
     def __call__(self, A, sigma):
-        from covariance_physics import quadrature_slice
+        try:
+            from reservoir_engineering.covariance_physics import quadrature_slice
+        except ImportError:
+            from covariance_physics import quadrature_slice
         si = quadrature_slice(self.idxs[0])
         sj = quadrature_slice(self.idxs[1])
         block = A[si, sj]
@@ -337,7 +346,10 @@ class Constraint_physical_state(Base_Constraint):
         self.target_mode_ids = target_mode_ids
 
     def __call__(self, A, sigma):
-        from covariance_physics import get_mode_covariance
+        try:
+            from reservoir_engineering.covariance_physics import get_mode_covariance
+        except ImportError:
+            from covariance_physics import get_mode_covariance
         s = get_mode_covariance(sigma, self.target_mode_ids)
         N = s.shape[0] // 2
         Omega = jnp.zeros_like(s)
@@ -400,7 +412,10 @@ class Constraint_entanglement(Base_Constraint):
         self.mode_ids = mode_ids
 
     def __call__(self, A, sigma):
-        from covariance_physics import get_mode_covariance
+        try:
+            from reservoir_engineering.covariance_physics import get_mode_covariance
+        except ImportError:
+            from covariance_physics import get_mode_covariance
         s = get_mode_covariance(sigma, self.mode_ids)
         duan_sum = (s[0,0] + s[2,2] - 2*s[0,2] +
                     s[1,1] + s[3,3] + 2*s[1,3])
@@ -433,7 +448,10 @@ class Constraint_entanglement(Base_Constraint):
 #   Else: return None (only decay, no active squeezing self-coupling)
 
 def return_edge_type(A, i, j, threshold=1e-4):
-    from covariance_physics import quadrature_slice
+    try:
+        from reservoir_engineering.covariance_physics import quadrature_slice
+    except ImportError:
+        from covariance_physics import quadrature_slice
     si = quadrature_slice(i)
     sj = quadrature_slice(j)
     if i == j:

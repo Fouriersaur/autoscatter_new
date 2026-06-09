@@ -445,6 +445,7 @@ class CovarianceOptimizer:
                 num_tests=self.kwargs_optimization['num_tests'],
                 conditions=conditions_full,
                 lambda_scale=LAMBDA_SCALE_DEFAULT,
+                max_violation_success=self.kwargs_optimization['max_violation_success'],
             )
             if not success:
                 raise Exception(
@@ -1252,26 +1253,50 @@ class CovarianceOptimizer:
     # topology. Same role here: find the sparsest graph that actually works.
 
     def check_all_constraints(self, A, sigma, threshold=None) -> np.ndarray:
-        from reservoir_engineering.topology_search import translate_conditions_to_triu
+        from reservoir_engineering.constraints import (
+            Constraint_coupling_absent,
+            Constraint_coupling_beamsplitter,
+            Constraint_coupling_two_mode_squeezing)
+        from reservoir_engineering.topology_search import (
+            NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING, PARAMETRIC,
+            BEAMSPLITTER_AND_TWO_MODE_SQUEEZING)
 
         if threshold is None:
             threshold = 1e-6
 
-        fulfilled = []
         A_jnp = jnp.array(A)
         sigma_jnp = jnp.array(sigma)
+        N = self.num_modes
+        rows, cols = np.triu_indices(N)
+        triu = np.zeros(len(rows), dtype=int)
 
-        # Evaluates every possible constraint against the solution
-        for c in self.all_possible_constraints:
-            try:
-                # How far is the A_jnp from the constraints 
-                residual = float(c(A_jnp, sigma_jnp))
-                if abs(residual) < threshold:
-                    fulfilled.append(c)
-            except Exception:
-                pass
+        for k, (i, j) in enumerate(zip(rows, cols)):
+            if i == j:
+                # Parametric drive shifts x and p decay rates differently.
+                # Without parametric: A[2i,2i] == A[2i+1,2i+1] (both = -decay/2).
+                # With parametric g: A[2i,2i] = -decay/2+g, A[2i+1,2i+1] = -decay/2-g.
+                diag_diff = abs(float(A_jnp[2*i, 2*i]) - float(A_jnp[2*i+1, 2*i+1]))
+                triu[k] = PARAMETRIC if diag_diff > threshold else NO_COUPLING
+            else:
+                # Off-diagonal: check whether block is zero (absent), pure BS, pure TMS, or both
+                bs_c  = Constraint_coupling_beamsplitter(i, j)
+                tms_c = Constraint_coupling_two_mode_squeezing(i, j)
+                absent_c = Constraint_coupling_absent(i, j)
+                absent_val   = float(absent_c(A_jnp, sigma_jnp))
+                bs_residual  = float(bs_c(A_jnp, sigma_jnp))
+                tms_residual = float(tms_c(A_jnp, sigma_jnp))
+                if abs(absent_val) < threshold:
+                    triu[k] = NO_COUPLING
+                elif abs(bs_residual) < threshold:
+                    # symmetric part ≈ 0 → no TMS component → pure BS
+                    triu[k] = BEAMSPLITTER
+                elif abs(tms_residual) < threshold:
+                    # antisymmetric part ≈ 0 → no BS component → pure TMS
+                    triu[k] = TWO_MODE_SQUEEZING
+                else:
+                    triu[k] = BEAMSPLITTER_AND_TWO_MODE_SQUEEZING
 
-        return translate_conditions_to_triu(fulfilled, self.num_modes, self.node_types)
+        return triu
 
     # -----------------------------------------------------------------------
     # prepare_all_possible_combinations()
@@ -1530,9 +1555,10 @@ class CovarianceOptimizer:
                 self.valid_combinations.append(minimal_triu)
                 self.best_info_list.append(best_info)
                 newly_added.append(minimal_triu)
-            else:
-                self.invalid_combinations.append(triu_array)
-                num_skipped += 1
+            # NOTE: Stage 3 failures are NOT added to invalid_combinations.
+            # Reason: without Stage 2, a topology that fails (e.g. BS-only can't squeeze)
+            # does NOT imply its supersets fail (BS+TMS = Kronwald CAN squeeze).
+            # Only Stage 2 failures are structural and safe to prune transitively.
 
         self.tested_complexities.append(complexity_level)
         self.num_tested_graphs.append(num_tested)

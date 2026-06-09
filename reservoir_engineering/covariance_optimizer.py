@@ -1260,8 +1260,11 @@ class CovarianceOptimizer:
         fulfilled = []
         A_jnp = jnp.array(A)
         sigma_jnp = jnp.array(sigma)
+
+        # Evaluates every possible constraint against the solution
         for c in self.all_possible_constraints:
             try:
+                # How far is the A_jnp from the constraints 
                 residual = float(c(A_jnp, sigma_jnp))
                 if abs(residual) < threshold:
                     fulfilled.append(c)
@@ -1311,28 +1314,44 @@ class CovarianceOptimizer:
         from reservoir_engineering.topology_search import (
             NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
             PARAMETRIC, BEAMSPLITTER_AND_TWO_MODE_SQUEEZING)
-
+        
+        # For each edge slot (i,j) -> checks what are the valid entries
+        # Example: 
+        # slot (0,0): [0, 3]
+        # slot (0,1): [0, 1, 2, 4]
+        # slot (1,1): [0, 3]
+        
         possible_entry_lists = []
         for i, j in self.all_possible_edges:
+            # Check if there are any prior edges that are absent
             forced_absent = any(
                 isinstance(c, Constraint_coupling_absent) and
                 c.idxs == [min(i, j), max(i, j)]
                 for c in self.enforced_constraints)
+            
+            # if the prior edges are specified to be absent
             if forced_absent:
                 possible_entry_lists.append([NO_COUPLING])
+            # If edges present + digonal terms
             elif i == j:
                 possible_entry_lists.append([NO_COUPLING, PARAMETRIC])
+            # If edges present + off-diagonal terms
             else:
                 possible_entry_lists.append([
                     NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
                     BEAMSPLITTER_AND_TWO_MODE_SQUEEZING])
 
         self.possible_entry_lists = possible_entry_lists
+        
+        # Generated every combination of one value per slot 
         self.list_of_triu_arrays = [
             np.array(combo, dtype=np.int8)
             for combo in itertools_product(*possible_entry_lists)]
+        
+        # Calculate the complexity of the graph
         self.complexity_levels = [int(np.sum(t)) for t in self.list_of_triu_arrays]
         self.unique_complexity_levels = sorted(set(self.complexity_levels))
+        
         self.num_possible_graphs = len(self.list_of_triu_arrays)
 
     # -----------------------------------------------------------------------
@@ -1450,6 +1469,7 @@ class CovarianceOptimizer:
     #   scaling exponents are preserved alongside each valid topology.
     #   This differs from AutoScatter which stores only triu_arrays.
 
+    # == Takes the canidate graphs and see which ones are valid == 
     def find_valid_combinations(
         self,
         complexity_level: int,
@@ -1517,7 +1537,7 @@ class CovarianceOptimizer:
         self.tested_complexities.append(complexity_level)
         self.num_tested_graphs.append(num_tested)
         self.num_tested_invalid_graphs.append(num_skipped)
-
+ 
     # -----------------------------------------------------------------------
     # cleanup_valid_combinations()
     # -----------------------------------------------------------------------
@@ -1543,7 +1563,7 @@ class CovarianceOptimizer:
         if not self.valid_combinations:
             return
 
-        # Deduplicate
+        # Deduplicate 
         seen = set()
         unique = []
         for t in self.valid_combinations:
@@ -1577,7 +1597,20 @@ class CovarianceOptimizer:
     #          find_valid_combinations(c)
     #          cleanup_valid_combinations()
     #   3. Return np.array(self.valid_combinations, dtype=int8)
-    #
+
+    # ========================================================================
+    # Algorithm: 
+
+    # prepare_all_possible_combinations()
+    # complexity 0 → find_valid_combinations → cleanup
+    # complexity 1 → find_valid_combinations → cleanup
+    # complexity 2 → find_valid_combinations → cleanup   ← Kronwald found here
+    # complexity 3 → find_valid_combinations → cleanup   ← pruned by Kronwald
+
+    # => output is a list of combinations from least complex to most complex
+
+    # =========================================================================
+
     # This is IDENTICAL to AutoScatter's perform_breadth_first_search.
     # The outer loop iterates over complexity levels (sparse → dense).
     # Pruning rules in identify_potential_combinations make it tractable.
@@ -1601,25 +1634,34 @@ class CovarianceOptimizer:
 
         if self.valid_combinations:
             return np.array(self.valid_combinations, dtype=np.int8)
-        return np.array([], dtype=np.int8)
+        return np.array([], dtype=np.int8) 
 
     # -----------------------------------------------------------------------
     # count_valid_invalid_graphs_layers() → (complexities, valid_counts, invalid_counts)
     # -----------------------------------------------------------------------
     # MIRRORS: count_valid_invalid_graphs_layers() in Architecture_Optimizer
     #
-    # Count how many valid/invalid graphs exist at each complexity level.
+    # ============ Example output ===========
+    # complexities  = [0, 1, 2, 3, 4, 5, 6, 7]
+    # valid_counts  = [0, 0, 0, 1, 0, 0, 0, 0]
+    # invalid_counts= [0, 1, 2, 0, 0, 0, 0, 0]
+    # =======================================
+    # 
     # Used for plotting the "landscape" of the search space.
     # Returns arrays of counts per complexity level, for analysis.py to plot.
 
+    # == Count how many valid/invalid graphs exist at each complexity level == 
     def count_valid_invalid_graphs_layers(self):
+
         complexities = getattr(self, 'unique_complexity_levels', [])
         valid_counts = [
             sum(1 for t in self.valid_combinations if int(np.sum(t)) == c)
             for c in complexities]
+         
         invalid_counts = [
             sum(1 for t in self.invalid_combinations if int(np.sum(t)) == c)
             for c in complexities]
+        
         return complexities, valid_counts, invalid_counts
 
     # -----------------------------------------------------------------------

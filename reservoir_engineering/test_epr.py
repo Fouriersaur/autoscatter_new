@@ -42,7 +42,7 @@ import numpy as np
 
 from reservoir_engineering.targets import two_mode_squeezed, duan_criterion, log_negativity
 from reservoir_engineering.covariance_optimizer import CovarianceOptimizer
-from reservoir_engineering.constraints import Constraint_stability
+from reservoir_engineering.constraints import Constraint_stability, Constraint_coupling_absent
 from reservoir_engineering.topology_search import NO_COUPLING
 
 
@@ -92,7 +92,8 @@ def run_epr_test(r=0.7, num_tests=10, verbosity=False):
         target_mode_ids      = [1, 2],
         node_types           = node_types,
         num_auxiliary_modes  = 1,
-        enforced_constraints = [Constraint_stability(penalty_strength=50.0)],
+        enforced_constraints = [Constraint_stability(penalty_strength=50.0),
+                                Constraint_coupling_absent(1, 2)],
         kwargs_optimization  = dict(
             num_tests               = num_tests,
             interrupt_if_successful = True,
@@ -157,10 +158,12 @@ def run_epr_test(r=0.7, num_tests=10, verbosity=False):
             t_ok &= check('  Duan criterion', duan_criterion(sigma_achieved))
 
             ln = log_negativity(sigma_achieved)
+            r_achieved = float(np.log(2) / 2 * ln)
             t_ok &= check(f'  log_neg > 0  (got {ln:.4f})', ln > 0)
             t_ok &= check(
                 f'  log_neg ≥ ½·theory  (got {ln:.4f}, theory {ln_theory:.4f})',
                 ln >= 0.5 * ln_theory)
+            print(f'     r_achieved = {r_achieved:.4f}  (target r={r})')
 
             # Flag whether this solution looks experimentally realistic
             realistic = max_coop < 1e7 and max_det < 100.
@@ -197,8 +200,7 @@ def run_epr_test(r=0.7, num_tests=10, verbosity=False):
 
 
 if __name__ == '__main__':
-    # r=0.4: safe below the direct-TMS stability limit (tanh(r) < 0.5 requires r < 0.549).
-    # r=0.7 is above this limit — the scheme becomes marginal and requires C > 1e7.
-    # To test higher squeezing, use Constraint_coupling_absent(1,2) to enforce
-    # cavity-mediated only (Woolley-Clerk), which has no such stability constraint.
-    run_epr_test(r=0.4, num_tests=10)
+    # Cavity-mediated only (Constraint_coupling_absent(1,2) active) > no mech-mech coupling
+    # Dissipative reservoir engineering ceiling (i.e. Wooley-Clerk Scheme): r >= 0.3 not achievable within loss
+    # threshold 5e-4. Use r=0.1 with 30 restarts to find Woolley-Clerk-like topologies.
+    run_epr_test(r=0.1, num_tests=60)

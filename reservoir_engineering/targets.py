@@ -214,8 +214,8 @@ def symplectic_eigenvalues(sigma: np.ndarray) -> np.ndarray:
         Omega[2*i+1, 2*i] = -1.
     M = 1j * Omega @ sigma
     eigs = np.linalg.eigvals(M)
-    nus = np.sort(np.abs(eigs.real))   # ±ν_k pairs → take abs, sort
-    return nus[N:]                     # last N are the N distinct positive values
+    nus = np.sort(np.abs(eigs.real))   # ±ν_k pairs → take abs, sort ascending
+    return nus[::2]                    # sorted as [ν₁,ν₁,ν₂,ν₂,...] — take every other to get N distinct values
 
 
 # ───────────────────────────────────────────────────────────────────────────

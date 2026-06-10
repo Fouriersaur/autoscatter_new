@@ -218,11 +218,21 @@ LAMBDA_SCALE_DEFAULT         = 1000.          # fixed large scale λ for optimis
 INIT_LOG_RATIO_RANGE_DEFAULT = [-1.0, 1.0]   # initial u_k = log(C̃_k) draw range
 #                                              (corresponds to C̃_k ∈ [e^{-1}, e^1] ≈ [0.37, 2.72])
 
-# ── Stage 2 scaling-discovery constants (disabled in prototype) ────────────
-# Re-enable when implementing check_convergence for automated scale finding.
-# LAMBDA_VALUES_STAGE2       = [10., 100., 1000.]  # scales for convergence test
-# STAGE2_SHORT_OPT_ITER      = 30                  # L-BFGS-B steps per scale
-# CONVERGENCE_LOSS_THRESHOLD = 1e-4                # accept if L*(λ=1000) < this
+# ── Physical bounds for Stage 3 ────────────────────────────────────────────
+# Prevent optimizer from converging to unphysical saddle points at extreme
+# cooperativities or far-off-resonance detunings.
+# u_k = log(C̃_k); C_k = λ·C̃_k.  At λ=1000:
+#   u_max = log(C̃_max) = log(C_max/λ)
+#   C_max = 1e7 → u_max ≈ 9.2   (cooperativity up to 10 million)
+# Detuning bound: |Δ_i| ≤ DETUNING_BOUND in units of κ (cavity linewidth).
+#   Sideband resolution requires |Δ| ≲ few × κ; 20 is generous.
+LOG_RATIO_BOUND_DEFAULT = np.log(1e7 / LAMBDA_SCALE_DEFAULT)   # ≈ 9.21
+DETUNING_BOUND_DEFAULT  = 20.0
+
+# ── Stage 2 scaling-discovery constants ────────────────────────────────────
+LAMBDA_VALUES_STAGE2       = [10., 100., 1000.]  # scales for convergence test
+STAGE2_SHORT_OPT_ITER      = 50                  # L-BFGS-B steps per scale
+CONVERGENCE_LOSS_THRESHOLD = 1e-3                # accept if L*(λ=1000) < this
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -395,7 +405,8 @@ class CovarianceOptimizer:
 
         self.kwargs_optimization = dict(num_tests=10, verbosity=0,
                                     max_violation_success=1e-8,
-                                    interrupt_if_successful=True)
+                                    interrupt_if_successful=True,
+                                    stage2_loss_threshold=None)
         self.kwargs_optimization.update(kwargs_optimization)
 
         self.solver_options = dict(maxiter=2000, ftol=0, gtol=1e-12)
@@ -713,9 +724,98 @@ class CovarianceOptimizer:
         short_iter: int = None,
         loss_threshold: float = None,
     ) -> tuple:
-        # PROTOTYPE: Stage 2 disabled. Always returns (None, True) to skip straight to Stage 3.
-        # No filtering on convergence — every Stage-1-stable topology proceeds to optimisation.
-        return (None, True)
+        from reservoir_engineering.topology_search import TopologyGraph
+        from reservoir_engineering.covariance_physics import (
+            build_drift_matrix_from_ratios, solve_lyapunov_kronecker, get_mode_covariance)
+
+        lambda_values  = lambda_values  if lambda_values  is not None else LAMBDA_VALUES_STAGE2
+        short_iter     = short_iter     if short_iter     is not None else STAGE2_SHORT_OPT_ITER
+        loss_threshold = loss_threshold if loss_threshold is not None else CONVERGENCE_LOSS_THRESHOLD
+
+        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
+        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
+        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
+            default_kappa=default_kappa, default_gamma=default_gamma)
+
+        E = len(edges)
+        if E == 0:
+            return (None, False)
+
+        D = self.D
+        sigma_target_jnp = jnp.array(self.sigma_target)
+        target_mode_ids  = self.target_mode_ids
+        enforced_constraints = self.enforced_constraints
+
+        losses = []
+        # Decay-rate-normalized init: set each u_k so that ALL edges start with
+        # the same physical coupling strength g = sqrt(lambda * C̃ * d_i * d_j / 4).
+        # Without normalization, mech-mech edges (d_i*d_j = γ² = 1e-4) start
+        # with g ≈ 0.04, while cavity-mech edges (d_i*d_j = κγ = 0.01) start
+        # with g ≈ 1.8 — a 40× gap that makes mech-mech gradients vanish.
+        # Normalization formula: u_k = log(d_ref / (d_i * d_j)) ± 0.5 bias
+        # where d_ref = κ*γ (cavity-mech reference product).
+        d_cav  = next((n['kappa'] for n in nodes if n['type'] == 'cavity'), 1.0)
+        d_mech = next((n['gamma'] for n in nodes if n['type'] == 'mechanical'), 0.01)
+        d_ref  = d_cav * d_mech   # reference decay-rate product (cavity-mech)
+        u_init = []
+        for edge in edges:
+            ni, nj = nodes[edge['i']], nodes[edge['j']]
+            di = ni.get('kappa', ni.get('gamma'))
+            dj = nj.get('kappa', nj.get('gamma'))
+            u_base = float(np.log(d_ref / (di * dj)))  # equalize physical g across edge types
+            etype  = edge.get('type', '')[:3]
+            if etype == 'bea':    # beamsplitter: slight positive bias for stability
+                u_init.append(u_base + 0.5)
+            elif etype == 'two':  # two_mode_squeezing: slightly below BS to avoid instability
+                u_init.append(u_base - 0.5)
+            else:
+                u_init.append(u_base)
+        u_current = jnp.array(u_init)
+
+        for lam in lambda_values:
+            def make_loss(lam_val):
+                def loss_fn(u):
+                    ratios = jnp.exp(u)
+                    A = build_drift_matrix_from_ratios(nodes, edges, ratios, lam_val)
+                    sigma = solve_lyapunov_kronecker(A, D)
+                    sigma_sub = get_mode_covariance(sigma, target_mode_ids)
+                    base = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
+                    penalty = sum(c(A, sigma) for c in enforced_constraints)
+                    return base + penalty
+                return loss_fn
+
+            loss_fn  = make_loss(lam)
+            loss_jit = jax.jit(loss_fn)
+            grad_jit = jax.jit(jax.grad(loss_fn))
+
+            u_bound = self.kwargs_optimization.get('log_ratio_bound', LOG_RATIO_BOUND_DEFAULT)
+            result = sciopt.minimize(
+                fun=lambda x: float(loss_jit(jnp.array(x, dtype=float))),
+                jac=lambda x: np.array(grad_jit(jnp.array(x, dtype=float)), dtype=float),
+                x0=np.array(u_current, dtype=float),
+                method='L-BFGS-B',
+                bounds=[(-u_bound, u_bound)] * E,
+                options={'maxiter': short_iter},
+            )
+            u_current = jnp.array(result.x, dtype=float)
+            losses.append(float(loss_jit(u_current)))
+
+        # Stage 2 never filters topologies — it only provides warm-starts.
+        #
+        # Rationale: in systems with heterogeneous decay rates (κ >> γ), mech-mech
+        # couplings need cooperativity ratios ~(κ/γ) larger than cavity-mech couplings
+        # to produce comparable physical coupling strengths. The short Stage 2
+        # optimisation cannot bridge this gap, so valid multi-mode EPR topologies
+        # converge to a "near-vacuum" local minimum (loss ≈ 3.9) indistinguishable
+        # from genuinely invalid topologies. Using Stage 2 as a hard filter would
+        # cause false negatives (valid EPR topologies rejected).
+        #
+        # Role of Stage 2: if the optimisation DID converge below loss_threshold
+        # (e.g. Kronwald-like topologies with homogeneous decay rates), return
+        # the warm-start log_ratios to accelerate Stage 3. Otherwise return
+        # u_warm=None so Stage 3 falls back to its own random initialisation.
+        u_warmstart = u_current if losses[-1] < loss_threshold else None
+        return (u_warmstart, True)
 
     # -----------------------------------------------------------------------
     # give_free_variable_idxs(conditions) → list of int
@@ -1068,16 +1168,40 @@ class CovarianceOptimizer:
             loss_jit = jax.jit(loss_fn)
             grad_jit = jax.jit(jax.grad(loss_fn))
 
-        # == Initial guess == 
-        # u_warm comes from stage 2 - the check convergecne step 
-        # since there is some level of optimization in stage 2, 
+        # Physical bounds (needed both for clipping init and for L-BFGS-B)
+        u_bound = self.kwargs_optimization.get('log_ratio_bound', LOG_RATIO_BOUND_DEFAULT)
+        d_bound = self.kwargs_optimization.get('detuning_bound',  DETUNING_BOUND_DEFAULT)
+
+        # == Initial guess ==
+        # u_warm comes from stage 2 - the check convergecne step
+        # since there is some level of optimization in stage 2,
         # u_warm is the parameter which is slghly optimized in 2
 
         if u_warm is not None:
             u_init = np.array(u_warm[:E], dtype=float)
         else:
+            # Physics-motivated base: equalise physical coupling strengths across
+            # heterogeneous edge types (cavity-mech vs mech-mech differ by κ/γ = 100×).
+            # Without this, mec-mec TMS edges start at u=0 (C̃=1, C=1000) while the
+            # physical EPR operating point needs C̃≈2000 (u≈7.7) — the random search
+            # from [-1,1] rarely bridges this 4-order-of-magnitude gap.
+            d_cav  = next((n['kappa'] for n in nodes if n['type'] == 'cavity'), 1.0)
+            d_mech = next((n['gamma'] for n in nodes if n['type'] == 'mechanical'), 0.01)
+            d_ref  = d_cav * d_mech
+            u_base = []
+            for edge in edges:
+                ni, nj = nodes[edge['i']], nodes[edge['j']]
+                di = ni.get('kappa', ni.get('gamma'))
+                dj = nj.get('kappa', nj.get('gamma'))
+                ub = float(np.log(d_ref / (di * dj)))
+                etype = edge.get('type', '')[:3]
+                if etype == 'bea':   u_base.append(ub + 0.5)
+                elif etype == 'two': u_base.append(ub - 0.5)
+                else:                u_base.append(ub)
             lo, hi = INIT_LOG_RATIO_RANGE_DEFAULT
-            u_init = np.random.uniform(lo, hi, E).astype(float)
+            u_init = (np.array(u_base, dtype=float)
+                      + np.random.uniform(lo, hi, E).astype(float))
+            u_init = np.clip(u_init, -u_bound, u_bound)
 
         if optimize_detunings:
             x0 = np.concatenate([u_init, np.zeros(N)])
@@ -1093,13 +1217,18 @@ class CovarianceOptimizer:
         solver_opts = dict(self.solver_options)
         solver_opts.update(kwargs_solver)
 
+        if optimize_detunings:
+            bounds = ([(-u_bound, u_bound)] * E) + ([(-d_bound, d_bound)] * N)
+        else:
+            bounds = [(-u_bound, u_bound)] * E
+
         # Run optimization
         result = sciopt.minimize(
             fun=lambda x: float(loss_jit(jnp.array(x, dtype=float))),
             jac=lambda x: np.array(grad_jit(jnp.array(x, dtype=float)), dtype=float),
             x0=x0,
             method=method,
-            bounds=None,
+            bounds=bounds,
             options=solver_opts,
             callback=callback,
         )
@@ -1518,10 +1647,21 @@ class CovarianceOptimizer:
                 num_skipped += 1
                 continue  # DO NOT add to invalid_combinations
 
-            # STAGE 2: convergence test (prototype: always returns (None, True))
-            u_warm, stage2_ok = self.check_convergence(triu_array)
+            # STAGE 2: convergence test — short multi-scale optimisation
+            u_warm, stage2_ok = self.check_convergence(
+                triu_array,
+                loss_threshold=self.kwargs_optimization.get('stage2_loss_threshold'),
+            )
             if not stage2_ok:
-                self.invalid_combinations.append(triu_array)
+                # Do NOT add to invalid_combinations.
+                # Reason: the integer subgraph comparison (triu[k] ≤ triu'[k]) does
+                # not preserve physical validity across coupling types.  BS (1) failing
+                # does NOT imply BS+TMS (4) fails — TMS adds qualitatively new physics.
+                # Adding a Stage-2 failure to invalid_combinations would cause
+                # identify_potential_combinations to prune BS+TMS as a "superset of
+                # the invalid BS topology", which is wrong.
+                # Stage 2 here acts as a speed filter (skip Stage 3 for obvious
+                # failures) and warm-start provider only — not a structural prune.
                 num_skipped += 1
                 continue
 

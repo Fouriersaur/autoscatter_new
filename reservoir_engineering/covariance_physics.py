@@ -554,11 +554,9 @@ def solve_lyapunov_kronecker(A: jnp.ndarray, D: jnp.ndarray) -> jnp.ndarray:
 #   loss functions (covariance_loss, covariance_loss_from_ratios) remain
 #   fully JAX-differentiable.
 
-def check_stability(A) -> bool:
-    
+def check_stability(A, tolerance: float = 1e-10) -> bool:
     eigs = np.linalg.eigvals(np.asarray(A))
-
-    return bool(np.all(np.real(eigs) < 0))
+    return bool(np.all(np.real(eigs) < tolerance))
 
 
 # ───────────────────────────────────────────────────────────────────────────

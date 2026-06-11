@@ -42,7 +42,7 @@ import numpy as np
 
 from reservoir_engineering.targets import two_mode_squeezed, duan_criterion, log_negativity
 from reservoir_engineering.covariance_optimizer import CovarianceOptimizer
-from reservoir_engineering.constraints import Constraint_stability, Constraint_coupling_absent
+from reservoir_engineering.constraints import Constraint_stability, Constraint_coupling_absent, Constraint_coupling_symmetric
 from reservoir_engineering.topology_search import NO_COUPLING
 
 
@@ -93,7 +93,11 @@ def run_epr_test(r=0.7, num_tests=10, verbosity=False):
         node_types           = node_types,
         num_auxiliary_modes  = 1,
         enforced_constraints = [Constraint_stability(penalty_strength=50.0),
-                                Constraint_coupling_absent(1, 2)],
+                                Constraint_coupling_absent(1, 2),
+                                Constraint_coupling_symmetric(0, 1, 'bea', 0, 2, 'bea', penalty_strength=5.0,
+                                                              guard_edges=[(0, 1, 'two'), (0, 2, 'two')]),
+                                Constraint_coupling_symmetric(0, 1, 'two', 0, 2, 'two', penalty_strength=5.0,
+                                                              guard_edges=[(0, 1, 'bea'), (0, 2, 'bea')])],
         kwargs_optimization  = dict(
             num_tests               = num_tests,
             interrupt_if_successful = True,

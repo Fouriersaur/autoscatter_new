@@ -467,6 +467,39 @@ def return_edge_type(A, i, j, threshold=1e-4):
     return EDGETYPE_BEAMSPLITTER
 
 # ───────────────────────────────────────────────────────────────────────────
+# CLASS: Constraint_coupling_symmetric(i1, j1, edge_type1, i2, j2, edge_type2)
+# ───────────────────────────────────────────────────────────────────────────
+# Penalises |u_a − u_b|² to enforce equal coupling strengths between two edges.
+# edge_type: 'bea' (beamsplitter) or 'two' (two_mode_squeezing).
+# Called with (log_ratios, edges) instead of (A, sigma) — detected and dispatched
+# specially inside give_conditions_func_with_conditions.
+
+class Constraint_coupling_symmetric:
+    def __init__(self, i1, j1, edge_type1, i2, j2, edge_type2,
+                 penalty_strength=10.0, guard_edges=None):
+        self.edge_a = (min(i1, j1), max(i1, j1), edge_type1[:3])
+        self.edge_b = (min(i2, j2), max(i2, j2), edge_type2[:3])
+        self.penalty_strength = penalty_strength
+        # guard_edges: list of (i, j, type_prefix) — ALL must exist before penalty fires
+        self.guard_edges = [(min(i, j), max(i, j), t[:3]) for i, j, t in (guard_edges or [])]
+
+    def __call__(self, log_ratios, edges):
+        present = set()
+        idx_a = idx_b = None
+        for k, e in enumerate(edges):
+            key = (min(e['i'], e['j']), max(e['i'], e['j']), e.get('type', '')[:3])
+            present.add(key)
+            if key == self.edge_a:
+                idx_a = k
+            if key == self.edge_b:
+                idx_b = k
+        if idx_a is None or idx_b is None:
+            return 0.0
+        if any(g not in present for g in self.guard_edges):
+            return 0.0
+        return self.penalty_strength * (log_ratios[idx_a] - log_ratios[idx_b]) ** 2
+
+# ───────────────────────────────────────────────────────────────────────────
 # FUNCTION: setup_constraints(edges_absent, edges_beamsplitter, edges_tms) → list
 # ───────────────────────────────────────────────────────────────────────────
 # MIRRORS: setup_constraints(couplings_set_to_zero, coupling_phases_set_to_zero)

@@ -772,6 +772,10 @@ class CovarianceOptimizer:
                 u_init.append(u_base)
         u_current = jnp.array(u_init)
 
+        from reservoir_engineering.constraints import Constraint_coupling_symmetric
+        _sym_c   = [c for c in enforced_constraints if isinstance(c, Constraint_coupling_symmetric)]
+        _other_c = [c for c in enforced_constraints if not isinstance(c, Constraint_coupling_symmetric)]
+
         for lam in lambda_values:
             def make_loss(lam_val):
                 def loss_fn(u):
@@ -780,7 +784,8 @@ class CovarianceOptimizer:
                     sigma = solve_lyapunov_kronecker(A, D)
                     sigma_sub = get_mode_covariance(sigma, target_mode_ids)
                     base = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
-                    penalty = sum(c(A, sigma) for c in enforced_constraints)
+                    penalty = sum(c(A, sigma) for c in _other_c)
+                    penalty += sum(c(u, edges) for c in _sym_c)
                     return base + penalty
                 return loss_fn
 
@@ -884,9 +889,14 @@ class CovarianceOptimizer:
         D = self.D
         sigma_target_jnp = jnp.array(self.sigma_target)
         target_mode_ids = self.target_mode_ids
-        enforced_constraints = self.enforced_constraints
         J2 = jnp.array([[0., 1.], [-1., 0.]])
         lambda_scale = LAMBDA_SCALE_DEFAULT
+
+        from reservoir_engineering.constraints import Constraint_coupling_symmetric
+        sym_constraints   = [c for c in self.enforced_constraints
+                             if isinstance(c, Constraint_coupling_symmetric)]
+        other_constraints = [c for c in self.enforced_constraints
+                             if not isinstance(c, Constraint_coupling_symmetric)]
 
         def loss_fn(x):
             """
@@ -899,20 +909,22 @@ class CovarianceOptimizer:
             ratios = jnp.exp(log_ratios)
 
             A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
-            
+
             for i in range(N):
                 s = slice(2 * i, 2 * i + 2)
                 A = A.at[s, s].add(detunings_x[i] * J2)
-            
+
             # construct the cov matrix -> loss function
             sigma = solve_lyapunov_kronecker(A, D)
             sigma_sub = get_mode_covariance(sigma, target_mode_ids)
             loss = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
-            
-            # Add the contraints f into the loss function
-            for c in enforced_constraints:
+
+            for c in other_constraints:
                 loss = loss + c(A, sigma)
-            
+
+            for c in sym_constraints:
+                loss = loss + c(log_ratios, edges)
+
             return loss
 
         loss_jit = jax.jit(loss_fn)

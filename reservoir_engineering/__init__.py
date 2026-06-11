@@ -164,6 +164,7 @@ from reservoir_engineering.constraints import (
     Constraint_coupling_absent,         # mirrors Constraint_coupling_zero
     Constraint_coupling_beamsplitter,   # mirrors Constraint_coupling_phase_zero
     Constraint_coupling_two_mode_squeezing,
+    Constraint_coupling_symmetric,      # enforces equal coupling strengths between two edges
     Constraint_stability,               # mirrors MinimalAddedInputNoise
     Constraint_physical_state,          # mirrors MinimalAddedOutputNoise
     Constraint_target_squeezing,
@@ -248,7 +249,7 @@ __all__ = [
     'NO_COUPLING', 'BEAMSPLITTER', 'TWO_MODE_SQUEEZING', 'PARAMETRIC',
     'BEAMSPLITTER_AND_TWO_MODE_SQUEEZING',
     'Constraint_coupling_absent', 'Constraint_coupling_beamsplitter',
-    'Constraint_coupling_two_mode_squeezing',
+    'Constraint_coupling_two_mode_squeezing', 'Constraint_coupling_symmetric',
     'Constraint_stability', 'Constraint_physical_state',
     'Constraint_target_squeezing', 'Constraint_entanglement',
     'setup_constraints', 'plot_graph', 'plot_list_of_graphs',

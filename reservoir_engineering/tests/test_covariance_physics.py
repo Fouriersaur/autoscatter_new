@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__))   # adds reservoir_engineering/ to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))   # adds reservoir_engineering/ to path
 
 import jax.numpy as jnp
 import numpy as np

@@ -12,7 +12,7 @@ A summary at the end shows total pass/fail count.
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import numpy as np
 from topology_search import (

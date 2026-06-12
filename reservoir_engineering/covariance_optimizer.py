@@ -388,7 +388,9 @@ class CovarianceOptimizer:
         kwargs_optimization: dict = {},
         solver_options: dict = {},
         enforced_constraints: list = [],
-        make_initial_test: bool = True,):
+        make_initial_test: bool = True,
+        kappa: float = 1.0,
+        gamma: float = 0.01,):
 
             
         from reservoir_engineering.covariance_physics import build_diffusion_matrix
@@ -417,10 +419,10 @@ class CovarianceOptimizer:
         for i, t in enumerate(node_types):
             if t == 'cavity':
                 self.nodes.append({'id': i, 'type': 'cavity',
-                                'kappa': 1.0, 'delta': 0.0})
+                                'kappa': kappa, 'delta': 0.0})
             else:
                 self.nodes.append({'id': i, 'type': 'mechanical',
-                                'gamma': 0.01, 'n_th': 0.0, 'delta': 0.0})
+                                'gamma': gamma, 'n_th': 0.0, 'delta': 0.0})
 
         self.D = build_diffusion_matrix(self.nodes)
 

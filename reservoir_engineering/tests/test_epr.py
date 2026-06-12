@@ -7,7 +7,7 @@ Modes
 -----
     node_types       = ['cavity', 'mechanical', 'mechanical']
     target_mode_ids  = [1, 2]   (both mechanicals are the signal)
-    Target           : two_mode_squeezed(r=0.7)
+    Target           : two_mode_squeezed(r)
 
 What the BFS finds
 ------------------
@@ -33,16 +33,54 @@ Regardless of which topology is found, the achieved σ must satisfy:
   - Negative p-p correlation   (σ_{p₁,p₂} < 0)
   - Duan criterion satisfied   → state is entangled
   - Log negativity > 0         → quantitative entanglement measure
+
+Topology discovery summary (empirical, from BFS runs)
+------------------------------------------------------
+γ/κ = 1e-2 (default), no mec-mec constraint, loss threshold 5e-4:
+
+    r = 0.4  →  4 topologies found (all direct mec-mec):
+        [0, 1, 4, 0, 2, 0]  cav-m1:BS,      cav-m2:BS+TMS,  m1-m2:TMS
+        [0, 2, 1, 0, 4, 0]  cav-m1:TMS,     cav-m2:BS,      m1-m2:BS+TMS
+        [0, 4, 1, 0, 2, 0]  cav-m1:BS+TMS,  cav-m2:BS,      m1-m2:TMS
+        [0, 1, 0, 0, 4, 0]  cav-m1:BS only,                 m1-m2:BS+TMS
+        → novel asymmetric schemes, no literature precedent (except [0,1,0,0,4,0]
+          which resembles Bogoliubov bath cooling, Woolley & Clerk PRA 2014 §III)
+        → max cooperativity ~6.5e6 (mec-mec TMS); [realistic] flag marginal
+
+γ/κ = 1e-2 (default), Constraint_coupling_absent(1,2) — cavity-mediated only:
+
+    r = 0.1  →  1–2 topologies found (stochastic, 60–120 restarts needed):
+        [0, 4, 4, 0, 0, 0]  cav-m1:BS+TMS,  cav-m2:BS+TMS   ← Woolley-Clerk
+        [0, 4, 1, 0, 0, 0]  cav-m1:BS+TMS,  cav-m2:BS only  ← asymmetric variant
+        [0, 1, 4, 0, 0, 0]  cav-m1:BS only, cav-m2:BS+TMS   ← asymmetric variant
+        → r_achieved ≈ 0.08–0.09 (optimizer reaches ~88% of target)
+        → Duan criterion FAILS even on perfect target at r=0.1 (convention issue)
+        → C ~ 1e4–1e7; borderline realistic
+    r ≥ 0.3  →  0 topologies — physics ceiling for dissipative cavity-only EPR
+        (adiabatic elimination degrades; g_tms → g_bs → marginal instability)
+
+γ/κ = 4e-5 (deep resolved sideband), no mec-mec constraint, log_ratio_bound=13:
+
+    r = 0.4  →  1 topology found:
+        [0, 1, 1, 0, 2, 0]  cav-m1:BS, cav-m2:BS, m1-m2:TMS (direct)
+        → C_cav-mec ≈ 160,  C_mec-mec ≈ 4.4e8
+        → mec-mec cooperativity already at bound limit (exp(13)×λ ≈ 4.4e8)
+    r = 0.7+  →  0 topologies — C_mec-mec would exceed 4.4e8; instability ceiling
+    r = 2.1   →  NOT achievable — requires C_mec-mec ~ 10^14 (unphysical)
+
+Stability ceiling for direct mec-mec TMS:
+    tanh(r) = g_tms / γ_eff   where γ_eff = C_cav × γ (cavity cooling rate)
+    As r → ∞: g_tms → γ_eff → marginal instability; C_mec-mec ∝ C_cav² × exp(2r)
 """
 
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import numpy as np
 
 from reservoir_engineering.targets import two_mode_squeezed, duan_criterion, log_negativity
 from reservoir_engineering.covariance_optimizer import CovarianceOptimizer
-from reservoir_engineering.constraints import Constraint_stability, Constraint_coupling_absent, Constraint_coupling_symmetric
+from reservoir_engineering.constraints import Constraint_stability
 from reservoir_engineering.topology_search import NO_COUPLING
 
 
@@ -92,19 +130,17 @@ def run_epr_test(r=0.7, num_tests=10, verbosity=False):
         target_mode_ids      = [1, 2],
         node_types           = node_types,
         num_auxiliary_modes  = 1,
-        enforced_constraints = [Constraint_stability(penalty_strength=50.0),
-                                Constraint_coupling_absent(1, 2),
-                                Constraint_coupling_symmetric(0, 1, 'bea', 0, 2, 'bea', penalty_strength=5.0,
-                                                              guard_edges=[(0, 1, 'two'), (0, 2, 'two')]),
-                                Constraint_coupling_symmetric(0, 1, 'two', 0, 2, 'two', penalty_strength=5.0,
-                                                              guard_edges=[(0, 1, 'bea'), (0, 2, 'bea')])],
+        enforced_constraints = [Constraint_stability(penalty_strength=50.0)],
         kwargs_optimization  = dict(
             num_tests               = num_tests,
             interrupt_if_successful = True,
             max_violation_success   = 5e-4,
+            log_ratio_bound         = 13.0,   # γ=4e-5: mec-mec u_base≈10.8 > default 9.21
         ),
         solver_options       = dict(maxiter=3000, ftol=0, gtol=1e-12),
         make_initial_test    = False,
+        kappa                = 1.0,
+        gamma                = 4e-5,
     )
     print('  optimizer initialised OK')
 
@@ -173,7 +209,13 @@ def run_epr_test(r=0.7, num_tests=10, verbosity=False):
             realistic = max_coop < 1e7 and max_det < 100.
             print(f'     {"[realistic]" if realistic else "[unphysical: extreme cooperativity/detuning]"}')
 
-            print('     Cooperativities:', {k: f'{v:.2e}' for k, v in info.get('cooperativities', {}).items()})
+            coops = info.get('cooperativities', {})
+            if coops:
+                c_ref_key = max(coops, key=lambda k: coops[k])
+                c_ref_val = coops[c_ref_key]
+                print(f'     Cooperativity ratios (ref = edge {c_ref_key}, C_ref = {c_ref_val:.2e}):')
+                for k, v in coops.items():
+                    print(f'       C_{k} / C_ref = {v / c_ref_val:.4f}   (C_{k} = {v:.2e})')
             print('     Detunings:', {k: f'{v:.2f}' for k, v in info.get('detunings', {}).items()})
 
             if verbosity:
@@ -204,7 +246,13 @@ def run_epr_test(r=0.7, num_tests=10, verbosity=False):
 
 
 if __name__ == '__main__':
-    # Cavity-mediated only (Constraint_coupling_absent(1,2) active) > no mech-mech coupling
-    # Dissipative reservoir engineering ceiling (i.e. Wooley-Clerk Scheme): r >= 0.3 not achievable within loss
-    # threshold 5e-4. Use r=0.1 with 30 restarts to find Woolley-Clerk-like topologies.
-    run_epr_test(r=0.1, num_tests=60)
+    # Current config: γ/κ = 4e-5, direct mec-mec allowed, extended cooperativity bound.
+    # Finds [0,1,1,0,2,0] at r=0.4 (C_cav~160, C_mm~4.4e8).
+    # Ceiling: r ≥ 0.7 requires C_mm > 4.4e8 — exceeds bound, not achievable.
+    # To recover default γ/κ=1e-2 asymmetric schemes at r=0.4:
+    #   remove kappa/gamma kwargs and log_ratio_bound → finds [0,1,4,0,2,0] etc.
+    # To find Woolley-Clerk at r=0.1:
+    #   add Constraint_coupling_absent(1,2), set r=0.1, num_tests=120.
+    # Chose r = 0.4 to ensure system has decent entanglement but remains stable
+    #   Higher r -> stronger entanglement ; Lower r -> more stable
+    run_epr_test(r=0.4, num_tests=20)

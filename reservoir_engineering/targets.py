@@ -161,9 +161,80 @@ def thermal(n_bar: float, n_modes: int = 1) -> np.ndarray:
 # Note: the circuit topology needed to ENGINEER a cluster state dissipatively
 # is an interesting open question — this is what the searcher is for.
 
-def cluster_state(n_modes: int, delta: float) -> np.ndarray:
-    pass
+# Used the quadracture naming convention (x₀, p₀, x₁, p₁, x₂, p₂ ...)
+def cluster_state(n_modes: int, delta: float, adjacency: np.ndarray = None) -> np.ndarray:
+    if adjacency is None:
+        adjacency = np.zeros((n_modes, n_modes))
+        for i in range(n_modes - 1):
+            adjacency[i, i+1] = 1.0
+            adjacency[i+1, i] = 1.0
+    
+    # Mechanical Covariance Matrix
+    sigma_product = np.zeros((2*n_modes, 2*n_modes))
+    for i in range(n_modes):
+        sigma_product[2*i,   2*i  ] = 0.5 * np.exp(+2*delta)
+        sigma_product[2*i+1, 2*i+1] = 0.5 * np.exp(-2*delta)
+    
+    # Control Z Gate Symplectic Transformation
+    S = np.eye(2*n_modes)
+    for i in range(n_modes):
+        for j in range(i+1, n_modes):
+            if adjacency[i, j] != 0:
+                g = float(adjacency[i, j])
+                S[2*i+1, 2*j  ] += g   # p_i gets x_j
+                S[2*j+1, 2*i  ] += g   # p_j gets x_i
 
+    return S @ sigma_product @ S.T
+
+
+def nullifier_variances(sigma: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
+    """
+    Variance of each cluster nullifier  f_j = p_j - sum_k A[j,k] * x_k.
+    Returns shape (N,).  Ideal cluster state: all variances = e^{-2*delta}/2.
+
+    Var(f_j) = sigma[p_j,p_j]
+             - 2 * sum_k A[j,k] * sigma[p_j, x_k]
+             + sum_{k,l} A[j,k]*A[j,l] * sigma[x_k, x_l]
+    """
+    N = sigma.shape[0] // 2
+    variances = np.zeros(N)
+    for j in range(N):
+        v = sigma[2*j+1, 2*j+1]
+        for k in range(N):
+            if adjacency[j, k] != 0:
+                v -= 2.0 * adjacency[j, k] * sigma[2*j+1, 2*k]
+                for l in range(N):
+                    if adjacency[j, l] != 0:
+                        v += adjacency[j, k] * adjacency[j, l] * sigma[2*k, 2*l]
+        variances[j] = v
+    return variances
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# nullifier_variances() 
+# ───────────────────────────────────────────────────────────────────────────
+
+def nullifier_variances(sigma: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
+    """
+    Variance of each cluster nullifier  f_j = p_j - sum_k A[j,k] * x_k.
+    Returns shape (N,).  Ideal cluster state: all variances = e^{-2*delta}/2 → 0.
+
+    Var(f_j) = sigma[p_j,p_j]
+             - 2 * sum_k A[j,k] * sigma[p_j, x_k]
+             + sum_{k,l} A[j,k]*A[j,l] * sigma[x_k, x_l]
+    """
+    N = sigma.shape[0] // 2
+    variances = np.zeros(N)
+    for j in range(N):
+        v = sigma[2*j+1, 2*j+1]
+        for k in range(N):
+            if adjacency[j, k] != 0:
+                v -= 2.0 * adjacency[j, k] * sigma[2*j+1, 2*k]
+                for l in range(N):
+                    if adjacency[j, l] != 0:
+                        v += adjacency[j, k] * adjacency[j, l] * sigma[2*k, 2*l]
+        variances[j] = v
+    return variances
 
 # ───────────────────────────────────────────────────────────────────────────
 # is_physical(sigma) → bool

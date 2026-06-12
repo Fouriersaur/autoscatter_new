@@ -255,4 +255,4 @@ if __name__ == '__main__':
     #   add Constraint_coupling_absent(1,2), set r=0.1, num_tests=120.
     # Chose r = 0.4 to ensure system has decent entanglement but remains stable
     #   Higher r -> stronger entanglement ; Lower r -> more stable
-    run_epr_test(r=0.4, num_tests=20)
+    run_epr_test(r=0.4, num_tests=40)

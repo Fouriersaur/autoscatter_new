@@ -887,11 +887,9 @@ class CovarianceOptimizer:
             default_kappa=default_kappa, default_gamma=default_gamma)
         
         E = len(edges)
-        N = self.num_modes
         D = self.D
         sigma_target_jnp = jnp.array(self.sigma_target)
         target_mode_ids = self.target_mode_ids
-        J2 = jnp.array([[0., 1.], [-1., 0.]])
         lambda_scale = LAMBDA_SCALE_DEFAULT
 
         from reservoir_engineering.constraints import Constraint_coupling_symmetric
@@ -900,23 +898,31 @@ class CovarianceOptimizer:
         other_constraints = [c for c in self.enforced_constraints
                              if not isinstance(c, Constraint_coupling_symmetric)]
 
+        # Reference edge: fixed at C = lambda_scale (u_ref = 0).
+        # Choose the edge with the largest d_i*d_j (most natural coupling scale).
+        # All other E-1 edges are free log-ratios relative to C_ref.
+        decay_prods = []
+        for edge in edges:
+            ni_e = nodes[edge['i']]; nj_e = nodes[edge['j']]
+            decay_prods.append(ni_e.get('kappa', ni_e.get('gamma')) *
+                               nj_e.get('kappa', nj_e.get('gamma')))
+        ref_idx  = int(np.argmax(decay_prods)) if E > 0 else 0
+        n_free_u = max(E - 1, 0)
+
         def loss_fn(x):
             """
-            x is a flat vector of all free parameters:
-            x = [u_0, u_1, ..., u_{E-1}, Δ_0, Δ_1, ..., Δ_{N-1}]
-                ←── log coupling ratios ──→  ←──── detunings ────→
+            x = [u_1, ..., u_{E-1}]  (E-1 log-ratios vs C_ref)
+            Reference edge (ref_idx) is fixed at u=0 (C = lambda_scale).
+            Detunings are fixed at zero: covariance depends only on cooperativity ratios.
             """
-            log_ratios = x[:E]
-            detunings_x = x[E:]
-            ratios = jnp.exp(log_ratios)
+            u_free = x[:n_free_u]
+            full_u = jnp.concatenate([u_free[:ref_idx],
+                                      jnp.array([0.0]),
+                                      u_free[ref_idx:]])
+            ratios = jnp.exp(full_u)
 
             A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
 
-            for i in range(N):
-                s = slice(2 * i, 2 * i + 2)
-                A = A.at[s, s].add(detunings_x[i] * J2)
-
-            # construct the cov matrix -> loss function
             sigma = solve_lyapunov_kronecker(A, D)
             sigma_sub = get_mode_covariance(sigma, target_mode_ids)
             loss = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
@@ -925,7 +931,7 @@ class CovarianceOptimizer:
                 loss = loss + c(A, sigma)
 
             for c in sym_constraints:
-                loss = loss + c(log_ratios, edges)
+                loss = loss + c(full_u, edges)
 
             return loss
 
@@ -967,7 +973,7 @@ class CovarianceOptimizer:
         self,
         conditions: list = [],
         betas=None,
-        optimize_detunings: bool = True,
+        optimize_detunings: bool = False,
     ):
         
         # Give the indices of the free variables that need optimising
@@ -1118,7 +1124,7 @@ class CovarianceOptimizer:
         triu_array=None,
         lambda_scale: float = None,
         u_warm=None,
-        optimize_detunings: bool = True,
+        optimize_detunings: bool = False,
         verbosity: bool = False,
         max_violation_success: float = 1e-8,
         calc_conditions_and_gradients=None,
@@ -1156,24 +1162,42 @@ class CovarianceOptimizer:
         enforced_constraints = self.enforced_constraints
         J2 = jnp.array([[0., 1.], [-1., 0.]])
 
-        # == Define loss Function: x = [u_0,...,u_{E-1}, Δ_0,...,Δ_{N-1}] == 
+        # Reference edge: largest d_i*d_j fixed at C = lambda_scale (u_ref = 0).
+        # Free variables: E-1 log-ratios (other edges relative to C_ref) + N detunings.
+        decay_prods = []
+        for edge in edges:
+            ni_e = nodes[edge['i']]; nj_e = nodes[edge['j']]
+            decay_prods.append(ni_e.get('kappa', ni_e.get('gamma')) *
+                               nj_e.get('kappa', nj_e.get('gamma')))
+        ref_idx  = int(np.argmax(decay_prods)) if E > 0 else 0
+        n_free_u = max(E - 1, 0)
+
+        # == Define loss Function ==
+        # x = [u_1,...,u_{E-1}]  when optimize_detunings=False (default)
+        # x = [u_1,...,u_{E-1}, Δ_0,...,Δ_{N-1}]  when optimize_detunings=True
+        # u_k = log(C_k / C_ref), reference edge fixed at u=0.
+        # Covariance depends only on cooperativity ratios; detunings fixed at 0 by default.
         def loss_fn(x):
-            log_ratios = x[:E]
-            detunings_x = x[E:]
-            ratios = jnp.exp(log_ratios)
+            u_free = x[:n_free_u]
+            full_u = jnp.concatenate([u_free[:ref_idx],
+                                      jnp.array([0.0]),
+                                      u_free[ref_idx:]])
+            ratios = jnp.exp(full_u)
             A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
-            
-            for i in range(N):
-                s = slice(2 * i, 2 * i + 2)
-                A = A.at[s, s].add(detunings_x[i] * J2)
-            
+
+            if optimize_detunings:
+                detunings_x = x[n_free_u:]
+                for i in range(N):
+                    s = slice(2 * i, 2 * i + 2)
+                    A = A.at[s, s].add(detunings_x[i] * J2)
+
             sigma = solve_lyapunov_kronecker(A, D)
             sigma_sub = get_mode_covariance(sigma, target_mode_ids)
             loss = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
-            
+
             for c in enforced_constraints:
                 loss = loss + c(A, sigma)
-            
+
             return loss
 
         if calc_conditions_and_gradients is not None:
@@ -1187,34 +1211,34 @@ class CovarianceOptimizer:
         d_bound = self.kwargs_optimization.get('detuning_bound',  DETUNING_BOUND_DEFAULT)
 
         # == Initial guess ==
-        # u_warm comes from stage 2 - the check convergecne step
-        # since there is some level of optimization in stage 2,
-        # u_warm is the parameter which is slghly optimized in 2
-
+        # u_warm (E-dim from Stage 2) → drop ref_idx component → n_free_u values.
         if u_warm is not None:
-            u_init = np.array(u_warm[:E], dtype=float)
+            u_warm_full = np.array(u_warm[:E], dtype=float)
+            u_init = np.delete(u_warm_full, ref_idx)
         else:
-            # Physics-motivated base: equalise physical coupling strengths across
-            # heterogeneous edge types (cavity-mech vs mech-mech differ by κ/γ = 100×).
-            # Without this, mec-mec TMS edges start at u=0 (C̃=1, C=1000) while the
-            # physical EPR operating point needs C̃≈2000 (u≈7.7) — the random search
-            # from [-1,1] rarely bridges this 4-order-of-magnitude gap.
-            d_cav  = next((n['kappa'] for n in nodes if n['type'] == 'cavity'), 1.0)
-            d_mech = next((n['gamma'] for n in nodes if n['type'] == 'mechanical'), 0.01)
-            d_ref  = d_cav * d_mech
+            # Physics-motivated base relative to reference edge's decay product.
+            ref_edge = edges[ref_idx] if E > 0 else None
+            if ref_edge is not None:
+                ref_ni = nodes[ref_edge['i']]; ref_nj = nodes[ref_edge['j']]
+                d_ref_edge = (ref_ni.get('kappa', ref_ni.get('gamma')) *
+                              ref_nj.get('kappa', ref_nj.get('gamma')))
+            else:
+                d_ref_edge = 1.0
             u_base = []
-            for edge in edges:
+            for k, edge in enumerate(edges):
+                if k == ref_idx:
+                    continue
                 ni, nj = nodes[edge['i']], nodes[edge['j']]
                 di = ni.get('kappa', ni.get('gamma'))
                 dj = nj.get('kappa', nj.get('gamma'))
-                ub = float(np.log(d_ref / (di * dj)))
+                ub = float(np.log(d_ref_edge / (di * dj)))
                 etype = edge.get('type', '')[:3]
                 if etype == 'bea':   u_base.append(ub + 0.5)
                 elif etype == 'two': u_base.append(ub - 0.5)
                 else:                u_base.append(ub)
             lo, hi = INIT_LOG_RATIO_RANGE_DEFAULT
             u_init = (np.array(u_base, dtype=float)
-                      + np.random.uniform(lo, hi, E).astype(float))
+                      + np.random.uniform(lo, hi, n_free_u).astype(float))
             u_init = np.clip(u_init, -u_bound, u_bound)
 
         if optimize_detunings:
@@ -1226,31 +1250,38 @@ class CovarianceOptimizer:
         loss_history = []
         def callback(x):
             loss_history.append(float(loss_jit(jnp.array(x, dtype=float))))
-        
+
         # Optimization solver
         solver_opts = dict(self.solver_options)
         solver_opts.update(kwargs_solver)
 
         if optimize_detunings:
-            bounds = ([(-u_bound, u_bound)] * E) + ([(-d_bound, d_bound)] * N)
+            bounds = ([(-u_bound, u_bound)] * n_free_u) + ([(-d_bound, d_bound)] * N)
         else:
-            bounds = [(-u_bound, u_bound)] * E
+            bounds = [(-u_bound, u_bound)] * n_free_u
 
-        # Run optimization
-        result = sciopt.minimize(
-            fun=lambda x: float(loss_jit(jnp.array(x, dtype=float))),
-            jac=lambda x: np.array(grad_jit(jnp.array(x, dtype=float)), dtype=float),
-            x0=x0,
-            method=method,
-            bounds=bounds,
-            options=solver_opts,
-            callback=callback,
-        )
+        n_vars = len(x0)
+        if n_vars == 0:
+            # No free variables: reference edge is the only edge, fixed at C=lambda.
+            # Just evaluate loss directly — no optimization to run.
+            x_sol = x0
+        else:
+            # Run optimization
+            result = sciopt.minimize(
+                fun=lambda x: float(loss_jit(jnp.array(x, dtype=float))),
+                jac=lambda x: np.array(grad_jit(jnp.array(x, dtype=float)), dtype=float),
+                x0=x0,
+                method=method,
+                bounds=bounds,
+                options=solver_opts,
+                callback=callback,
+            )
+            x_sol = result.x
 
-        # Solutions to Optimization and sucess or not 
-        x_sol = result.x
-        log_ratios_sol = x_sol[:E]
-        detunings_sol = x_sol[E:] if optimize_detunings else np.zeros(N)
+        # Reconstruct full E-dim log_ratios by re-inserting 0.0 at ref_idx
+        u_free_sol = x_sol[:n_free_u]
+        log_ratios_sol = np.insert(u_free_sol, ref_idx, 0.0)
+        detunings_sol = x_sol[n_free_u:] if optimize_detunings else np.zeros(N)
         final_loss = float(loss_jit(jnp.array(x_sol, dtype=float)))
         success = final_loss < max_violation_success
 
@@ -1280,8 +1311,11 @@ class CovarianceOptimizer:
             cooperativities[label] = C_k
             coupling_ratios_dict[f'C~_{label}'] = C_tilde
 
+        opt_nit = result.nit if n_vars > 0 else 0
+        opt_msg = result.message if n_vars > 0 else 'no free variables — direct evaluation'
+
         if verbosity:
-            print(f'  loss={final_loss:.3e}  success={success}  nit={result.nit}')
+            print(f'  loss={final_loss:.3e}  success={success}  nit={opt_nit}')
 
         info_out = {
             'initial_guess'      : x0,
@@ -1296,12 +1330,12 @@ class CovarianceOptimizer:
             'physical_formula'   : 'g_k = sqrt(lambda * C~_k * decay_i * decay_j / 4)',
             'final_cost'         : final_loss,
             'success'            : success,
-            'optimizer_message'  : result.message,
+            'optimizer_message'  : opt_msg,
             'A'                  : np.array(A_sol),
             'sigma_full'         : np.array(sigma_full_sol),
             'sigma_achieved'     : np.array(sigma_achieved),
             'sigma_target'       : self.sigma_target,
-            'nit'                : result.nit,
+            'nit'                : opt_nit,
             'loss_history'       : loss_history,
         }
         return success, info_out

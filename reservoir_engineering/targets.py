@@ -79,18 +79,23 @@ def squeezed_vacuum(r: float) -> np.ndarray:
 #
 # Formula (block structure in the (x_0, p_0, x_1, p_1) basis):
 #
-#   σ = ½ · [[ cosh(2r) · I₂    sinh(2r) · σ_z  ]
-#             [ sinh(2r) · σ_z   cosh(2r) · I₂   ]]
+#   σ = ½ · [[ cosh(2r) · I₂    -sinh(2r) · σ_z  ]
+#             [ -sinh(2r) · σ_z   cosh(2r) · I₂   ]]
 #
 #   where σ_z = diag(+1, -1) and I₂ = identity(2).
 #
 #   Explicitly:
 #   σ_00 = σ_11 = ½ cosh(2r)  (both modes equally noisy individually)
-#   σ_01[x,x] = +½ sinh(2r)   (positive x-x correlation)
-#   σ_01[p,p] = -½ sinh(2r)   (negative p-p correlation → anti-correlated)
+#   σ_01[x,x] = -½ sinh(2r)   (negative x-x correlation)
+#   σ_01[p,p] = +½ sinh(2r)   (positive p-p correlation)
+#
+# Convention note:
+#   This uses the dissipative-engineering (Woolley-Clerk) convention where
+#   x₁+x₂ and p₁-p₂ are the squeezed quadratures.  Equivalent to the
+#   parametric-downconversion convention up to a local π-rotation on mode 0.
+#   Entanglement check: var(x₀+x₁) + var(p₀-p₁) = 2e^{-2r} < 1 for r > 0.
 #
 # Entanglement:
-#   Duan criterion: violated (state is entangled) iff  r > 0.
 #   Log negativity = r  (monotonically increasing with squeezing).
 #
 # Usage: target for 3-mode systems with 2 signal modes (cavity mediates).
@@ -100,8 +105,8 @@ def two_mode_squeezed(r: float) -> np.ndarray:
     s  = np.sinh(2*r)
     sz = np.diag([1., -1.])
     I2 = np.eye(2)
-    return 0.5 * np.block([[c*I2, s*sz],
-                            [s*sz, c*I2]])
+    return 0.5 * np.block([[c*I2, -s*sz],
+                            [-s*sz, c*I2]])
 
 
 
@@ -331,9 +336,14 @@ def squeezing_db(sigma: np.ndarray, mode_id: int = 0) -> float:
 # Raise ValueError for other sizes.
 
 def duan_criterion(sigma: np.ndarray) -> bool:
-    duan_sum = (sigma[0, 0] + sigma[2, 2] - 2 * sigma[0, 2]
-                + sigma[1, 1] + sigma[3, 3] + 2 * sigma[1, 3])
-    return bool(duan_sum < 1.0)
+    # Check both EPR orientations (convention-independent):
+    # orientation 1: u=x0-x1, v=p0+p1  (parametric-downconversion convention)
+    # orientation 2: u=x0+x1, v=p0-p1  (dissipative Woolley-Clerk convention)
+    sum1 = (sigma[0,0] + sigma[2,2] - 2*sigma[0,2]
+            + sigma[1,1] + sigma[3,3] + 2*sigma[1,3])
+    sum2 = (sigma[0,0] + sigma[2,2] + 2*sigma[0,2]
+            + sigma[1,1] + sigma[3,3] - 2*sigma[1,3])
+    return bool(sum1 < 1.0 or sum2 < 1.0)
 
 # ───────────────────────────────────────────────────────────────────────────
 # duan_criterion(sigma) → bool

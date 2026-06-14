@@ -372,3 +372,24 @@ def log_negativity(sigma: np.ndarray) -> float:
     nu_min = float(np.min(nus))
     return float(max(0., -np.log2(2 * nu_min)))
 
+
+# ───────────────────────────────────────────────────────────────────────────
+# purity(sigma) → float
+# ───────────────────────────────────────────────────────────────────────────
+# Purity of a Gaussian state from its covariance matrix.
+#
+# Formula:  μ = 1 / sqrt(det(2σ))
+#
+# Pure state:  μ = 1  (all symplectic eigenvalues = ½, det(2σ) = 1)
+# Mixed state: μ < 1
+#
+# When sigma is a REDUCED covariance matrix (signal modes only, cavity traced
+# out), this gives the purity of the engineered signal state — which is the
+# physically relevant quantity. Mixedness comes from two sources:
+#   (1) thermal bath noise (γ, n_th)
+#   (2) residual entanglement with the cavity at finite cooperativity
+# As C → ∞ (resolved sideband, κ >> g >> γ), μ → 1 for both Kronwald and EPR.
+
+def purity(sigma: np.ndarray) -> float:
+    return float(1.0 / np.sqrt(np.linalg.det(2 * sigma)))
+

@@ -78,7 +78,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import numpy as np
 
-from reservoir_engineering.targets import two_mode_squeezed, duan_criterion, log_negativity
+from reservoir_engineering.targets import two_mode_squeezed, duan_criterion, log_negativity, purity
 from reservoir_engineering.covariance_optimizer import CovarianceOptimizer
 from reservoir_engineering.constraints import Constraint_stability
 from reservoir_engineering.topology_search import NO_COUPLING
@@ -195,6 +195,13 @@ def run_epr_test(r=0.1, num_tests=40, verbosity=False):
                 f'  log_neg ≥ ½·theory  (got {ln:.4f}, theory {ln_theory:.4f})',
                 ln >= 0.5 * ln_theory)
             print(f'     r_achieved = {r_achieved:.4f}  (target r={r})')
+
+            mu_target   = purity(sigma_target)
+            mu_achieved = purity(sigma_achieved)
+            print(f'     Purity:')
+            print(f'       target   μ = {mu_target:.6f}  (ideal: 1.0)')
+            print(f'       achieved μ = {mu_achieved:.6f}  (gap = finite-C + bath mixing)')
+            t_ok &= check(f'  achieved purity > 0.5  (got {mu_achieved:.4f})', mu_achieved > 0.5)
 
             realistic = max_coop < 1e7
             print(f'     {"[realistic]" if realistic else "[unphysical: extreme cooperativity]"}')

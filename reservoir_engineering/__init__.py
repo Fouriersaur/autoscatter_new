@@ -216,6 +216,7 @@ from reservoir_engineering.targets import (
     squeezing_db,               # squeezing in decibels
     log_negativity,             # entanglement measure
     duan_criterion,             # inseparability criterion
+    purity,                     # 1/sqrt(det(2σ)) — Gaussian state purity
 )
 
 # ── Benchmarks ────────────────────────────────────────────────────────────
@@ -270,7 +271,7 @@ __all__ = [
     # targets
     'squeezed_vacuum', 'two_mode_squeezed', 'vacuum', 'thermal',
     'cluster_state', 'is_physical', 'symplectic_eigenvalues',
-    'squeezing_db', 'log_negativity', 'duan_criterion',
+    'squeezing_db', 'log_negativity', 'duan_criterion', 'purity',
     # benchmarks
     'ALL_BENCHMARKS', 'get_benchmark', 'make_benchmark_optimizer',
     'run_benchmark', 'run_all_benchmarks', 'print_benchmark_summary',

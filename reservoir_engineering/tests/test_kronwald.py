@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import numpy as np
 
-from reservoir_engineering.targets import squeezed_vacuum
+from reservoir_engineering.targets import squeezed_vacuum, purity
 from reservoir_engineering.covariance_optimizer import CovarianceOptimizer, LAMBDA_SCALE_DEFAULT
 from reservoir_engineering.constraints import Constraint_stability
 from reservoir_engineering.topology_search import BEAMSPLITTER_AND_TWO_MODE_SQUEEZING
@@ -116,6 +116,14 @@ def run_kronwald_test(r=1.0, num_tests=10, verbosity=False):
                           s_pp > 0.5)
         all_pass &= check('sigma_xx * sigma_pp >= 0.25  (uncertainty principle)',
                           s_xx * s_pp >= 0.25 - 1e-6)
+
+        mu_target   = purity(sigma_tgt)
+        mu_achieved = purity(sigma_achieved)
+        print(f'\n  Purity:')
+        print(f'    target   μ = {mu_target:.6f}  (ideal: 1.0)')
+        print(f'    achieved μ = {mu_achieved:.6f}  (gap from 1 = finite-C correction)')
+        all_pass &= check(f'achieved purity > 0.9  (got {mu_achieved:.4f})',
+                          mu_achieved > 0.9)
 
         # --- Kronwald coupling ratio check ---
         # Kronwald predicts: nu/g = tanh(r), so C_nu/C_g = tanh(r)^2

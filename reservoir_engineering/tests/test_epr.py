@@ -245,4 +245,4 @@ def run_epr_test(r=0.1, num_tests=40, verbosity=False):
 
 
 if __name__ == '__main__':
-    run_epr_test(r=0.1, num_tests=40)
+    run_epr_test(r=0.5, num_tests=40)

@@ -96,6 +96,7 @@ def run_kronwald_test(r=1.0, num_tests=10, verbosity=False):
         sigma_tgt      = sigma_target
 
         loss = info['final_cost']
+        print(f'\n  Loss: {loss:.2e}  (threshold 2e-5)')
         all_pass &= check(f'Stage 3 loss < 2e-5  (loss={loss:.2e})',
                           loss < 2e-5)
 
@@ -159,3 +160,94 @@ def run_kronwald_test(r=1.0, num_tests=10, verbosity=False):
 
 if __name__ == '__main__':
     run_kronwald_test(r=1.0, num_tests=10)
+
+    # ── Quadrature variance vs r ──────────────────────────────────────────
+    import matplotlib.pyplot as plt
+
+    r_values = np.concatenate([
+        np.linspace(0.1, 1.0, 10),
+        np.linspace(1.0, 1.25, 10)[1:],   # denser near ceiling; skip duplicate 1.0
+    ])
+
+    xx_target, pp_target = [], []
+    xx_achieved, pp_achieved, r_achieved = [], [], []
+
+    for r in r_values:
+        sigma_tgt = squeezed_vacuum(r)
+        xx_target.append(float(sigma_tgt[0, 0]))
+        pp_target.append(float(sigma_tgt[1, 1]))
+
+        opt = CovarianceOptimizer(
+            sigma_target         = sigma_tgt,
+            target_mode_ids      = [1],
+            node_types           = ['cavity', 'mechanical'],
+            num_auxiliary_modes  = 1,
+            enforced_constraints = [Constraint_stability(penalty_strength=50.0)],
+            kwargs_optimization  = dict(
+                num_tests               = 10,
+                interrupt_if_successful = True,
+                max_violation_success   = 2e-5,
+            ),
+            solver_options       = dict(maxiter=2000, ftol=0, gtol=1e-12),
+            make_initial_test    = False,
+        )
+        opt.perform_breadth_first_search()
+
+        if opt.best_info_list:
+            s = opt.best_info_list[0]['sigma_achieved']
+            xx_achieved.append(float(s[0, 0]))
+            pp_achieved.append(float(s[1, 1]))
+            r_achieved.append(r)
+
+    ZPF = 0.5   # vacuum variance per quadrature in this convention
+    ratio_all      = np.tanh(r_values)
+    ratio_achieved = np.tanh(np.array(r_achieved))
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    (ax_xx_r, ax_pp_r), (ax_xx_ratio, ax_pp_ratio) = axes
+
+    # ── σ_xx vs r ────────────────────────────────────────────────────────
+    ax_xx_r.axhline(1.0, color='gray', linestyle=':', linewidth=1, label='vacuum')
+    ax_xx_r.plot(r_values,   [v / ZPF for v in xx_target],   'b--', linewidth=1.5, label='target')
+    ax_xx_r.plot(r_achieved, [v / ZPF for v in xx_achieved], 'bo-', markersize=5,  label='achieved')
+    ax_xx_r.set_xlabel('Squeezing parameter $r$')
+    ax_xx_r.set_ylabel(r'$\sigma_{xx}\ /\ \sigma_\mathrm{ZPF}$')
+    ax_xx_r.set_title(r'$\sigma_{xx}$ vs $r$')
+    ax_xx_r.legend()
+    ax_xx_r.grid(True, alpha=0.3)
+
+    # ── σ_pp vs r ────────────────────────────────────────────────────────
+    ax_pp_r.axhline(1.0, color='gray', linestyle=':', linewidth=1, label='vacuum')
+    ax_pp_r.plot(r_values,   [v / ZPF for v in pp_target],   'r--', linewidth=1.5, label='target')
+    ax_pp_r.plot(r_achieved, [v / ZPF for v in pp_achieved], 'ro-', markersize=5,  label='achieved')
+    ax_pp_r.set_xlabel('Squeezing parameter $r$')
+    ax_pp_r.set_ylabel(r'$\sigma_{pp}\ /\ \sigma_\mathrm{ZPF}$')
+    ax_pp_r.set_title(r'$\sigma_{pp}$ vs $r$')
+    ax_pp_r.legend()
+    ax_pp_r.grid(True, alpha=0.3)
+
+    # ── σ_xx vs ν/g ──────────────────────────────────────────────────────
+    ax_xx_ratio.axhline(1.0, color='gray', linestyle=':', linewidth=1, label='vacuum')
+    ax_xx_ratio.plot(ratio_all,      [v / ZPF for v in xx_target],   'b--', linewidth=1.5, label='target')
+    ax_xx_ratio.plot(ratio_achieved, [v / ZPF for v in xx_achieved], 'bo-', markersize=5,  label='achieved')
+    ax_xx_ratio.set_xlabel(r'Driving ratio $\nu/g$')
+    ax_xx_ratio.set_ylabel(r'$\sigma_{xx}\ /\ \sigma_\mathrm{ZPF}$')
+    ax_xx_ratio.set_title(r'$\sigma_{xx}$ vs $\nu/g$')
+    ax_xx_ratio.legend()
+    ax_xx_ratio.grid(True, alpha=0.3)
+
+    # ── σ_pp vs ν/g ──────────────────────────────────────────────────────
+    ax_pp_ratio.axhline(1.0, color='gray', linestyle=':', linewidth=1, label='vacuum')
+    ax_pp_ratio.plot(ratio_all,      [v / ZPF for v in pp_target],   'r--', linewidth=1.5, label='target')
+    ax_pp_ratio.plot(ratio_achieved, [v / ZPF for v in pp_achieved], 'ro-', markersize=5,  label='achieved')
+    ax_pp_ratio.set_xlabel(r'Driving ratio $\nu/g$')
+    ax_pp_ratio.set_ylabel(r'$\sigma_{pp}\ /\ \sigma_\mathrm{ZPF}$')
+    ax_pp_ratio.set_title(r'$\sigma_{pp}$ vs $\nu/g$')
+    ax_pp_ratio.legend()
+    ax_pp_ratio.grid(True, alpha=0.3)
+
+    fig.suptitle('Kronwald: quadrature variances (r = 0.1–1.25)', fontsize=13)
+    fig.tight_layout()
+    plt.savefig('kronwald_variances.png', dpi=150)
+    print('\nSaved kronwald_variances.png')
+    plt.show()

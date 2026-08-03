@@ -2,196 +2,56 @@
 covariance_optimizer.py
 =======================
 Main optimiser class for covariance-matrix targeting.
+MIRRORS: autoscatter/architecture_optimizer.py
 
-MIRRORS: autoscatter/architecture_optimizer.py  (1-to-1 conceptual mapping)
+CovarianceOptimizer has two responsibilities, exactly like Architecture_Optimizer:
+  1. INNER LOOP — parameter optimisation for a fixed topology (which edges
+     are absent / what type): find coupling strengths minimising the
+     covariance loss. optimize_given_conditions, repeated_optimization.
+  2. OUTER LOOP — topology discovery via breadth-first search: enumerate
+     topologies by complexity, test each with the inner loop, prune via
+     subgraph rules. prepare_all_possible_combinations,
+     find_valid_combinations, identify_potential_combinations,
+     cleanup_valid_combinations, perform_breadth_first_search.
 
-═══════════════════════════════════════════════════════════════════════════════
-ROLE IN THE PIPELINE
-═══════════════════════════════════════════════════════════════════════════════
+Differences from AutoScatter: no sympy (A built directly in JAX from edge
+dicts); couplings are real, not complex (real quadrature basis, no phase
+variable); no gauge freedom (sigma is gauge-invariant); stability isn't
+automatic (TMS edges can destabilise A, handled via Constraint_stability);
+D is fixed (depends only on node types/kappa/gamma/n_th, not couplings).
 
-This file contains CovarianceOptimizer, the central class of the package.
-It mirrors Architecture_Optimizer in AutoScatter essentially one-to-one:
+Coupling parametrisation — §1.5's literal (G-tilde, C-tilde): every
+coherent edge k gets a free log-ratio u_k with g_k = kappa0*exp(u_k)
+(kappa0 = a single fixed reference rate, default 1.0); every AUXILIARY
+node (every mode not in target_mode_ids) gets a free log-rate v_m with
+decay_m = kappa0*exp(v_m). Signal-mode decay rates stay fixed inputs (may
+be exactly 0 — the idealized §1.6 limit; nothing here divides by them, so
+gamma=0 and gamma!=0 both just work — see
+covariance_physics.build_drift_diffusion_from_GC_tilde). No lambda, no
+per-edge decay_i*decay_j reconstruction, no reference-edge pinning (kappa0
+already fixes the overall-scale gauge — see that function's docstring).
 
-    AutoScatter                          Reservoir Engineering
-    ─────────────────────────────────    ─────────────────────────────────
-    Architecture_Optimizer               CovarianceOptimizer
-    S_target (sympy Matrix)          →   sigma_target (numpy array, 2M×2M)
-    mode_types (list of bool)        →   node_types (list of 'cavity'|'mechanical')
-    num_auxiliary_modes (int)        →   num_auxiliary_modes (int)
-    gabs, gphases, Deltas (complex)  →   C̃_k (ratios), Δ_i (detunings) — real
-    gauge phases (complex)           →   (none — σ is gauge-invariant)
-    coupling_matrix H (complex N×N)  →   H_quad (real 2N×2N) — EXPLICIT Hamiltonian matrix
-                                         (analogue of H: detuning + coupling blocks, no decay)
-    decay separate: -κ/2 in S-matrix →   A_decay separate: -decay/2·I₂ diagonal blocks
-    A = -iH - κ/2  (combined)        →   A = H_quad + A_decay  (combined drift matrix)
-    kappa_int_matrix                 →   (absorbed in D via γ, n_th)
-    S = I + (-iH - κ/2)⁻¹           →   Aσ + σAᵀ + D = 0
-    Frobenius loss on S              →   Frobenius loss on σ_sub
-    C_{i,j} = 4|g_{i,j}|²          →   C_{i,j} = 4g_{i,j}²/(κ_i·κ_j)
+Two-stage algorithm run per candidate topology in the BFS outer loop:
+  Stage 1 (check_stability_unit_cooperativity) — fast filter, no gradient:
+      build A at unit cooperativity (g_ij = sqrt(decay_i*decay_j/4), a
+      fixed reference coupling used ONLY for this cheap pre-filter, not
+      tied to how Stage 2 later parametrises the real search), check
+      Hurwitz. Failures are NOT added to invalid_combinations, since a
+      supergraph can add stabilising edges (e.g. TMS-only is marginally
+      unstable, but BS+TMS/Kronwald is stable) — this is a speed filter
+      only, not a structural impossibility proof.
+  Stage 2 (optimize_given_conditions) — the real test: optimise the
+      coherent log-ratios u_k and auxiliary log-rates v_m (+ optionally
+      detunings Delta_i) against the target loss (§3, target term + soft
+      constraints + optional purity/regulariser terms). Success if loss <
+      max_violation_success.
 
-The class has TWO responsibilities (exactly as in AutoScatter):
-  1. INNER LOOP — parameter optimisation for a fixed topology.
-     Given a condition list (which edges are absent / what type),
-     find coupling_strengths that minimise the covariance loss.
-     Methods: optimize_given_conditions, repeated_optimization.
-
-  2. OUTER LOOP — topology discovery via breadth-first search.
-     Enumerate all possible topologies (by complexity level),
-     test each with the inner loop, prune using subgraph rules.
-     Methods: prepare_all_possible_combinations, find_valid_combinations,
-              identify_potential_combinations, cleanup_valid_combinations,
-              perform_breadth_first_search.
-
-═══════════════════════════════════════════════════════════════════════════════
-KEY SIMPLIFICATIONS VS AUTOSCATTER
-═══════════════════════════════════════════════════════════════════════════════
-
-1. NO SYMPY — AutoScatter builds a symbolic H matrix (sympy) and lambdifies
-   it to JAX. Here, A is built directly in JAX from edge dicts. No sympy needed.
-   Simpler, but loses the ability to have free symbols in sigma_target.
-
-2. REAL COUPLING STRENGTHS — In AutoScatter, couplings are complex (gabs + gphase).
-   In the real quadrature basis, A is real, so all couplings are real numbers.
-   Fewer optimisation variables: one scalar per edge instead of two (no phase).
-
-3. NO GAUGE FREEDOM — AutoScatter optimises over detector-position phases γ.
-   Covariance matrices are gauge-invariant: σ doesn't depend on the reference phase.
-   No gauge phases needed.
-
-4. STABILITY ENFORCEMENT — AutoScatter doesn't need this (passive systems are
-   always stable). Here, TMS edges can destabilise A. Handled via a penalty
-   term (Constraint_stability) added to the loss, or via log-reparametrisation.
-
-5. DIFFUSION MATRIX D IS FIXED — D depends only on node types and physical
-   parameters (κ, γ, n_th), NOT on coupling strengths. Precomputed once.
-   In AutoScatter, the kappa_int_matrix can optionally be optimised over
-   (port_intrinsic_losses). Here, decay rates are fixed inputs.
-
-═══════════════════════════════════════════════════════════════════════════════
-COOPERATIVITY  (mirrors extract_cooperativities in Architecture_Optimizer)
-═══════════════════════════════════════════════════════════════════════════════
-
-In AutoScatter:   C_{i,j} = 4 |g_{i,j}|²   (with κ_ext = 1 normalised away)
-Here:             C_{i,j} = 4 g_{i,j}² / (κ_i · κ_j)
-
-where κ_i, κ_j are the decay rates of modes i and j.
-For a cavity-mechanical pair: C = 4g² / (κ · γ) — the optomechanical cooperativity.
-
-Physical meaning: C > 1 means strong coupling (interaction faster than decay).
-Kronwald condition: g > ν > 0 with C_g - C_ν > some threshold for stability.
-
-The cooperativity dict is returned alongside the solution dict in the
-result of optimize_given_conditions, exactly as in AutoScatter.
-
-═══════════════════════════════════════════════════════════════════════════════
-TWO-STAGE ALGORITHM  (prototype — Stage 2 scaling discovery commented out)
-═══════════════════════════════════════════════════════════════════════════════
-
-PROTOTYPE SIMPLIFICATION:
-    Stage 2 (convergence test / scaling discovery) is currently disabled.
-    All cooperativity ratios C̃_k are assumed equal at initialisation (u_k=0).
-    Stage 3 optimises from this flat starting point directly.
-    Stage 2 should be re-enabled once the prototype recovers the Kronwald scheme.
-
-For every candidate topology produced by the BFS outer loop, the algorithm
-runs two internal stages before accepting or rejecting that topology.
-
-STAGE 1 — Stability check at unit cooperativity  (fast discrete filter)
-    Build A from H with all cooperativities C_{ij} = 1.
-    "Unit cooperativity" means each Hamiltonian coupling g_{ij} is set to
-    the geometric-mean threshold: g_{ij} = sqrt(decay_i × decay_j / 4).
-    A is assembled via the H → A map (build_drift_matrix): one block per
-    Hamiltonian term.  Then check whether all eigenvalues of A have strictly
-    negative real part.
-    If unstable → SKIP this topology (do not proceed to Stage 2 or 3).
-    No gradient computation, no Lyapunov solve — just an eigenvalue check.
-    Method: check_stability_unit_cooperativity(triu_array) → bool
-
-    CRITICAL — Stage 1 failures do NOT go into self.invalid_combinations.
-    Reason: a topology that is unstable at unit cooperativity may become
-    stable at a different coupling ratio. Adding MORE edges (a supergraph)
-    can add stabilising BS couplings that fix the instability.
-    Example: TMS-only is marginally unstable at C=1, but BS+TMS (Kronwald)
-    is stable. If TMS-only were added to invalid_combinations, its superset
-    BS+TMS would be pruned and never found.
-    Stage 1 is a SPEED FILTER only — it avoids expensive Stage 2/3 computation
-    for topologies that cannot even be stable at unit cooperativity, but it
-    does not make any claim about whether their supersets are valid.
-
-# ── STAGE 2 DISABLED (prototype) ─────────────────────────────────────────────
-# STAGE 2 — Convergence test  (short optimisation at multiple scales)
-#     For λ in [10, 100, 1000]:
-#         Run a SHORT optimisation (~30 steps of L-BFGS-B) over log_ratios u_k:
-#             u_k* = argmin_{u_k} loss(λ, u_k)
-#             where C̃_k = exp(u_k),  g_k = sqrt(λ · C̃_k · decay_i · decay_j / 4)
-#         Record L*(λ) = loss at the short optimum.
-#     Accept topology if:
-#         L*(10) > L*(100) > L*(1000)   (loss strictly decreasing — converging)
-#         AND L*(1000) < CONVERGENCE_LOSS_THRESHOLD
-#     If accepted: warm-start Stage 3 from u_k* found at λ=1000.
-#     If rejected: add to self.invalid_combinations.
-#         Stage 2 failures CAN prune supersets — structural incompatibility
-#         with σ_target is not fixed by adding more edges.
-#     Method: check_convergence(triu_array) → (u_warm, success)
-#
-#     Key design choice: tests convergence at the OPTIMAL ratio for each λ,
-#     not an arbitrary placeholder (e.g. C̃_k=1 would give wrong ratios and
-#     incorrectly reject valid topologies like Kronwald).
-# ─────────────────────────────────────────────────────────────────────────────
-
-STAGE 2 (prototype) — Optimise log coupling ratios {u_k} AND detunings {Δ_i}
-    Fix λ = LAMBDA_SCALE_DEFAULT = 1000.
-    Free variables — TWO GROUPS (mirrors AutoScatter's gabs + Deltas):
-      Group 1 — LOG coupling ratios:  u_k = log(C̃_k) ∈ (−∞, +∞), one per active edge.
-          C̃_k = exp(u_k) > 0 automatically (no lower bound needed)
-          Cooperativity:   C_k = λ · exp(u_k)
-          Coupling:        g_k = sqrt(λ · exp(u_k) · decay_i · decay_j / 4)
-          Initial guess:   u_k = 0 for all k  (C̃_k = 1, all ratios equal — prototype)
-                           [future: warm-start from Stage 2 result u_k* at λ=1000]
-          Bounds:          none (log space handles positivity)
-      Group 2 — mode detunings:  Δ_i ∈ (−∞, +∞), one per mode i.
-          Enter A as:  A[s_i, s_i] += Δ_i · J₂   where J₂ = [[0,1],[-1,0]]
-          Initial guess: Δ_i = 0 (resonant driving start)
-          Bounds:        none (unbounded)
-    Loss: ½‖σ_system − σ_target‖²_F  (Frobenius on signal modes only)
-    Gradient flows: loss → σ_sub → Lyapunov solve → A → g_k → exp(u_k)
-    Optimiser: L-BFGS-B + JAX autodiff (same as AutoScatter).
-    Multiple random restarts for Group 1; Group 2 always starts at 0.
-    Method: optimize_given_conditions(conditions, lambda_scale) → (success, info_out)
-
-    Why log parametrisation?
-      exp(u_k) > 0 automatically — no bounds needed.
-      Gradient steps are multiplicative: Δu_k=0.1 → 10% change at any scale.
-      Runaway prevented naturally: instability increases loss before exp(u_k) → ∞.
-
-    Why include detunings?
-      AutoScatter optimises over Δ_i explicitly (they are in all_variables_list).
-      Here, Δ_i are needed whenever:
-        (a) The target covariance has a squeezed quadrature at a non-zero angle
-            (Δ_i rotates the squeezing direction in phase space).
-        (b) Multiple mechanical modes have different frequencies (only one can be in
-            its own rotating frame; the others need residual detuning Δ ≠ 0).
-        (c) Off-resonance driving improves stability or squeezing magnitude.
-      For Kronwald / Wang-Clerk: Stage 2 optimizer converges to Δ_i ≈ 0
-      (confirming the resonant condition). This is a non-trivial output.
-
-    Stage 1 uses Δ_i = 0 for all modes (resonant stability check).
-
-OUTPUT per successful topology:
-    topology:        graph (nodes, edges, edge types)
-    log_ratios:      {u_k} per active edge      (Stage 2 Group 1 raw output)
-    coupling_ratios: {C̃_k = exp(u_k)} per edge (Stage 2 Group 1 interpreted)
-    detunings:       {Δ_i} per mode             (Stage 2 Group 2 output)
-    lambda_scale:    λ = 1000 (fixed)
-    physical_formula: g_k = sqrt(λ · exp(u_k) · decay_i · decay_j / 4)
-    cooperativities: C_k = λ · exp(u_k)          (the hardware requirement)
-
-INTERPRETATION:
-    All cooperativities are large (C_k = λ · C̃_k with λ=1000).
-    The RATIOS {C̃_k} determine which state is produced.
-    The absolute scale λ=1000 ensures the strong-coupling limit is reached.
-    If all Δ_i ≈ 0:  resonant driving suffices (Kronwald, Wang-Clerk cases).
-    If some Δ_i ≠ 0: off-resonance driving is required — a non-trivial prediction.
+Output per successful topology: G_tilde/C_tilde_aux (exp(u_k)/exp(v_m)),
+detunings, physical coupling strengths g_k=kappa0*exp(u_k), auxiliary decay
+rates, and a post-hoc 'cooperativities' dict (C_k=4*g_k^2/(decay_i*decay_j),
+computed from the achieved solution for reporting/rank_by_cost — not the
+search variable). All Delta_i ~ 0 means resonant driving suffices
+(Kronwald/Wang-Clerk); nonzero means off-resonance is required.
 """
 
 import jax
@@ -204,86 +64,56 @@ from typing import List, Optional
 
 jax.config.update("jax_enable_x64", True)
 
-# ── Gradient method constants  (mirrors architecture_optimizer.py) ─────────
 AUTODIFF_FORWARD  = 'autodiff_forward'
 AUTODIFF_REVERSE  = 'autodiff_reverse'
 DIFFERENCE_QUOTIENT = '2-point'
 
-# ── Default optimisation hyperparameters (mirrors architecture_optimizer.py) ─
 INIT_STRENGTH_RANGE_DEFAULT  = [0.01, 3.0]   # initial coupling strengths [g_lo, g_hi]
-BOUNDS_STRENGTH_DEFAULT      = [0., np.inf]   # lower bound = 0 (strengths are non-negative)
+BOUNDS_STRENGTH_DEFAULT      = [0., np.inf]   # strengths are non-negative
 
-# ── Stage 2 & 3 hyperparameters (no AutoScatter analogue) ─────────────────
-LAMBDA_SCALE_DEFAULT         = 1000.          # fixed large scale λ for optimisation
-INIT_LOG_RATIO_RANGE_DEFAULT = [-1.0, 1.0]   # initial u_k = log(C̃_k) draw range
-#                                              (corresponds to C̃_k ∈ [e^{-1}, e^1] ≈ [0.37, 2.72])
+INIT_LOG_RATIO_RANGE_DEFAULT = [-1.0, 1.0]    # initial u_k/v_m draw range (G~_k in [e^-1,e^1])
+DETUNING_BOUND_DEFAULT       = 20.0
 
-# ── Physical bounds for Stage 3 ────────────────────────────────────────────
-# Prevent optimizer from converging to unphysical saddle points at extreme
-# cooperativities or far-off-resonance detunings.
-# u_k = log(C̃_k); C_k = λ·C̃_k.  At λ=1000:
-#   u_max = log(C̃_max) = log(C_max/λ)
-#   C_max = 1e7 → u_max ≈ 9.2   (cooperativity up to 10 million)
-# Detuning bound: |Δ_i| ≤ DETUNING_BOUND in units of κ (cavity linewidth).
-#   Sideband resolution requires |Δ| ≲ few × κ; 20 is generous.
-LOG_RATIO_BOUND_DEFAULT = np.log(1e7 / LAMBDA_SCALE_DEFAULT)   # ≈ 9.21
-DETUNING_BOUND_DEFAULT  = 20.0
+# §1.5 (G-tilde, C-tilde) parametrisation: no lambda, no decay_i*decay_j
+# reconstruction — g_k=kappa0*exp(u_k) directly, works identically at
+# decay=0 or decay>0 (see covariance_physics.build_drift_diffusion_from_GC_tilde).
+# KAPPA_0_DEFAULT is just a unit choice (§1.5's reference rate);
+# DIRECT_LOG_BOUND_DEFAULT caps |u_k|,|v_m| so g_k/kappa0 stays in [1e-4,1e4].
+KAPPA_0_DEFAULT           = 1.0
+DIRECT_LOG_BOUND_DEFAULT  = np.log(1e4)   # ~9.21
 
-# ── Stage 2 scaling-discovery constants ────────────────────────────────────
-LAMBDA_VALUES_STAGE2       = [10., 100., 1000.]  # scales for convergence test
-STAGE2_SHORT_OPT_ITER      = 50                  # L-BFGS-B steps per scale
-CONVERGENCE_LOSS_THRESHOLD = 1e-3                # accept if L*(λ=1000) < this
+# §2.6(b) domain palette: squeezed-bath (Bogoliubov) dissipator on a cavity
+# aux node, in place of plain vacuum. Free vars (a_,b_) = Re/Im of
+# M=sinh(r)e^{i theta} (see covariance_physics.build_jump_matrix) — an
+# unconstrained 2D reparametrisation of (r,theta) with no periodic-phase
+# wraparound, and (a_,b_)=(0,0) exactly recovers plain vacuum, so declaring
+# a node squeezable OFFERS the resource without FORCING it: the optimizer
+# finds both whether and how much to squeeze. SQUEEZE_AB_BOUND_DEFAULT caps
+# |a_|,|b_| (i.e. |M|<=~50, r up to ~asinh(50)~4.6) for the same reason
+# DIRECT_LOG_BOUND_DEFAULT caps u_k/v_m: keep the search finite.
+SQUEEZE_AB_BOUND_DEFAULT  = 50.0
+
+# §2.6(b) domain palette: beamsplitter couplings are COMPLEX (carry a free
+# phase theta_k) by default — see covariance_physics.build_hamiltonian_matrix's
+# phase generalisation and Zippilli & Vitali PRL 126, 020402 (2021) eq.
+# S.27-S.29 (their Lemma: the passivity-preserving coupling phase is
+# generically nonzero, fixed by the squeezing phases of whatever's coupled
+# to that edge — forcing real, as this package used to do unconditionally,
+# is a restriction, not a baseline). Use constraints.Constraint_real_coupling
+# to opt a specific edge back into real-only. One period is enough range
+# (theta is genuinely periodic, unlike the log-space u_k/v_m).
+PHASE_BOUND_DEFAULT      = np.pi
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# STANDALONE FUNCTION: find_minimum_number_auxiliary_modes(...)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: find_minimum_number_auxiliary_modes(S_target, start_value, max_value,
-#          allow_squeezing, **kwargs_optimizer)
-#          in autoscatter/architecture_optimizer.py  (EXACT analogue)
-#
-# Purpose:
-#   Identify the MINIMUM number of auxiliary cavity modes required to realise
-#   the target covariance sigma_target, starting from zero auxiliaries.
-#
-# Parameters:
-#   sigma_target       : np.ndarray (2M, 2M) — target covariance for signal modes
-#   target_mode_ids    : list of int — which modes are signal modes (e.g. mechanical)
-#   node_types_signal  : list of str — types of the signal modes (e.g. ['mechanical'])
-#   start_value        : int — start search from this many auxiliaries (default 0)
-#   max_value          : int — stop search at this many auxiliaries (default 5)
-#   **kwargs_optimizer : passed to CovarianceOptimizer.__init__
-#
-# Algorithm:
-#   for num_aux in range(start_value, max_value+1):
-#       print('testing %i auxiliary modes' % num_aux)
-#       Build node_types = node_types_signal + ['cavity'] * num_aux
-#       Build optimizer = CovarianceOptimizer(sigma_target, target_mode_ids,
-#                                             node_types, num_auxiliary_modes=num_aux,
-#                                             make_initial_test=False, ...)
-#       success, _, _ = optimizer.repeated_optimization(conditions=[], ...)
-#       if success:
-#           print('minimum auxiliary modes: %i' % num_aux)
-#           return optimizer
-#   return None
-#
-# Returns:
-#   CovarianceOptimizer instance configured for the minimum found, or None.
-#
-# Example:
-#   # Discover how many cavities are needed to squeeze a mechanical mode
-#   optimizer = find_minimum_number_auxiliary_modes(
-#       sigma_target    = squeezed_vacuum(r=1.0),
-#       target_mode_ids = [0],
-#       node_types_signal = ['mechanical'],
-#       start_value=0, max_value=3,
-#   )
-#   # Should return an optimizer with 1 auxiliary cavity (Kronwald topology)
-
+# Find the minimum number of auxiliary cavity modes needed to satisfy the
+# target predicate, by trying num_aux = start_value, start_value+1, ... and
+# returning the first CovarianceOptimizer whose fully-connected graph
+# succeeds (make_initial_test=True raises if it can't). sigma_target may be
+# None if a target_predicate (§2.1) is passed instead via **kwargs_optimizer.
 def find_minimum_number_auxiliary_modes(
-    sigma_target,
-    target_mode_ids: List[int],
-    node_types_signal: List[str],
+    sigma_target=None,
+    target_mode_ids: List[int] = None,
+    node_types_signal: List[str] = None,
     start_value: int = 0,
     max_value: int = 5,
     **kwargs_optimizer,
@@ -307,82 +137,140 @@ def find_minimum_number_auxiliary_modes(
     return None
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: CovarianceOptimizer
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: Architecture_Optimizer in autoscatter/architecture_optimizer.py
-#
-# Central class of the package. Combines inner-loop parameter optimisation
-# and outer-loop topology search, exactly as Architecture_Optimizer does.
+# §2.5 cost metric: rank results by (num_auxiliary_modes, num_couplings,
+# num_active_couplings [drive-tone proxy], max_cooperativity) ascending —
+# smaller is "more minimal". results: list of dicts with keys
+# 'num_auxiliary_modes', 'triu_array', 'node_types', 'info' (best_info or None).
+def rank_by_cost(results: list) -> list:
+    from reservoir_engineering.topology_search import characterize_topology
 
+    def cost_key(r):
+        charac = characterize_topology(r['triu_array'], r['node_types'])
+        coops = (r['info'] or {}).get('cooperativities', {})
+        max_coop = max(coops.values()) if coops else 0.0
+        return (r['num_auxiliary_modes'], charac['num_couplings'],
+                charac['num_active_couplings'], max_coop)
+
+    return sorted(results, key=cost_key)
+
+
+# §5 "full algorithm" top-level driver:
+#   optional Approach-A ceiling (gaussian_states.optimise_state) for diagnostics
+#   for M in M_min..M_max: build a CovarianceOptimizer with M auxiliary
+#       modes, run perform_breadth_first_search, canonicalise the results by
+#       residual gauge symmetry (canonicalise_by_gauge)
+#   return results ranked by cost (rank_by_cost)
+#
+# approach_a_loss_fn: optional callable(sigma)->jax scalar, the target
+# predicate evaluated on a pure N_signal-mode covariance; if given, runs the
+# ceiling first purely as a diagnostic (doesn't currently seed Stage 2 —
+# wiring the ideal dark-state nullifiers into a warm start is a natural
+# follow-up). stop_at_first_M=True mirrors find_minimum_number_auxiliary_modes
+# (stop at the first M with any valid scheme); set False to keep searching
+# larger M for possibly-cheaper alternatives.
+def run_algorithm(
+    sigma_target=None,
+    target_mode_ids: List[int] = None,
+    node_types_signal: List[str] = None,
+    M_min: int = 0,
+    M_max: int = 5,
+    approach_a_loss_fn=None,
+    kwargs_optimizer: dict = None,
+    stop_at_first_M: bool = True,
+    verbosity: bool = True,
+) -> dict:
+    from reservoir_engineering.topology_search import canonicalise_by_gauge
+
+    kwargs_optimizer = kwargs_optimizer or {}
+
+    ceiling = None
+    if approach_a_loss_fn is not None:
+        from reservoir_engineering.gaussian_states import optimise_state
+        ceiling = optimise_state(len(target_mode_ids), approach_a_loss_fn)
+        if verbosity:
+            print(f'Approach-A ceiling: loss={ceiling["loss"]:.3e} '
+                  f'(ideal N={len(target_mode_ids)} dark-state dissipators found)')
+
+    all_results = []
+    for M in range(M_min, M_max + 1):
+        if verbosity:
+            print(f'=== run_algorithm: searching with {M} auxiliary modes ===')
+        node_types = list(node_types_signal) + ['cavity'] * M
+        try:
+            optimizer = CovarianceOptimizer(
+                sigma_target=sigma_target,
+                target_mode_ids=target_mode_ids,
+                node_types=node_types,
+                num_auxiliary_modes=M,
+                make_initial_test=True,
+                **kwargs_optimizer,
+            )
+        except Exception as exc:
+            if verbosity:
+                print(f'  M={M}: infeasible even fully-connected ({exc}); skipping')
+            continue
+
+        valid = optimizer.perform_breadth_first_search()
+        if len(valid) == 0:
+            continue
+
+        canon = canonicalise_by_gauge(list(valid), node_types, fixed_mode_ids=target_mode_ids)
+        for t in canon:
+            idx = next((k for k, v in enumerate(optimizer.valid_combinations)
+                        if np.array_equal(v, t)), None)
+            info = optimizer.best_info_list[idx] if idx is not None else None
+            all_results.append({
+                'num_auxiliary_modes': M,
+                'triu_array': t,
+                'node_types': node_types,
+                'info': info,
+                'optimizer': optimizer,
+            })
+
+        if stop_at_first_M:
+            break
+
+    return {'ceiling': ceiling, 'results': rank_by_cost(all_results)}
+
+
+# Central class: combines inner-loop parameter optimisation and outer-loop
+# topology search. MIRRORS: Architecture_Optimizer.
 class CovarianceOptimizer:
 
-    # -----------------------------------------------------------------------
-    # __init__(sigma_target, target_mode_ids, node_types,
-    #          num_auxiliary_modes=0,
-    #          gradient_method=AUTODIFF_REVERSE,
-    #          kwargs_optimization={},
-    #          solver_options={},
-    #          enforced_constraints=[],
-    #          make_initial_test=True)
-    # -----------------------------------------------------------------------
-    # MIRRORS: Architecture_Optimizer.__init__(S_target, num_auxiliary_modes,
-    #          num_far_detuned_modes, mode_types, gradient_method,
-    #          kwargs_optimization, solver_options, enforced_constraints,
-    #          make_initial_test, ...)
+    # sigma_target: (2M,2M) target covariance for target_mode_ids (the
+    # convenience case of §2.1's target predicate: matching every entry of
+    # the target block at once). target_predicate: §2.1's general form —
+    # a list of TargetTerm(fn, q, weight, modes) entries, each a scalar
+    # quantity Q_i(sigma) matched to a target value q_i (e.g.
+    # targets.target_log_negativity, target_purity, target_quadratic_form).
+    # At least one of sigma_target/target_predicate must be given; both may
+    # be given together (their residuals simply add in the §3 loss).
+    # node_types: length N list of 'cavity'|'mechanical' (signal + auxiliary
+    # modes). enforced_constraints: Base_Constraint objects added to the
+    # loss for every topology (Constraint_stability should always be
+    # included). lambda_pure/lambda_reg/normalize_targets: optional §3 loss
+    # terms (all off by default). make_initial_test: if True, verify the
+    # fully-connected graph can satisfy the target predicate at all (raises
+    # if not) before anything else.
     #
-    # Parameters:
-    #   sigma_target       : np.ndarray (2M, 2M) — target covariance for signal modes.
-    #                        Mirrors S_target (sympy Matrix) in AutoScatter, but
-    #                        purely numerical (no free symbols).
-    #   target_mode_ids    : list of int — which modes to compare to sigma_target.
-    #                        E.g. [1] means compare mode 1 to sigma_target.
-    #                        Mirrors num_port_modes (AutoScatter knows S is for port modes).
-    #   node_types         : list of str, length N — 'cavity' or 'mechanical'.
-    #                        Mirrors mode_types (list of bool) in AutoScatter.
-    #                        Length = num_signal_modes + num_auxiliary_modes.
-    #   num_auxiliary_modes: int — how many nodes in node_types are auxiliary.
-    #                        Mirrors num_auxiliary_modes in AutoScatter.
-    #   gradient_method    : AUTODIFF_FORWARD | AUTODIFF_REVERSE | DIFFERENCE_QUOTIENT
-    #                        Same as AutoScatter.
-    #   kwargs_optimization: dict — mirrors Architecture_Optimizer.kwargs_optimization:
-    #                          num_tests              (default 10) ← AutoScatter default
-    #                          verbosity              (default 0)
-    #                          init_strength_range    (default [0.01, 3.0])
-    #                          max_violation_success  (default 1e-8)
-    #                          interrupt_if_successful (default True)
-    #   solver_options     : dict — passed to scipy.optimize.minimize:
-    #                          maxiter  (default 2000 for L-BFGS-B)
-    #                          ftol, gtol (default 0, 1e-12)
-    #   enforced_constraints: list of Base_Constraint objects —
-    #                        Added to the loss function for all topologies.
-    #                        Constraint_stability() should always be included.
-    #                        Mirrors enforced_constraints in AutoScatter (e.g.
-    #                        MinimalAddedInputNoise for quantum-limited amplifiers).
-    #   make_initial_test  : bool — if True, test the fully-connected graph immediately.
-    #                        Raise Exception if even the dense graph fails.
-    #                        Mirrors make_initial_test in AutoScatter exactly.
-    #
-    # Internally sets up:
-    #   self.nodes, self.edges  ← default node/edge dicts from node_types
-    #   self.D                  ← precomputed diffusion matrix (constant, from nodes)
-    #   self.num_modes          ← len(node_types)
-    #   self.num_signal_modes   ← len(target_mode_ids)
-    #   self.num_auxiliary_modes← num_auxiliary_modes
-    #   self.all_possible_edges ← list of all edge slots (i,j) with j>=i
-    #   self.conditions_func    ← JIT-compiled loss + gradient (like AutoScatter)
-    #   self.jacobian           ← JIT-compiled gradient function
-    #   self.valid_combinations    ← list of valid triu_arrays found (like AutoScatter)
-    #   self.invalid_combinations  ← list of invalid triu_arrays found
-    #   self.tested_complexities   ← list of complexity levels tested
-    #   self.num_tested_graphs     ← count per level
-    #   self.num_tested_invalid_graphs ← count per level
-
+    # kappa: fixed decay rate for cavity-type nodes (used as-is for signal
+    #   cavities; overwritten per-solve for auxiliary cavities — see
+    #   aux_node_ids below). gamma: same, for mechanical-type nodes; may be
+    #   exactly 0.0 (the idealized §1.6 limit — see module docstring).
+    # kappa0: §1.5 reference rate for the free log-ratios/log-rates.
+    # aux_node_ids (computed automatically) = every mode NOT in
+    #   target_mode_ids — only these get a free decay rate; signal-mode
+    #   decay rates stay at the fixed kappa/gamma given above.
+    # squeezable_aux_ids: §2.6(b) domain palette — human-declared subset of
+    #   the auxiliary CAVITY modes allowed a squeezed (Bogoliubov) bath
+    #   instead of plain vacuum (see module docstring / SQUEEZE_AB_BOUND_DEFAULT).
+    #   The optimizer decides whether/how much to squeeze each one; omit a
+    #   node here and it stays plain vacuum, no exceptions.
     def __init__(
         self,
-        sigma_target,
-        target_mode_ids: List[int],
-        node_types: List[str],
+        sigma_target=None,
+        target_mode_ids: List[int] = None,
+        node_types: List[str] = None,
         num_auxiliary_modes: int = 0,
         gradient_method: str = AUTODIFF_REVERSE,
         kwargs_optimization: dict = {},
@@ -390,31 +278,72 @@ class CovarianceOptimizer:
         enforced_constraints: list = [],
         make_initial_test: bool = True,
         kappa: float = 1.0,
-        gamma: float = 0.01,):
+        gamma: float = 0.01,
+        lambda_pure: float = 0.0,
+        lambda_reg: float = 0.0,
+        normalize_targets: bool = False,
+        target_predicate: list = None,
+        kappa0: float = KAPPA_0_DEFAULT,
+        squeezable_aux_ids: List[int] = None,):
 
-            
+
         from reservoir_engineering.covariance_physics import build_diffusion_matrix
 
-        self.sigma_target         = np.array(sigma_target) # 2M x 2M target covariance matrix
+        if sigma_target is None and not target_predicate:
+            raise ValueError(
+                "Must provide sigma_target and/or target_predicate (§2.1: at "
+                "least one target-predicate term is required).")
+
+        self.sigma_target         = None if sigma_target is None else np.array(sigma_target)
+        self.target_predicate     = list(target_predicate or [])   # §2.1: [(Q_i, q_i, weight, modes), ...]
         self.target_mode_ids      = list(target_mode_ids) # which modes are the squeezed modes ("Mechanical modes")
-        self.node_types           = list(node_types) 
+        self.node_types           = list(node_types)
         self.num_modes            = len(node_types)
         self.num_auxiliary_modes  = num_auxiliary_modes
         self.gradient_method      = gradient_method
+        self.kappa0                   = kappa0
+        # every mode NOT a signal/target mode is auxiliary — only these get
+        # a free decay rate (see class docstring above)
+        self.aux_node_ids             = [i for i in range(self.num_modes) if i not in self.target_mode_ids]
         self.enforced_constraints = list(enforced_constraints)
 
-        # Optimization hyperparameters
+        # §2.6(b) real-coupling palette: beamsplitter edges are complex
+        # (free phase) by default — this set records which specific edges
+        # the user has restricted back to real-only via
+        # Constraint_real_coupling, so no phase variable gets created for
+        # them (structural, not a soft penalty — see that class's docstring).
+        from reservoir_engineering.constraints import Constraint_real_coupling
+        self.real_coupling_edges = {tuple(c.idxs) + (c.edge_type[:3],)
+                                     for c in self.enforced_constraints
+                                     if isinstance(c, Constraint_real_coupling)}
+
+        # §2.6(b) squeezed-bath palette (see class docstring): must be a
+        # subset of aux_node_ids, and cavity type (squeezed-bath formula is
+        # only defined for the vacuum-based cavity row, not the thermal
+        # loss/gain rows).
+        self.squeezable_aux_ids = list(squeezable_aux_ids or [])
+        for nid in self.squeezable_aux_ids:
+            if nid not in self.aux_node_ids:
+                raise ValueError(f"squeezable_aux_ids: node {nid} is not an auxiliary mode "
+                                  f"(aux_node_ids={self.aux_node_ids})")
+            if self.node_types[nid] != 'cavity':
+                raise ValueError(f"squeezable_aux_ids: node {nid} is type "
+                                  f"'{self.node_types[nid]}', must be 'cavity'")
+
+        # §3 optional loss terms (off by default — see class docstring)
+        self.lambda_pure       = lambda_pure
+        self.lambda_reg        = lambda_reg
+        self.normalize_targets = normalize_targets
 
         self.kwargs_optimization = dict(num_tests=10, verbosity=0,
                                     max_violation_success=1e-8,
                                     interrupt_if_successful=True,
-                                    stage2_loss_threshold=None)
+                                    optimize_detunings=False)
         self.kwargs_optimization.update(kwargs_optimization)
 
         self.solver_options = dict(maxiter=2000, ftol=0, gtol=1e-12)
         self.solver_options.update(solver_options)
 
-        # Initilise the node dictionary
         self.nodes = []
         for i, t in enumerate(node_types):
             if t == 'cavity':
@@ -426,11 +355,10 @@ class CovarianceOptimizer:
 
         self.D = build_diffusion_matrix(self.nodes)
 
-        # All the upper-triangle edge slots 
         self.all_possible_edges = [(i, j)
                                for i in range(self.num_modes)
                                for j in range(i, self.num_modes)]
-        
+
         # BFS state
         self.valid_combinations         = []
         self.invalid_combinations       = []
@@ -439,458 +367,168 @@ class CovarianceOptimizer:
         self.num_tested_graphs          = []
         self.num_tested_invalid_graphs  = []
 
-        # initilise all constraints on all the modes
-
         self.__setup_all_constraints__()
 
-        # See if the fully-connected graph can achieve sigma_target
-        # if failed -> the subgraphs of the fully connected graph cannot either
-
+        # Fully-connected graph must satisfy the target predicate, or no subgraph can either.
         if make_initial_test:
             from reservoir_engineering.topology_search import TopologyGraph
             from reservoir_engineering.topology_search import translate_triu_to_conditions
 
             full_triu = TopologyGraph.fully_connected(node_types).triu_array
-
-            # Optimization
             conditions_full = translate_triu_to_conditions(full_triu, node_types)
             success, _, _ = self.repeated_optimization(
                 num_tests=self.kwargs_optimization['num_tests'],
                 conditions=conditions_full,
-                lambda_scale=LAMBDA_SCALE_DEFAULT,
                 max_violation_success=self.kwargs_optimization['max_violation_success'],
+                optimize_detunings=self.kwargs_optimization['optimize_detunings'],
             )
             if not success:
                 raise Exception(
-                    "Fully-connected graph failed to achieve sigma_target. "
+                    "Fully-connected graph failed to satisfy the target predicate. "
                     "Check that the target is physically reachable with these node types.")
-            
 
-    # -----------------------------------------------------------------------
-    # __setup_all_constraints__()
-    # -----------------------------------------------------------------------
-    # MIRRORS: __setup_all_constraints__ in Architecture_Optimizer
-    #
-    # Enumerate ALL possible architectural constraints for the N-mode system.
-    # Stored in self.all_possible_constraints as a flat list.
-    #
-    # For each upper-triangle pair (i, j):
-    #   Append Constraint_coupling_absent(i, j)
-    #   If i != j:
-    #       Append Constraint_coupling_beamsplitter(i, j)
-    #       (TMS is the default unconstrained edge type — absent means no edge)
-    # For each diagonal (i, i):
-    #   Append Constraint_coupling_absent(i, i)  ← no single-mode squeezing
-    #
-    # Used by check_all_constraints to discover which constraints are
-    # "accidentally" satisfied in a dense-graph solution.
 
+    # All possible architectural constraints for the N-mode system (every
+    # edge absent, every off-diagonal edge BS) — used by check_all_constraints
+    # to discover which are "accidentally" satisfied in a dense-graph solution.
     def __setup_all_constraints__(self):
-        
+
         from reservoir_engineering.constraints import (
             Constraint_coupling_absent, Constraint_coupling_beamsplitter)
-        
+
         self.all_possible_constraints = []
-        
+
         for i in range(self.num_modes):
             for j in range(i, self.num_modes):
-                # There is no self-coupling within a mode i,i
                 self.all_possible_constraints.append(Constraint_coupling_absent(i, j))
                 if i != j:
-                    # Initialising all the off-digonal interactions i,j to be BS 
                     self.all_possible_constraints.append(Constraint_coupling_beamsplitter(i, j))
-
-    # -----------------------------------------------------------------------
-    # __initialize_conditions_func__()
-    # -----------------------------------------------------------------------
-    # MIRRORS: __initialize_conditions_func__ in Architecture_Optimizer
-    #
-    # Build and JIT-compile the loss function and its gradient.
-    # This is called once in __init__ and reused for all topology tests.
-    #
-    # The loss function (mirroring calc_conditions in AutoScatter):
-    #
-    #   def calc_conditions(coupling_strengths_free, conditions):
-    #       # 1. Expand free params into full coupling_strengths array
-    #       #    (absent edges fixed to 0, free edges from the input)
-    #       full_cs = expand_to_full(coupling_strengths_free, conditions)
-    #
-    #       # 2. Build drift matrix A = H_quad + A_decay.
-    #       #    H_quad = build_hamiltonian_matrix(nodes, edges, full_cs)
-    #       #      — the EXPLICIT Hamiltonian matrix (analogue of AutoScatter's H)
-    #       #      — contains ONLY coherent terms (couplings + detunings):
-    #       #          BS  edge k:  H += g_k(a†b + h.c.)  →  H_quad block += g_k · I₂
-    #       #          TMS edge k:  H += g_k(a†b† + h.c.) →  H_quad block += ±g_k · σ_z
-    #       #          Detuning:    H += Δ_i a_i†a_i      →  H_quad diag += Δ_i · J₂
-    #       #    A_decay = diagonal -decay_i/2 · I₂ blocks (dissipation, NOT from H)
-    #       #    A = H_quad + A_decay   (mirrors AutoScatter: -iH + (-κ/2))
-    #       A = build_drift_matrix(self.nodes, self.edges, full_cs)
-    #
-    #       # 3. Solve Lyapunov for steady-state covariance
-    #       sigma = solve_lyapunov_kronecker(A, self.D)
-    #
-    #       # 4. Extract signal modes submatrix
-    #       sigma_sub = get_mode_covariance(sigma, self.target_mode_ids)
-    #
-    #       # 5. Frobenius loss (same form as AutoScatter's S-matrix Frobenius loss)
-    #       diff = sigma_sub - jnp.array(self.sigma_target)
-    #       frobenius_loss = jnp.sum(jnp.abs(diff)**2) / 2.
-    #
-    #       # 6. Add enforced constraint penalties (like MinimalAddedInputNoise)
-    #       penalty = sum(c(A, sigma) for c in self.enforced_constraints)
-    #
-    #       total_loss = frobenius_loss + penalty
-    #       return total_loss, {'A': A, 'sigma': sigma}
-    #
-    # Returns: self.conditions_func (JIT-compiled), sets self.jacobian.
-    # The jacobian is obtained via jax.jacrev or jax.jacfwd depending on
-    # gradient_method — same pattern as Architecture_Optimizer.
 
     def __initialize_conditions_func__(self):
         pass
 
-    # -----------------------------------------------------------------------
-    # check_stability_unit_cooperativity(triu_array) → bool
-    # -----------------------------------------------------------------------
-    # STAGE 1 of the main algorithm.  Fast discrete topology filter — no
-    # gradient computation, no Lyapunov solve.
+    # §2.1/§3 target-predicate residual: Σ_i w_i (Q_i(σ)/q_i - 1)² over
+    # self.target_predicate, each term evaluated on the sub-block given by
+    # its own `modes` (full sigma if modes is None). Combine with the
+    # optional sigma_target Frobenius term (below) to get the full §3
+    # equality-target contribution to L. sigma is the FULL system
+    # covariance (not sigma_sub) — each term picks its own modes.
     #
-    # Build the drift matrix A with ALL cooperativities C_{ij} = 1 for every
-    # active edge in the topology, then check that A is Hurwitz.
-    #
-    # "Unit cooperativity" means:
-    #   g_{ij} = sqrt( decay_i × decay_j / 4 )
-    #   where decay_i = kappa_i for cavity nodes, gamma_i for mechanical nodes.
-    #
-    # Parameters:
-    #   triu_array — 1D int array encoding the topology (see topology_search.py)
-    #
-    # Returns:
-    #   bool — True if A is Hurwitz (stable), False if any eigenvalue has Re ≥ 0
-    #
-    # Steps:
-    #   1. Convert triu_array to nodes, edges via TopologyGraph(...).to_nodes_edges_dicts().
-    #   2. For each active (non-zero) edge k between nodes i and j:
-    #        decay_i = self.nodes[i]['kappa'] if cavity, else self.nodes[i]['gamma']
-    #        decay_j = self.nodes[j]['kappa'] if cavity, else self.nodes[j]['gamma']
-    #        g_unit_k = np.sqrt(decay_i * decay_j / 4.)
-    #   3. Build unit_g_array = np.array([g_unit_0, ..., g_unit_{E-1}])
-    #   4. A = build_drift_matrix(nodes, edges, jnp.array(unit_g_array))
-    #   5. return check_stability(A)       ← from covariance_physics.py
-    #
-    # If this returns False:
-    #   Do NOT append to self.invalid_combinations.
-    #   Do NOT call find_scaling_exponents or optimize_given_conditions.
-    #   Just continue to the next topology (skip silently).
-    #
-    #   WHY NOT add to invalid_combinations?
-    #   Adding more edges (a supergraph) can STABILISE a previously unstable
-    #   topology. Example: TMS-only has a zero eigenvalue at unit cooperativity
-    #   (marginally unstable), but adding a BS edge (→ BS+TMS = Kronwald) makes
-    #   it stable. If TMS-only were added to invalid_combinations, the BFS prune
-    #   rule "skip supersets of invalid topologies" would skip BS+TMS entirely,
-    #   and the algorithm would NEVER find the Kronwald topology.
-    #   Stage 1 is a SPEED FILTER only, not a structural impossibility proof.
-    #
-    # No AutoScatter analogue (AutoScatter's passive cavities are always stable).
+    # q_i == 0 (e.g. targeting a zero correlation) can't be relative-error
+    # normalised — falls back to plain squared error in that case.
+    def _predicate_residual(self, sigma):
+        from reservoir_engineering.covariance_physics import get_mode_covariance
+        residual = 0.0
+        for term in self.target_predicate:
+            sub = sigma if term.modes is None else get_mode_covariance(sigma, term.modes)
+            val = term.fn(sub)
+            if abs(term.q) > 1e-12:
+                residual = residual + term.weight * (val / term.q - 1.) ** 2
+            else:
+                residual = residual + term.weight * val ** 2
+        return residual
 
+    # Full §3 equality-target term: optional sigma_target Frobenius match
+    # (on sigma_sub = target_mode_ids block) plus the target_predicate sum
+    # (each term on its own modes, from the full sigma). target_scale
+    # normalises the Frobenius term when self.normalize_targets is set.
+    def _target_residual(self, sigma, sigma_sub, sigma_target_jnp, target_scale=None):
+        residual = 0.0
+        if sigma_target_jnp is not None:
+            matrix_term = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
+            if target_scale is not None and target_scale > 0:
+                matrix_term = matrix_term / target_scale
+            residual = residual + matrix_term
+        residual = residual + self._predicate_residual(sigma)
+        return residual
 
-    # == To Check if Matrix A satisfies the stability condition under unit coopertivity == 
+    # Stage 1: fast discrete filter, no gradient. Build A at unit
+    # cooperativity (g_ij = sqrt(decay_i*decay_j/4) — a fixed reference
+    # coupling used ONLY for this cheap pre-filter, unrelated to how Stage 2
+    # parametrises the real search) and check Hurwitz. False does NOT go
+    # into invalid_combinations — a supergraph (e.g. BS+TMS/Kronwald) can be
+    # stable even when this topology (e.g. TMS-only) isn't; this is a speed
+    # filter, not a structural impossibility proof.
     def check_stability_unit_cooperativity(self, triu_array) -> bool:
         from reservoir_engineering.topology_search import TopologyGraph
         from reservoir_engineering.covariance_physics import build_drift_matrix, check_stability
 
         default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
         default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
-        
-        # Creates Nodes List: {'id': 0, 'type': 'cavity', 'kappa': 1.0}
-        # Creates Edges List: {'i': 0, 'j': 1, 'type': 'beamsplitter'}
+
         nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
             default_kappa=default_kappa, default_gamma=default_gamma,)
 
-        unit_gs = [] # Coupling strength given unit coopertivity
-
+        unit_gs = []
         for edge in edges:
-            # Obtain the two nodes for each edge
             ni, nj = nodes[edge["i"]], nodes[edge["j"]]
-
-            # Decay rates of the two modes with the edge connected
             di = ni.get('kappa', ni.get('gamma'))
             dj = nj.get('kappa', nj.get('gamma'))
-
             unit_gs.append(float(np.sqrt(di * dj / 4.)))
-        
+
         A = build_drift_matrix(nodes, edges, jnp.array(unit_gs))
-        
         return check_stability(A)
 
-    # -----------------------------------------------------------------------
-    # check_convergence(triu_array, lambda_values=None, short_iter=None,
-    #                   loss_threshold=None) → (u_warm, success)
-    # -----------------------------------------------------------------------
-    # STAGE 2 of the main algorithm.  Test whether this topology can approach
-    # σ_target as the coupling scale λ grows, using short optimisations at
-    # multiple scales rather than a fixed placeholder ratio.
-    #
-    # Parameters:
-    #   triu_array      — 1D int array encoding the topology
-    #   lambda_values   — list of 3 increasing floats, default LAMBDA_VALUES_STAGE2 = [10, 100, 1000]
-    #   short_iter      — int, L-BFGS-B iterations per scale, default STAGE2_SHORT_OPT_ITER = 30
-    #   loss_threshold  — float, accept if L*(λ_max) < threshold,
-    #                     default CONVERGENCE_LOSS_THRESHOLD = 1e-4
-    #
-    # Returns:
-    #   (u_warm, success):
-    #     u_warm   — jnp.ndarray (E,), log_ratios at λ_max after short optimisation
-    #                (warm-start for Stage 3, or None on failure)
-    #     success  — bool: True if loss is decreasing AND below threshold
-    #
-    # Algorithm:
-    #   losses = []
-    #   u_current = jnp.zeros(E)   ← initial log_ratios = 0 → C̃_k = 1
-    #   for λ in lambda_values:
-    #       u_opt = short_optimise(covariance_loss_from_ratios,
-    #                              init=u_current, lambda_scale=λ,
-    #                              max_iter=short_iter)
-    #       losses.append(covariance_loss_from_ratios(u_opt, ..., λ, ...))
-    #       u_current = u_opt          ← warm-start each scale from the previous
-    #
-    #   converging = losses[0] > losses[1] > losses[2]  AND losses[2] < loss_threshold
-    #   if converging: return (u_current, True)
-    #   else:          return (None, False)
-    #
-    # Why this works:
-    #   Tests convergence at the OPTIMAL ratio for each λ, not an arbitrary 1:1 ratio.
-    #   Correctly handles topologies where the convergent direction requires specific
-    #   coupling ratios — e.g. Kronwald needs ν < g, not ν = g.
-    #   With C̃_k=1 (old approach), Kronwald would have σ_pm diverging and be rejected.
-    #   With this approach, the short optimiser finds ν/g ≈ tanh(r) at each λ and
-    #   confirms the loss is decreasing.
-    #
-    # Cost:
-    #   3 × short_iter gradient steps = 90 gradient evaluations total.
-    #   Each gradient evaluation ≈ 1 Lyapunov solve + 1 backprop.
-    #   Comparable to the old β-grid search (which did 3^E × 3 forward solves)
-    #   but correct for all topologies including Kronwald.
-    #
-    # Called by: find_valid_combinations, AFTER Stage 1 (stability check) passes.
-    # If success=False: add triu_array to self.invalid_combinations, skip Stage 3.
-    # If success=True:  pass u_warm to optimize_given_conditions as warm start.
-    #
-    # No AutoScatter analogue — unique to Reservoir Engineering.
-
-    # ── PROTOTYPE: check_convergence is disabled ──────────────────────────────
-    # Stage 2 (automated scaling discovery) is not used in the prototype.
-    # find_valid_combinations skips directly from Stage 1 to optimize_given_conditions.
-    # Re-enable by uncommenting the body below and restoring the Stage 2 constants.
-    #
-    # def check_convergence(
-    #     self,
-    #     triu_array,
-    #     lambda_values=None,        # default: LAMBDA_VALUES_STAGE2 = [10, 100, 1000]
-    #     short_iter: int = None,    # default: STAGE2_SHORT_OPT_ITER = 30
-    #     loss_threshold: float = None,  # default: CONVERGENCE_LOSS_THRESHOLD = 1e-4
-    # ) -> tuple:
-    #     lambda_values  = lambda_values  or LAMBDA_VALUES_STAGE2
-    #     short_iter     = short_iter     or STAGE2_SHORT_OPT_ITER
-    #     loss_threshold = loss_threshold or CONVERGENCE_LOSS_THRESHOLD
-    #
-    #     nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts()
-    #     E = len(edges)
-    #     losses = []
-    #     u_current = jnp.zeros(E)
-    #
-    #     for lam in lambda_values:
-    #         def loss_fn(u):
-    #             return covariance_loss_from_ratios(
-    #                 u, nodes, edges, self.D, lam,
-    #                 jnp.array(self.sigma_target), self.target_mode_ids)
-    #         grad_fn = jax.jit(jax.grad(loss_fn))
-    #         result = sciopt.minimize(
-    #             fun=jax.jit(loss_fn), jac=grad_fn,
-    #             x0=np.array(u_current), method='L-BFGS-B',
-    #             options={'maxiter': short_iter})
-    #         u_current = jnp.array(result.x)
-    #         losses.append(float(loss_fn(u_current)))
-    #
-    #     converging = (losses[0] > losses[1] > losses[2]) and (losses[2] < loss_threshold)
-    #     if converging:
-    #         return (u_current, True)
-    #     else:
-    #         return (None, False)
-
-    def check_convergence(
-        self,
-        triu_array,
-        lambda_values=None,
-        short_iter: int = None,
-        loss_threshold: float = None,
-    ) -> tuple:
-        from reservoir_engineering.topology_search import TopologyGraph
-        from reservoir_engineering.covariance_physics import (
-            build_drift_matrix_from_ratios, solve_lyapunov_kronecker, get_mode_covariance)
-
-        lambda_values  = lambda_values  if lambda_values  is not None else LAMBDA_VALUES_STAGE2
-        short_iter     = short_iter     if short_iter     is not None else STAGE2_SHORT_OPT_ITER
-        loss_threshold = loss_threshold if loss_threshold is not None else CONVERGENCE_LOSS_THRESHOLD
-
-        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
-        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
-        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
-            default_kappa=default_kappa, default_gamma=default_gamma)
-
-        E = len(edges)
-        if E == 0:
-            return (None, False)
-
-        D = self.D
-        sigma_target_jnp = jnp.array(self.sigma_target)
-        target_mode_ids  = self.target_mode_ids
-        enforced_constraints = self.enforced_constraints
-
-        losses = []
-        # Decay-rate-normalized init: set each u_k so that ALL edges start with
-        # the same physical coupling strength g = sqrt(lambda * C̃ * d_i * d_j / 4).
-        # Without normalization, mech-mech edges (d_i*d_j = γ² = 1e-4) start
-        # with g ≈ 0.04, while cavity-mech edges (d_i*d_j = κγ = 0.01) start
-        # with g ≈ 1.8 — a 40× gap that makes mech-mech gradients vanish.
-        # Normalization formula: u_k = log(d_ref / (d_i * d_j)) ± 0.5 bias
-        # where d_ref = κ*γ (cavity-mech reference product).
-        d_cav  = next((n['kappa'] for n in nodes if n['type'] == 'cavity'), 1.0)
-        d_mech = next((n['gamma'] for n in nodes if n['type'] == 'mechanical'), 0.01)
-        d_ref  = d_cav * d_mech   # reference decay-rate product (cavity-mech)
-        u_init = []
-        for edge in edges:
-            ni, nj = nodes[edge['i']], nodes[edge['j']]
-            di = ni.get('kappa', ni.get('gamma'))
-            dj = nj.get('kappa', nj.get('gamma'))
-            u_base = float(np.log(d_ref / (di * dj)))  # equalize physical g across edge types
-            etype  = edge.get('type', '')[:3]
-            if etype == 'bea':    # beamsplitter: slight positive bias for stability
-                u_init.append(u_base + 0.5)
-            elif etype == 'two':  # two_mode_squeezing: slightly below BS to avoid instability
-                u_init.append(u_base - 0.5)
-            else:
-                u_init.append(u_base)
-        u_current = jnp.array(u_init)
-
-        from reservoir_engineering.constraints import Constraint_coupling_symmetric
-        _sym_c   = [c for c in enforced_constraints if isinstance(c, Constraint_coupling_symmetric)]
-        _other_c = [c for c in enforced_constraints if not isinstance(c, Constraint_coupling_symmetric)]
-
-        for lam in lambda_values:
-            def make_loss(lam_val):
-                def loss_fn(u):
-                    ratios = jnp.exp(u)
-                    A = build_drift_matrix_from_ratios(nodes, edges, ratios, lam_val)
-                    sigma = solve_lyapunov_kronecker(A, D)
-                    sigma_sub = get_mode_covariance(sigma, target_mode_ids)
-                    base = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
-                    penalty = sum(c(A, sigma) for c in _other_c)
-                    penalty += sum(c(u, edges) for c in _sym_c)
-                    return base + penalty
-                return loss_fn
-
-            loss_fn  = make_loss(lam)
-            loss_jit = jax.jit(loss_fn)
-            grad_jit = jax.jit(jax.grad(loss_fn))
-
-            u_bound = self.kwargs_optimization.get('log_ratio_bound', LOG_RATIO_BOUND_DEFAULT)
-            result = sciopt.minimize(
-                fun=lambda x: float(loss_jit(jnp.array(x, dtype=float))),
-                jac=lambda x: np.array(grad_jit(jnp.array(x, dtype=float)), dtype=float),
-                x0=np.array(u_current, dtype=float),
-                method='L-BFGS-B',
-                bounds=[(-u_bound, u_bound)] * E,
-                options={'maxiter': short_iter},
-            )
-            u_current = jnp.array(result.x, dtype=float)
-            losses.append(float(loss_jit(u_current)))
-
-        # Stage 2 never filters topologies — it only provides warm-starts.
-        #
-        # Rationale: in systems with heterogeneous decay rates (κ >> γ), mech-mech
-        # couplings need cooperativity ratios ~(κ/γ) larger than cavity-mech couplings
-        # to produce comparable physical coupling strengths. The short Stage 2
-        # optimisation cannot bridge this gap, so valid multi-mode EPR topologies
-        # converge to a "near-vacuum" local minimum (loss ≈ 3.9) indistinguishable
-        # from genuinely invalid topologies. Using Stage 2 as a hard filter would
-        # cause false negatives (valid EPR topologies rejected).
-        #
-        # Role of Stage 2: if the optimisation DID converge below loss_threshold
-        # (e.g. Kronwald-like topologies with homogeneous decay rates), return
-        # the warm-start log_ratios to accelerate Stage 3. Otherwise return
-        # u_warm=None so Stage 3 falls back to its own random initialisation.
-        u_warmstart = u_current if losses[-1] < loss_threshold else None
-        return (u_warmstart, True)
-
-    # -----------------------------------------------------------------------
-    # give_free_variable_idxs(conditions) → list of int
-    # -----------------------------------------------------------------------
-    # MIRRORS: give_free_variable_idxs(conditions) in Architecture_Optimizer
-    #
-    # Given a list of constraints, return the indices into the full coupling
-    # strengths array that are FREE (not fixed to zero by absent constraints).
-    #
-    # Build full_indices = list(range(len(all_edges)))
-    # For each Constraint_coupling_absent(i,j) in conditions:
-    #     Find the index k such that all_edges[k] == (i,j)
-    #     Remove k from free_indices
-    # Return free_indices
-    #
-    # Used by create_initial_guess, setup_bounds, and
-    # give_conditions_func_with_conditions to handle topology constraints.
-
-    # == see which edges are free to optimize? == 
+    # Indices into all_possible_edges that are FREE (not fixed to 0 by a
+    # Constraint_coupling_absent in conditions).
     def give_free_variable_idxs(self, conditions: list) -> list:
         from reservoir_engineering.constraints import Constraint_coupling_absent
-        
-        # Check which edges are absent 
+
         absent = {tuple(c.idxs) for c in conditions
                   if isinstance(c, Constraint_coupling_absent)}
-        
-        # return a list of indicies k which output edges which are present
+
         return [k for k, (i, j) in enumerate(self.all_possible_edges) if (min(i,j), max(i,j)) not in absent]
 
-    # -----------------------------------------------------------------------
-    # give_conditions_func_with_conditions(conditions) → (loss_fn, grad_fn, _)
-    # -----------------------------------------------------------------------
-    # MIRRORS: give_conditions_func_with_conditions(conditions)
-    #          in Architecture_Optimizer  (EXACT analogue)
-    #
-    # Wrap self.conditions_func to only operate on the FREE coupling strengths
-    # (those not fixed to 0 by Constraint_coupling_absent).
-    #
-    # Returns:
-    #   calc_conditions_constrained(partial_cs) → (loss, aux_dict)
-    #     partial_cs has shape (num_free_edges,), not (num_all_edges,).
-    #     Internally pads with zeros for absent edges, then calls conditions_func.
-    #   calc_jacobian_constrained(partial_cs) → gradient array, shape (num_free_edges,)
-    #   _ (placeholder for Hessian, not implemented)
-    #
-    # This wrapping is EXACTLY what AutoScatter does: it constructs a full
-    # parameter array padded with zeros for constrained variables, then
-    # extracts the relevant gradient components.
+    # Indices into `edges` (this topology's edge list) that get a free
+    # phase variable: beamsplitter edges NOT restricted to real-only via
+    # Constraint_real_coupling (self.real_coupling_edges — see __init__).
+    # Non-beamsplitter edges never get a phase (build_hamiltonian_matrix's
+    # phase generalisation only covers that edge type so far).
+    def _phase_edge_idxs(self, edges) -> list:
+        return [k for k, e in enumerate(edges)
+                if e['type'] == 'beamsplitter'
+                and (min(e['i'], e['j']), max(e['i'], e['j']), e['type'][:3]) not in self.real_coupling_edges]
 
-    # == Returns the loss function and its gradient for a specific toplogy found == 
+    # Build (u:E, v:n_aux, sq:2*n_sq, theta:P) coupling variables. theta is
+    # length E (padded with zeros at non-phase-free indices) so it plugs
+    # directly into build_drift_diffusion_from_GC_tilde's coherent_phases.
+    def _unpack_coupling_vars(self, x, E, n_aux, n_sq, phase_idxs):
+        u = x[:E]
+        v = x[E:E + n_aux]
+        sq = x[E + n_aux:E + n_aux + 2 * n_sq].reshape(n_sq, 2)
+        P = len(phase_idxs)
+        theta_free = x[E + n_aux + 2 * n_sq:E + n_aux + 2 * n_sq + P]
+        theta = jnp.zeros(E).at[jnp.array(phase_idxs, dtype=int)].set(theta_free) if P > 0 else jnp.zeros(E)
+        return u, v, sq, theta
 
+    # Build the (loss, grad) pair for a fixed topology's conditions: free
+    # vars x = [u_0,...,u_{E-1}, v_0,...,v_{A-1}] — ALL E coherent edges (no
+    # reference-edge pinning: kappa0 already fixes the overall-scale gauge,
+    # see build_drift_diffusion_from_GC_tilde's docstring) plus one log-rate
+    # per auxiliary node (self.aux_node_ids), plus the §2.6(c) soft
+    # constraints. Signal-mode decay rates come from self.nodes as given
+    # (may be exactly 0). Used by repeated_optimization to avoid rebuilding
+    # the JIT-compiled loss/grad on every restart.
     def give_conditions_func_with_conditions(self, conditions: list):
         from reservoir_engineering.topology_search import translate_conditions_to_triu, TopologyGraph
         from reservoir_engineering.covariance_physics import (
-            build_drift_matrix_from_ratios, solve_lyapunov_kronecker, get_mode_covariance)
-        
-        # == When topology is found -> what is the triu array, nodes and edges of the topology == 
+            build_drift_diffusion_from_GC_tilde, solve_lyapunov_kronecker, get_mode_covariance)
+
         triu_array = translate_conditions_to_triu(conditions, self.num_modes, self.node_types)
-        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
-        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
-        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
-            default_kappa=default_kappa, default_gamma=default_gamma)
-        
+        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts()
+        for i in range(self.num_modes):
+            if i not in self.aux_node_ids:
+                nodes[i] = dict(self.nodes[i])   # signal modes keep their real (possibly gamma=0) rates
+
         E = len(edges)
-        D = self.D
-        sigma_target_jnp = jnp.array(self.sigma_target)
+        n_aux = len(self.aux_node_ids)
+        n_sq = len(self.squeezable_aux_ids)
+        phase_idxs = self._phase_edge_idxs(edges)
+        sigma_target_jnp = None if self.sigma_target is None else jnp.array(self.sigma_target)
         target_mode_ids = self.target_mode_ids
-        lambda_scale = LAMBDA_SCALE_DEFAULT
+        aux_node_ids = self.aux_node_ids
+        squeezable_aux_ids = self.squeezable_aux_ids
+        kappa0 = self.kappa0
 
         from reservoir_engineering.constraints import Constraint_coupling_symmetric
         sym_constraints   = [c for c in self.enforced_constraints
@@ -898,40 +536,20 @@ class CovarianceOptimizer:
         other_constraints = [c for c in self.enforced_constraints
                              if not isinstance(c, Constraint_coupling_symmetric)]
 
-        # Reference edge: fixed at C = lambda_scale (u_ref = 0).
-        # Choose the edge with the largest d_i*d_j (most natural coupling scale).
-        # All other E-1 edges are free log-ratios relative to C_ref.
-        decay_prods = []
-        for edge in edges:
-            ni_e = nodes[edge['i']]; nj_e = nodes[edge['j']]
-            decay_prods.append(ni_e.get('kappa', ni_e.get('gamma')) *
-                               nj_e.get('kappa', nj_e.get('gamma')))
-        ref_idx  = int(np.argmax(decay_prods)) if E > 0 else 0
-        n_free_u = max(E - 1, 0)
-
         def loss_fn(x):
-            """
-            x = [u_1, ..., u_{E-1}]  (E-1 log-ratios vs C_ref)
-            Reference edge (ref_idx) is fixed at u=0 (C = lambda_scale).
-            Detunings are fixed at zero: covariance depends only on cooperativity ratios.
-            """
-            u_free = x[:n_free_u]
-            full_u = jnp.concatenate([u_free[:ref_idx],
-                                      jnp.array([0.0]),
-                                      u_free[ref_idx:]])
-            ratios = jnp.exp(full_u)
-
-            A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
+            u, v, s, theta = self._unpack_coupling_vars(x, E, n_aux, n_sq, phase_idxs)
+            A, D = build_drift_diffusion_from_GC_tilde(
+                nodes, edges, u, v, aux_node_ids, kappa0, squeezable_aux_ids, s, theta)
 
             sigma = solve_lyapunov_kronecker(A, D)
             sigma_sub = get_mode_covariance(sigma, target_mode_ids)
-            loss = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
+            loss = self._target_residual(sigma, sigma_sub, sigma_target_jnp)
 
             for c in other_constraints:
                 loss = loss + c(A, sigma)
 
             for c in sym_constraints:
-                loss = loss + c(full_u, edges)
+                loss = loss + c(u, edges)
 
             return loss
 
@@ -939,191 +557,58 @@ class CovarianceOptimizer:
         grad_jit = jax.jit(jax.grad(loss_fn))
         return loss_jit, grad_jit, None
 
-    # -----------------------------------------------------------------------
-    # create_initial_guess(conditions=[], u_warm=None, optimize_detunings=True)
-    #     → (initial_x, free_idxs)
-    # -----------------------------------------------------------------------
-    # MIRRORS: create_initial_guess(conditions, init_abs_range, ...)
-    #          in Architecture_Optimizer
-    #
-    # Sample the initial parameter vector x = [u_k..., Δ_i...] for Stage 3.
-    # Two groups of variables (mirrors AutoScatter's gabs + Deltas initial guess):
-    #
-    # Group 1 — LOG coupling ratios (E_free entries):
-    #   If u_warm provided (from Stage 2): use u_warm as initial guess.
-    #   Otherwise: draw u_k uniformly in INIT_LOG_RATIO_RANGE_DEFAULT = [-1.0, 1.0].
-    #   (Corresponds to C̃_k = exp(u_k) ∈ [e^{-1}, e^1] ≈ [0.37, 2.72].)
-    #   Note: AutoScatter draws gphases ∈ [-π, π]; here no phases needed
-    #         (real quadrature basis = real A matrix, no phase degree of freedom).
-    #
-    # Group 2 — mode detunings (N entries, one per node):
-    #   Δ_i = 0 for ALL modes (always start at resonance).
-    #   The optimizer moves Δ_i away from 0 if the target requires off-resonance driving.
-    #   For Kronwald / Wang-Clerk: expect Δ_i ≈ 0 at convergence.
-    #
-    # Returns:
-    #   initial_x  : np.ndarray (E_free + N,) — concatenated [u_k..., Δ_i...]
-    #   free_idxs  : list of int — indices of free edge slots (Group 1)
-    #
-    # If optimize_detunings=False: return only Group 1 (u_k only), shape (E_free,).
-
-    # === Create initial guesses for the 1. log ratios and 2. mode detunings ===
-
+    # Sample the initial parameter vector: E+A log-ratios/log-rates ~
+    # Uniform(INIT_LOG_RATIO_RANGE_DEFAULT), plus N detunings at 0 if
+    # optimize_detunings (always start at resonance; the optimiser moves away
+    # from 0 only if the target needs off-resonance driving).
     def create_initial_guess(
         self,
         conditions: list = [],
         betas=None,
         optimize_detunings: bool = False,
     ):
-        
-        # Give the indices of the free variables that need optimising
         free_idxs = self.give_free_variable_idxs(conditions)
         E = len(free_idxs)
-        
-        # initializes the coupling ratios
-        # draws E random values in [lo,hi] = u_k = log(C_k) -> C_k = [e^-1, e^1]
+
         lo, hi = INIT_LOG_RATIO_RANGE_DEFAULT
         u_init = np.random.uniform(lo, hi, E).astype(float)
-        
-        # Initilise the detunings
+
         if optimize_detunings:
             x0 = np.concatenate([u_init, np.zeros(self.num_modes)])
         else:
             x0 = u_init
-        
+
         return x0, free_idxs
 
-    # -----------------------------------------------------------------------
-    # setup_bounds(conditions) → np.ndarray or None
-    # -----------------------------------------------------------------------
-    # MIRRORS: setup_bounds(bounds_intrinsic_loss, free_idxs)
-    #          in Architecture_Optimizer
-    #
-    # Build the bounds array for L-BFGS-B.
-    # With the log parametrisation, ALL variables are unconstrained:
-    #   u_k = log(C̃_k) ∈ (−∞, +∞)  — exp(u_k) > 0 automatically
-    #   Δ_i             ∈ (−∞, +∞)  — detuning is unbounded
-    # Returns None (no bounds needed) or an array of (None, None) pairs.
-    #
-    # Contrast with AutoScatter: gabs ≥ 0 required explicit lower bounds.
-    # Here the log reparametrisation eliminates that requirement entirely.
-
+    # Log parametrisation means every variable is unconstrained (u_k, v_m,
+    # Delta_i in (-inf,inf)); no bounds needed here (unlike AutoScatter's
+    # gabs >= 0).
     def setup_bounds(self, conditions: list):
-        return None  # log-space: u_k and Δ_i are both unconstrained reals
+        return None
 
-    # -----------------------------------------------------------------------
-    # complete_variable_arrays_with_zeros(partial_cs, conditions) → np.ndarray
-    # -----------------------------------------------------------------------
-    # MIRRORS: complete_variable_arrays_with_zeros in Architecture_Optimizer
-    #
-    # Pad a partial (free-edges-only) coupling array with zeros for absent edges.
-    # Returns a full coupling array of shape (num_all_edges,).
-    # Used to recover the full solution from the optimiser output.
-
-    
+    # Pad a free-edges-only coupling array with zeros for absent edges.
     def complete_variable_arrays_with_zeros(self, partial_cs, conditions: list) -> np.ndarray:
-        # List of position of the free edges within the full index list
         free_idxs = self.give_free_variable_idxs(conditions)
-
-        # List of all zeros to create a full index list (include those without edges)
         full = np.zeros(len(self.all_possible_edges))
-
-        # Update the list so that len(full) = total number of modes
         for k, idx in enumerate(free_idxs):
             full[idx] = partial_cs[k]
         return full
 
-    # -----------------------------------------------------------------------
-    # optimize_given_conditions(conditions, ..., lambda_scale, u_warm) → (success, info_out)
-    # -----------------------------------------------------------------------
-    # MIRRORS: optimize_given_conditions(conditions, triu_matrix, verbosity, ...)
-    #          in Architecture_Optimizer  (EXACT analogue — this is the core method)
-    #
-    # STAGE 3 of the main algorithm.
-    # Run ONE optimisation (single random start) for a FIXED topology.
-    # The independent variables are:
-    #   Group 1 — LOG coupling ratios u_k = log(C̃_k) ∈ (−∞, +∞), one per active edge
-    #   Group 2 — mode DETUNINGS Δ_i ∈ ℝ, one per mode
-    # Concatenated into a single vector: x = [u_0,...,u_{E-1}, Δ_0,...,Δ_{N-1}].
-    # Mirrors AutoScatter's (gabs, Deltas) as the two groups of free variables.
-    #
-    # Parameters:
-    #   conditions               : list of constraint objects encoding the topology.
-    #                              If None, use translate_triu_to_conditions(triu_array).
-    #   triu_array               : alternative to conditions (1D encoding).
-    #   lambda_scale             : float, fixed large scale. Default LAMBDA_SCALE_DEFAULT=1000.
-    #                              All cooperativities are C_k = lambda_scale · exp(u_k).
-    #   u_warm                   : jnp.ndarray (E,), warm-start log_ratios from Stage 2.
-    #                              If None, draw u_k ~ Uniform(INIT_LOG_RATIO_RANGE_DEFAULT).
-    #   optimize_detunings       : bool, default True.
-    #                              If True, Δ_i are free variables (initialised to 0).
-    #                              If False, all Δ_i = 0 fixed (resonant case — faster).
-    #   verbosity                : print progress if True.
-    #   max_violation_success    : success threshold on loss (default 1e-8).
-    #   calc_conditions_and_gradients: pre-computed (loss_fn, grad_fn, _) to reuse.
-    #   method                   : scipy optimizer method (default 'L-BFGS-B').
-    #   **kwargs_solver          : passed to scipy.optimize.minimize options.
-    #
-    # Steps (Stage 3):
-    #   1. Build loss and gradient functions.
-    #      Free variable vector x = [u_0,...,u_{E-1}, Δ_0,...,Δ_{N-1}].
-    #      The loss function:
-    #        a. Extract log_ratios = x[:E], detunings = x[E:]
-    #        b. Set node['delta'] = detunings[i] for each node i
-    #        c. ratios = jnp.exp(log_ratios)   ← C̃_k = exp(u_k) > 0 always
-    #        d. A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
-    #           Builds A from H with g_k = sqrt(λ · C̃_k · decay_i · decay_j / 4)
-    #           and detuning rotation Δ_i · J₂ on each diagonal block.
-    #        e. sigma = solve_lyapunov_kronecker(A, D)
-    #        f. return ½‖get_mode_covariance(sigma, target_mode_ids) − sigma_target‖²_F
-    #      Gradient via jax.grad argnums=0 (w.r.t. full x vector).
-    #   2. Initial guess:
-    #        u_k = u_warm[k] if provided, else u_k ~ Uniform(INIT_LOG_RATIO_RANGE_DEFAULT)
-    #        Δ_i = 0 for all modes (always start at resonance)
-    #   3. Bounds: NONE — x is unconstrained.
-    #        u_k ∈ (−∞, +∞): exp(u_k) > 0 automatically
-    #        Δ_i ∈ (−∞, +∞): unbounded
-    #   4. Run scipy.optimize.minimize(fun=loss, jac=grad, method='L-BFGS-B', ...).
-    #   5. Build solution dict and info dict.
-    #
-    # Returns:
-    #   success : bool — loss < max_violation_success
-    #   info_out : dict — mirrors AutoScatter's info_out:
-    #     {
-    #       'initial_guess'       : full x vector at start [u_k..., Δ_i...]
-    #       'free_idxs'           : list of free edge indices
-    #       'solution'            : full x vector at end
-    #       'log_ratios'          : np.ndarray (E,) — u_k values (Group 1 raw)
-    #       'coupling_ratios'     : dict {'C̃_{i,j}': exp(u_k)} — Group 1 interpreted
-    #       'detunings'           : dict {'Δ_i': float} — Group 2 output
-    #                               ≈ 0 for Kronwald/Wang-Clerk; ≠ 0 for multi-ω_m schemes
-    #       'lambda_scale'        : float — λ used in Stage 3
-    #       'coupling_strengths'  : np.ndarray (E,) — physical g values:
-    #                               g_k = sqrt(λ · exp(u_k) · decay_i · decay_j / 4)
-    #       'cooperativities'     : dict — C_k = λ · exp(u_k) per edge
-    #       'physical_formula'    : 'g_k = sqrt(λ · C̃_k · decay_i · decay_j / 4)'
-    #       'final_cost'          : float
-    #       'success'             : bool
-    #       'optimizer_message'   : str from scipy
-    #       'A'                   : achieved drift matrix (2N×2N)
-    #       'sigma_full'          : achieved full covariance (2N×2N)
-    #       'sigma_achieved'      : achieved covariance for signal modes (2M×2M)
-    #       'sigma_target'        : self.sigma_target
-    #       'nit'                 : number of iterations
-    #       'loss_history'        : list of loss values per callback step
-    #     }
-    #
-    # Relationship to AutoScatter's optimize_given_conditions:
-    #   AutoScatter free variables: gabs (|g_{ij}|) + gphases (arg(g_{ij})) + Deltas (Δ_i)
-    #   Here: u_k = log(C̃_k) (replaces gabs, no phases) + Δ_i (detunings, same concept)
-    #   No phases needed — real quadrature basis means A is real (no phase freedom).
-
+    # Stage 2, the core method: one optimisation run (single random start)
+    # for a fixed topology. Free variables x = [u_0,...,u_{E-1},
+    # v_0,...,v_{A-1}] (+ Delta_0,...,Delta_{N-1} if optimize_detunings) —
+    # see build_drift_diffusion_from_GC_tilde and the class docstring. Loss
+    # = §3's L: target term (_target_residual) + soft constraints
+    # (enforced_constraints, incl. stability) + optional purity/regulariser
+    # terms (self.lambda_pure/self.lambda_reg). success = final loss <
+    # max_violation_success. Returns (success, info_out) with
+    # G_tilde/C_tilde_aux, detunings, physical coupling strengths, a
+    # post-hoc 'cooperativities' dict, achieved sigma, loss history, etc. —
+    # see the dict below for exact keys.
     def optimize_given_conditions(
         self,
         conditions: list = None,
         triu_array=None,
-        lambda_scale: float = None,
-        u_warm=None,
         optimize_detunings: bool = False,
         verbosity: bool = False,
         max_violation_success: float = 1e-8,
@@ -1131,13 +616,12 @@ class CovarianceOptimizer:
         method: str = 'L-BFGS-B',
         **kwargs_solver,
     ):
-        
         from reservoir_engineering.topology_search import (
             TopologyGraph, translate_triu_to_conditions, translate_conditions_to_triu)
         from reservoir_engineering.covariance_physics import (
-            build_drift_matrix_from_ratios, solve_lyapunov_kronecker, get_mode_covariance)
+            build_drift_diffusion_from_GC_tilde, solve_lyapunov_kronecker, get_mode_covariance,
+            purity_violation, check_stability)
 
-        # Resolve: need both conditions and triu_array
         if triu_array is not None and conditions is None:
             conditions = translate_triu_to_conditions(triu_array, self.node_types)
         elif conditions is not None and triu_array is None:
@@ -1145,58 +629,63 @@ class CovarianceOptimizer:
         elif conditions is None and triu_array is None:
             raise ValueError("Must provide conditions or triu_array")
 
-        if lambda_scale is None:
-            lambda_scale = LAMBDA_SCALE_DEFAULT
-
-        # == Setting up == 
-        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
-        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
-        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
-            default_kappa=default_kappa, default_gamma=default_gamma)
+        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts()
+        for i in range(self.num_modes):
+            if i not in self.aux_node_ids:
+                nodes[i] = dict(self.nodes[i])   # signal modes keep their real (possibly gamma=0) rates
         E = len(edges)
         N = self.num_modes
+        n_aux = len(self.aux_node_ids)
+        n_sq = len(self.squeezable_aux_ids)
+        aux_node_ids = self.aux_node_ids
+        squeezable_aux_ids = self.squeezable_aux_ids
+        kappa0 = self.kappa0
+        phase_idxs = self._phase_edge_idxs(edges)
+        n_phase = len(phase_idxs)
 
-        sigma_target_jnp = jnp.array(self.sigma_target)
-        D = self.D
+        sigma_target_jnp = None if self.sigma_target is None else jnp.array(self.sigma_target)
         target_mode_ids = self.target_mode_ids
-        enforced_constraints = self.enforced_constraints
         J2 = jnp.array([[0., 1.], [-1., 0.]])
 
-        # Reference edge: largest d_i*d_j fixed at C = lambda_scale (u_ref = 0).
-        # Free variables: E-1 log-ratios (other edges relative to C_ref) + N detunings.
-        decay_prods = []
-        for edge in edges:
-            ni_e = nodes[edge['i']]; nj_e = nodes[edge['j']]
-            decay_prods.append(ni_e.get('kappa', ni_e.get('gamma')) *
-                               nj_e.get('kappa', nj_e.get('gamma')))
-        ref_idx  = int(np.argmax(decay_prods)) if E > 0 else 0
-        n_free_u = max(E - 1, 0)
+        # Constraint_coupling_symmetric/_cooperativity_cap are dispatched on
+        # (log_ratios, edges), not (A, sigma) like every other constraint —
+        # filter them out here the same way give_conditions_func_with_conditions
+        # does, or they crash when called with the wrong signature.
+        from reservoir_engineering.constraints import Constraint_coupling_symmetric, Constraint_cooperativity_cap
+        u_constraints  = [c for c in self.enforced_constraints
+                          if isinstance(c, (Constraint_coupling_symmetric, Constraint_cooperativity_cap))]
+        other_constraints = [c for c in self.enforced_constraints if c not in u_constraints]
 
-        # == Define loss Function ==
-        # x = [u_1,...,u_{E-1}]  when optimize_detunings=False (default)
-        # x = [u_1,...,u_{E-1}, Δ_0,...,Δ_{N-1}]  when optimize_detunings=True
-        # u_k = log(C_k / C_ref), reference edge fixed at u=0.
-        # Covariance depends only on cooperativity ratios; detunings fixed at 0 by default.
+        target_scale = (float(np.sum(np.asarray(self.sigma_target) ** 2))
+                         if self.normalize_targets and self.sigma_target is not None else None)
+
         def loss_fn(x):
-            u_free = x[:n_free_u]
-            full_u = jnp.concatenate([u_free[:ref_idx],
-                                      jnp.array([0.0]),
-                                      u_free[ref_idx:]])
-            ratios = jnp.exp(full_u)
-            A = build_drift_matrix_from_ratios(nodes, edges, ratios, lambda_scale)
+            u, v, sq, theta = self._unpack_coupling_vars(x, E, n_aux, n_sq, phase_idxs)
+            A, D = build_drift_diffusion_from_GC_tilde(
+                nodes, edges, u, v, aux_node_ids, kappa0, squeezable_aux_ids, sq, theta)
 
             if optimize_detunings:
-                detunings_x = x[n_free_u:]
+                detunings_x = x[E + n_aux + 2 * n_sq + n_phase:]
                 for i in range(N):
                     s = slice(2 * i, 2 * i + 2)
                     A = A.at[s, s].add(detunings_x[i] * J2)
 
             sigma = solve_lyapunov_kronecker(A, D)
             sigma_sub = get_mode_covariance(sigma, target_mode_ids)
-            loss = jnp.sum((sigma_sub - sigma_target_jnp) ** 2) / 2.
 
-            for c in enforced_constraints:
+            loss = self._target_residual(sigma, sigma_sub, sigma_target_jnp, target_scale)
+
+            for c in other_constraints:
                 loss = loss + c(A, sigma)
+
+            for c in u_constraints:
+                loss = loss + c(u, edges)
+
+            if self.lambda_pure > 0:
+                loss = loss + self.lambda_pure * purity_violation(sigma_sub)
+
+            if self.lambda_reg > 0:
+                loss = loss + self.lambda_reg * jnp.sum(jnp.concatenate([u, v]) ** 2)
 
             return loss
 
@@ -1206,67 +695,102 @@ class CovarianceOptimizer:
             loss_jit = jax.jit(loss_fn)
             grad_jit = jax.jit(jax.grad(loss_fn))
 
-        # Physical bounds (needed both for clipping init and for L-BFGS-B)
-        u_bound = self.kwargs_optimization.get('log_ratio_bound', LOG_RATIO_BOUND_DEFAULT)
-        d_bound = self.kwargs_optimization.get('detuning_bound',  DETUNING_BOUND_DEFAULT)
+        bound       = self.kwargs_optimization.get('direct_log_bound', DIRECT_LOG_BOUND_DEFAULT)
+        sq_bound    = self.kwargs_optimization.get('squeeze_ab_bound', SQUEEZE_AB_BOUND_DEFAULT)
+        phase_bound = self.kwargs_optimization.get('phase_bound', PHASE_BOUND_DEFAULT)
+        d_bound     = self.kwargs_optimization.get('detuning_bound',  DETUNING_BOUND_DEFAULT)
 
-        # == Initial guess ==
-        # u_warm (E-dim from Stage 2) → drop ref_idx component → n_free_u values.
-        if u_warm is not None:
-            u_warm_full = np.array(u_warm[:E], dtype=float)
-            u_init = np.delete(u_warm_full, ref_idx)
-        else:
-            # Physics-motivated base relative to reference edge's decay product.
-            ref_edge = edges[ref_idx] if E > 0 else None
-            if ref_edge is not None:
-                ref_ni = nodes[ref_edge['i']]; ref_nj = nodes[ref_edge['j']]
-                d_ref_edge = (ref_ni.get('kappa', ref_ni.get('gamma')) *
-                              ref_nj.get('kappa', ref_nj.get('gamma')))
-            else:
-                d_ref_edge = 1.0
-            u_base = []
-            for k, edge in enumerate(edges):
-                if k == ref_idx:
+        lo, hi = INIT_LOG_RATIO_RANGE_DEFAULT
+        n_coupling_vars = E + n_aux + 2 * n_sq + n_phase
+        # per-variable final bound: (u,v) get `bound`, squeeze (a_,b_) get
+        # `sq_bound`, phase (theta) gets `phase_bound` (one period — see
+        # PHASE_BOUND_DEFAULT).
+        final_bounds = np.concatenate([np.full(E + n_aux, bound), np.full(2 * n_sq, sq_bound),
+                                        np.full(n_phase, phase_bound)])
+
+        # Decay-rate-aware init for the coherent edges (using the SAME
+        # unit-cooperativity formula as Stage 1's fast filter,
+        # g_unit=sqrt(decay_i*decay_j/4)): a flat Uniform(lo,hi) center for
+        # every edge is fine when all edges touch similar decay rates (e.g.
+        # Kronwald's single cavity-mech pair), but with several MODE PAIRS
+        # of very different natural scale in one topology (e.g. cavity-mech
+        # AND mech-mech edges, kappa/gamma ~ 100x apart), a flat center
+        # leaves some edges' initial physical g_k orders of magnitude away
+        # from what they need, and L-BFGS-B can get stuck. Centering each
+        # edge's init on its own unit-cooperativity scale removes that
+        # cross-edge conditioning gap; the uniform range still supplies the
+        # randomness multi-restart relies on. Auxiliary log-rates (v) and
+        # squeeze params (a_,b_) have no natural per-edge scale of their own
+        # — left centered at 0 (aux decay = kappa0; squeeze = plain vacuum).
+        # Phase (theta) is centered at 0 too but jittered over its FULL
+        # period (Uniform(-pi,pi), not the log-ratio jitter range) — it's
+        # periodic, not a magnitude, so a wide initial spread matters more
+        # than a small perturbation around a single guess.
+        u_center = []
+        for edge in edges:
+            ni, nj = nodes[edge['i']], nodes[edge['j']]
+            di = ni.get('kappa', ni.get('gamma'))
+            dj = nj.get('kappa', nj.get('gamma'))
+            g_unit = np.sqrt(max(di * dj, 0.) / 4.)
+            u_center.append(float(np.log(g_unit / kappa0)) if g_unit > 0 else 0.0)
+        centers = np.array(u_center + [0.0] * n_aux + [0.0] * (2 * n_sq) + [0.0] * n_phase)
+        jitter = np.concatenate([
+            np.random.uniform(lo, hi, E + n_aux + 2 * n_sq),
+            np.random.uniform(-phase_bound, phase_bound, n_phase),
+        ])
+        x0_coupling = np.clip(centers + jitter, -final_bounds, final_bounds).astype(float)
+
+        # Progressive coupling-scale warm-up (generalises the old
+        # cooperativity mode's Stage-2 multi-scale lambda continuation to
+        # (u,v) together): a few short solves at increasing bounds, each
+        # warm-starting the next from the previous solution. A single
+        # fixed-bound solve from a smart-but-static init can still get
+        # stuck in a bad local minimum on topologies with several very
+        # different edge scales in one graph (e.g. cavity-mech AND
+        # mech-mech edges together — heterogeneous decay rates, not fixed
+        # by the per-edge init alone); ramping the reachable scale up
+        # gradually escapes that far more reliably than jumping straight to
+        # the full bound. Skipped when there's nothing to warm up.
+        if n_coupling_vars > 0:
+            zeros_tail = np.zeros(N) if optimize_detunings else np.zeros(0)
+
+            def pad(yy):
+                return np.concatenate([yy, zeros_tail]) if optimize_detunings else yy
+
+            y = x0_coupling
+            for stage_scalar in (2.3, 4.6, 6.9):
+                stage_bounds = np.minimum(stage_scalar, final_bounds)
+                if np.all(stage_bounds >= final_bounds):
                     continue
-                ni, nj = nodes[edge['i']], nodes[edge['j']]
-                di = ni.get('kappa', ni.get('gamma'))
-                dj = nj.get('kappa', nj.get('gamma'))
-                ub = float(np.log(d_ref_edge / (di * dj)))
-                etype = edge.get('type', '')[:3]
-                if etype == 'bea':   u_base.append(ub + 0.5)
-                elif etype == 'two': u_base.append(ub - 0.5)
-                else:                u_base.append(ub)
-            lo, hi = INIT_LOG_RATIO_RANGE_DEFAULT
-            u_init = (np.array(u_base, dtype=float)
-                      + np.random.uniform(lo, hi, n_free_u).astype(float))
-            u_init = np.clip(u_init, -u_bound, u_bound)
+                y = np.clip(y, -stage_bounds, stage_bounds)
+                wres = sciopt.minimize(
+                    fun=lambda x: float(loss_jit(jnp.array(pad(x), dtype=float))),
+                    jac=lambda x: np.array(grad_jit(jnp.array(pad(x), dtype=float)), dtype=float)[:n_coupling_vars],
+                    x0=y, method=method,
+                    bounds=list(zip(-stage_bounds, stage_bounds)),
+                    options={'maxiter': 60},
+                )
+                y = wres.x
+            x0_coupling = y
 
-        if optimize_detunings:
-            x0 = np.concatenate([u_init, np.zeros(N)])
-        else:
-            x0 = u_init
+        x0 = np.concatenate([x0_coupling, np.zeros(N)]) if optimize_detunings else x0_coupling
 
-        # Loss History
         loss_history = []
         def callback(x):
             loss_history.append(float(loss_jit(jnp.array(x, dtype=float))))
 
-        # Optimization solver
         solver_opts = dict(self.solver_options)
         solver_opts.update(kwargs_solver)
 
         if optimize_detunings:
-            bounds = ([(-u_bound, u_bound)] * n_free_u) + ([(-d_bound, d_bound)] * N)
+            bounds = list(zip(-final_bounds, final_bounds)) + ([(-d_bound, d_bound)] * N)
         else:
-            bounds = [(-u_bound, u_bound)] * n_free_u
+            bounds = list(zip(-final_bounds, final_bounds))
 
         n_vars = len(x0)
         if n_vars == 0:
-            # No free variables: reference edge is the only edge, fixed at C=lambda.
-            # Just evaluate loss directly — no optimization to run.
             x_sol = x0
         else:
-            # Run optimization
             result = sciopt.minimize(
                 fun=lambda x: float(loss_jit(jnp.array(x, dtype=float))),
                 jac=lambda x: np.array(grad_jit(jnp.array(x, dtype=float)), dtype=float),
@@ -1278,38 +802,71 @@ class CovarianceOptimizer:
             )
             x_sol = result.x
 
-        # Reconstruct full E-dim log_ratios by re-inserting 0.0 at ref_idx
-        u_free_sol = x_sol[:n_free_u]
-        log_ratios_sol = np.insert(u_free_sol, ref_idx, 0.0)
-        detunings_sol = x_sol[n_free_u:] if optimize_detunings else np.zeros(N)
+        u_sol, v_sol, sq_sol, theta_sol = self._unpack_coupling_vars(x_sol, E, n_aux, n_sq, phase_idxs)
+        u_sol, v_sol, sq_sol, theta_sol = np.array(u_sol), np.array(v_sol), np.array(sq_sol), np.array(theta_sol)
+        detunings_sol = x_sol[E + n_aux + 2 * n_sq + n_phase:] if optimize_detunings else np.zeros(N)
         final_loss = float(loss_jit(jnp.array(x_sol, dtype=float)))
-        success = final_loss < max_violation_success
 
-        # Reconstruct A and sigma at solution
-        ratios_sol = jnp.exp(jnp.array(log_ratios_sol))
-        A_sol = build_drift_matrix_from_ratios(nodes, edges, ratios_sol, lambda_scale)
+        A_sol, D_sol = build_drift_diffusion_from_GC_tilde(
+            nodes, edges, jnp.array(u_sol), jnp.array(v_sol), aux_node_ids, kappa0,
+            squeezable_aux_ids, jnp.array(sq_sol), jnp.array(theta_sol))
         for i in range(N):
             s = slice(2 * i, 2 * i + 2)
             A_sol = A_sol.at[s, s].add(float(detunings_sol[i]) * J2)
-        sigma_full_sol = solve_lyapunov_kronecker(A_sol, D)
+        sigma_full_sol = solve_lyapunov_kronecker(A_sol, D_sol)
         sigma_achieved = get_mode_covariance(sigma_full_sol, target_mode_ids)
 
-        # Physical quantities per edge
+        # Constraint_stability is a SOFT penalty (§2.6(c)) — it shapes the
+        # landscape but a low loss doesn't guarantee it actually WON at the
+        # optimum found. An unstable A makes solve_lyapunov_kronecker solve
+        # a near-singular/wrong-sign system, silently producing an
+        # unphysical sigma (e.g. negative variances) that can coincidentally
+        # score a low target residual. Cross-check Hurwitz explicitly so
+        # `success` never reports a machine that doesn't actually have the
+        # claimed steady state.
+        success = (final_loss < max_violation_success) and check_stability(A_sol)
+
+        G_tilde = {}
+        coherent_phases = {}
         coupling_strengths_sol = []
-        cooperativities = {}
-        coupling_ratios_dict = {}
         for k, edge in enumerate(edges):
-            ni, nj = nodes[edge['i']], nodes[edge['j']]
-            di = ni.get('kappa', ni.get('gamma'))
-            dj = nj.get('kappa', nj.get('gamma'))
-            u_k = float(log_ratios_sol[k])
-            C_tilde = float(np.exp(u_k))
-            C_k = lambda_scale * C_tilde
-            g_k = float(np.sqrt(max(C_k * di * dj / 4., 0.)))
+            g_k = float(kappa0 * np.exp(u_sol[k]))   # magnitude only
             coupling_strengths_sol.append(g_k)
             label = f"({edge['i']},{edge['j']},{edge['type'][:3]})"
-            cooperativities[label] = C_k
-            coupling_ratios_dict[f'C~_{label}'] = C_tilde
+            G_tilde[f'G~_{label}'] = float(np.exp(u_sol[k]))
+            if k in phase_idxs:
+                coherent_phases[f'theta_{label}'] = float(theta_sol[k])
+
+        C_tilde_aux, aux_decay_sol = {}, {}
+        for slot, node_id in enumerate(aux_node_ids):
+            c_val = float(kappa0 * np.exp(v_sol[slot]))
+            aux_decay_sol[node_id] = c_val
+            C_tilde_aux[f'C~_aux_{node_id}'] = float(np.exp(v_sol[slot]))
+
+        # post-hoc (r,theta) from the achieved (a_,b_) — see
+        # covariance_physics.build_jump_matrix / SQUEEZE_AB_BOUND_DEFAULT.
+        # M=a_+i*b_=sinh(r)e^{i theta}; r=0 (a_=b_=0) means the search found
+        # plain vacuum was better/sufficient for that node, even though it
+        # was offered a squeezed bath.
+        bath_squeezing = {}
+        for slot, node_id in enumerate(squeezable_aux_ids):
+            a_val, b_val = float(sq_sol[slot, 0]), float(sq_sol[slot, 1])
+            bath_squeezing[node_id] = {
+                'a': a_val, 'b': b_val,
+                'r': float(np.arcsinh(np.hypot(a_val, b_val))),
+                'theta': float(np.arctan2(b_val, a_val)),
+            }
+
+        # post-hoc cooperativities (reporting only — not the search variable
+        # here); inf where a signal mode's fixed decay is exactly 0.
+        cooperativities = {}
+        for k, edge in enumerate(edges):
+            ni_id, nj_id = edge['i'], edge['j']
+            di = aux_decay_sol.get(ni_id, nodes[ni_id].get('kappa', nodes[ni_id].get('gamma')))
+            dj = aux_decay_sol.get(nj_id, nodes[nj_id].get('kappa', nodes[nj_id].get('gamma')))
+            g_k = coupling_strengths_sol[k]
+            label = f"({edge['i']},{edge['j']},{edge['type'][:3]})"
+            cooperativities[label] = float(4 * g_k ** 2 / (di * dj)) if (di > 0 and dj > 0) else float('inf')
 
         opt_nit = result.nit if n_vars > 0 else 0
         opt_msg = result.message if n_vars > 0 else 'no free variables — direct evaluation'
@@ -1318,68 +875,60 @@ class CovarianceOptimizer:
             print(f'  loss={final_loss:.3e}  success={success}  nit={opt_nit}')
 
         info_out = {
-            'initial_guess'      : x0,
-            'free_idxs'          : self.give_free_variable_idxs(conditions),
-            'solution'           : x_sol,
-            'log_ratios'         : log_ratios_sol,
-            'coupling_ratios'    : coupling_ratios_dict,
-            'detunings'          : {f'Delta_{i}': float(detunings_sol[i]) for i in range(N)},
-            'lambda_scale'       : lambda_scale,
-            'coupling_strengths' : np.array(coupling_strengths_sol),
-            'cooperativities'    : cooperativities,
-            'physical_formula'   : 'g_k = sqrt(lambda * C~_k * decay_i * decay_j / 4)',
-            'final_cost'         : final_loss,
-            'success'            : success,
-            'optimizer_message'  : opt_msg,
-            'A'                  : np.array(A_sol),
-            'sigma_full'         : np.array(sigma_full_sol),
-            'sigma_achieved'     : np.array(sigma_achieved),
-            'sigma_target'       : self.sigma_target,
-            'nit'                : opt_nit,
-            'loss_history'       : loss_history,
+            'initial_guess'       : x0,
+            'solution'            : x_sol,
+            'coherent_log_ratios' : u_sol,
+            'aux_log_rates'       : v_sol,
+            'G_tilde'             : G_tilde,
+            'C_tilde_aux'         : C_tilde_aux,
+            'bath_squeezing'      : bath_squeezing,
+            'coherent_phases'     : coherent_phases,
+            'detunings'           : {f'Delta_{i}': float(detunings_sol[i]) for i in range(N)},
+            'kappa0'              : kappa0,
+            'coupling_strengths'  : np.array(coupling_strengths_sol),
+            'aux_decay_rates'     : aux_decay_sol,
+            'cooperativities'     : cooperativities,
+            'physical_formula'    : ('g_k = kappa0*exp(u_k)*exp(i*theta_k) (theta free for beamsplitter '
+                                      'edges unless Constraint_real_coupling pins it to 0);  '
+                                      'aux_decay_m = kappa0*exp(v_m)'),
+            'final_cost'          : final_loss,
+            'success'             : success,
+            'optimizer_message'   : opt_msg,
+            'A'                   : np.array(A_sol),
+            'sigma_full'          : np.array(sigma_full_sol),
+            'sigma_achieved'      : np.array(sigma_achieved),
+            'sigma_target'        : self.sigma_target,
+            'nit'                 : opt_nit,
+            'loss_history'        : loss_history,
         }
         return success, info_out
 
-    # -----------------------------------------------------------------------
-    # repeated_optimization(num_tests, conditions, ...) → (success, infos, where)
-    # -----------------------------------------------------------------------
-    # MIRRORS: repeated_optimization(num_tests, conditions, ...) in Architecture_Optimizer
-    #          (EXACT analogue — runs multiple random restarts)
-    #
-    # Run optimize_given_conditions num_tests times from different random starts.
-    # Stop early if interrupt_if_successful=True AND a success is found.
-    # Returns the BEST result (lowest loss) across all restarts.
-    #
-    # Steps:
-    #   1. Pre-build calc_conditions_and_gradients ONCE (avoid retracing).
-    #      (Same optimisation as AutoScatter: build JIT outside the loop.)
-    #   2. For _ in range(num_tests):
-    #          success, info = self.optimize_given_conditions(conditions, ...)
-    #          Record success, info.
-    #          If success and interrupt_if_successful: break.
-    #   3. Return np.any(successes), list_of_infos, np.where(successes)
-    #
-    # The return format mirrors AutoScatter's repeated_optimization exactly:
-    #   (bool, list_of_info_dicts, np.where_array)
-
+    # Run optimize_given_conditions num_tests times from different random
+    # starts; stop early on success if interrupt_if_successful. Returns
+    # (any_success, list_of_infos, indices_of_successes).
     def repeated_optimization(
         self,
         num_tests: int,
         conditions: list = None,
         triu_array=None,
-        lambda_scale: float = None,
-        u_warm=None,
         verbosity: bool = False,
         max_violation_success: float = 1e-8,
         interrupt_if_successful: bool = True,
         **kwargs_solver,
     ):
-        if lambda_scale is None:
-            lambda_scale = LAMBDA_SCALE_DEFAULT
-
-        # Build the JIT-compiled functions once, reuse across restarts
+        # Build the JIT-compiled loss/grad once, reuse across restarts. NOT
+        # valid when optimize_detunings=True: give_conditions_func_with_conditions's
+        # loss_fn never applies the per-mode detuning rotation to A (that
+        # logic only exists in optimize_given_conditions's own inline
+        # loss_fn), so reusing it here would silently make the detuning
+        # variables dead weight (zero gradient, no effect) instead of
+        # actually searching over them. Fall back to rebuilding loss/grad
+        # fresh each restart in that case — slower (no JIT reuse) but correct.
         from reservoir_engineering.topology_search import translate_triu_to_conditions
-        if conditions is not None:
+        optimize_detunings = kwargs_solver.get('optimize_detunings', False)
+        if optimize_detunings:
+            calc_cag = None
+        elif conditions is not None:
             calc_cag = self.give_conditions_func_with_conditions(conditions)
         elif triu_array is not None:
             conds = translate_triu_to_conditions(triu_array, self.node_types)
@@ -1393,8 +942,6 @@ class CovarianceOptimizer:
             success, info = self.optimize_given_conditions(
                 conditions=conditions,
                 triu_array=triu_array,
-                lambda_scale=lambda_scale,
-                u_warm=u_warm,
                 verbosity=verbosity,
                 max_violation_success=max_violation_success,
                 calc_conditions_and_gradients=calc_cag,
@@ -1407,28 +954,9 @@ class CovarianceOptimizer:
 
         return bool(np.any(successes)), infos, np.where(successes)
 
-    # -----------------------------------------------------------------------
-    # check_all_constraints(A, loss) → triu_array
-    # -----------------------------------------------------------------------
-    # MIRRORS: check_all_constraints(coupling_matrix, kappa_int_matrix, max_violation)
-    #          in Architecture_Optimizer  (EXACT analogue)
-    #
-    # After finding a solution for the fully-connected graph, discover which
-    # architectural constraints are "accidentally" satisfied (nearly zero).
-    # This reveals the MINIMAL topology that the solution actually uses.
-    #
-    # For each constraint c in self.all_possible_constraints:
-    #   residual = c(A, sigma)    (from the achieved solution)
-    #   If |residual| < threshold:
-    #       The constraint is satisfied → this edge is effectively absent or constrained.
-    #       Add c to fulfilled_constraints.
-    #
-    # Convert fulfilled_constraints back to a triu_array.
-    # This is the minimal topology that should be re-optimised and stored.
-    #
-    # AutoScatter uses this to reduce discovered solutions to their minimal
-    # topology. Same role here: find the sparsest graph that actually works.
-
+    # After solving the fully-connected graph, read off which constraints
+    # are "accidentally" satisfied (block ~ 0/pure-BS/pure-TMS) to recover
+    # the minimal topology the solution actually uses.
     def check_all_constraints(self, A, sigma, threshold=None) -> np.ndarray:
         from reservoir_engineering.constraints import (
             Constraint_coupling_absent,
@@ -1449,13 +977,11 @@ class CovarianceOptimizer:
 
         for k, (i, j) in enumerate(zip(rows, cols)):
             if i == j:
-                # Parametric drive shifts x and p decay rates differently.
-                # Without parametric: A[2i,2i] == A[2i+1,2i+1] (both = -decay/2).
-                # With parametric g: A[2i,2i] = -decay/2+g, A[2i+1,2i+1] = -decay/2-g.
+                # Parametric drive splits x/p decay rates: without it
+                # A[2i,2i]==A[2i+1,2i+1] (both -decay/2); with it they differ.
                 diag_diff = abs(float(A_jnp[2*i, 2*i]) - float(A_jnp[2*i+1, 2*i+1]))
                 triu[k] = PARAMETRIC if diag_diff > threshold else NO_COUPLING
             else:
-                # Off-diagonal: check whether block is zero (absent), pure BS, pure TMS, or both
                 bs_c  = Constraint_coupling_beamsplitter(i, j)
                 tms_c = Constraint_coupling_two_mode_squeezing(i, j)
                 absent_c = Constraint_coupling_absent(i, j)
@@ -1465,122 +991,55 @@ class CovarianceOptimizer:
                 if abs(absent_val) < threshold:
                     triu[k] = NO_COUPLING
                 elif abs(bs_residual) < threshold:
-                    # symmetric part ≈ 0 → no TMS component → pure BS
                     triu[k] = BEAMSPLITTER
                 elif abs(tms_residual) < threshold:
-                    # antisymmetric part ≈ 0 → no BS component → pure TMS
                     triu[k] = TWO_MODE_SQUEEZING
                 else:
                     triu[k] = BEAMSPLITTER_AND_TWO_MODE_SQUEEZING
 
         return triu
 
-    # -----------------------------------------------------------------------
-    # prepare_all_possible_combinations()
-    # -----------------------------------------------------------------------
-    # MIRRORS: prepare_all_possible_combinations() in Architecture_Optimizer
-    #          (EXACT analogue — populates self.list_of_triu_arrays,
-    #           self.complexity_levels, self.unique_complexity_levels)
-    #
-    # Enumerate ALL possible topologies for the N-mode system.
-    # Uses itertools.product over the possible edge types for each upper-triangle slot.
-    #
-    # For each upper-triangle entry (i, j):
-    #   If Constraint_coupling_absent(i,j) in self.enforced_constraints:
-    #       allowed_entries = [NO_COUPLING]   ← cannot have this edge
-    #   Elif i == j:
-    #       allowed_entries = [NO_COUPLING, PARAMETRIC]
-    #   Else:
-    #       allowed_entries = [NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
-    #                          BEAMSPLITTER_AND_TWO_MODE_SQUEEZING]
-    #       Four off-diagonal choices. BEAMSPLITTER_AND_TWO_MODE_SQUEEZING(4)
-    #       represents both drives simultaneously (e.g. Kronwald topology).
-    #
-    # Compute:
-    #   self.possible_entry_lists   = list of allowed_entries per slot
-    #   self.list_of_triu_arrays    = list of all possible triu_arrays (all combinations)
-    #   self.complexity_levels      = sum(triu_array) for each
-    #   self.unique_complexity_levels = sorted unique complexity values
-    #   self.num_possible_graphs    = len(list_of_triu_arrays)
-    #
-    # For N=2 modes (1 cavity + 1 mechanical): 3 off-diagonal choices × 2 diagonal choices
-    # × 2 diagonal choices = 3 × 4 = 12 possible topologies. Manageable.
-    # For N=3: 3³ × 2² × 2 = 27 × 4 × 2 = 216. Still tractable with BFS pruning.
-    # For N=4: 3^6 × 2^4 = 729 × 16 = 11664. Expensive but feasible.
-    #
-    # This method is the SAME ALGORITHM as AutoScatter's prepare_all_possible_combinations
-    # which uses itertools.product over possible coupling matrix entries.
-
+    # Enumerate every possible topology for the N-mode system (itertools
+    # product over each slot's allowed values: {0} if forced absent, {0,3}
+    # on the diagonal, {0,1,2,4} off-diagonal). Populates
+    # list_of_triu_arrays/complexity_levels/unique_complexity_levels — the
+    # search space the BFS walks low->high complexity.
     def prepare_all_possible_combinations(self):
         from reservoir_engineering.constraints import Constraint_coupling_absent
         from reservoir_engineering.topology_search import (
             NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
             PARAMETRIC, BEAMSPLITTER_AND_TWO_MODE_SQUEEZING)
-        
-        # For each edge slot (i,j) -> checks what are the valid entries
-        # Example: 
-        # slot (0,0): [0, 3]
-        # slot (0,1): [0, 1, 2, 4]
-        # slot (1,1): [0, 3]
-        
+
         possible_entry_lists = []
         for i, j in self.all_possible_edges:
-            # Check if there are any prior edges that are absent
             forced_absent = any(
                 isinstance(c, Constraint_coupling_absent) and
                 c.idxs == [min(i, j), max(i, j)]
                 for c in self.enforced_constraints)
-            
-            # if the prior edges are specified to be absent
+
             if forced_absent:
                 possible_entry_lists.append([NO_COUPLING])
-            # If edges present + digonal terms
             elif i == j:
                 possible_entry_lists.append([NO_COUPLING, PARAMETRIC])
-            # If edges present + off-diagonal terms
             else:
                 possible_entry_lists.append([
                     NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING,
                     BEAMSPLITTER_AND_TWO_MODE_SQUEEZING])
 
         self.possible_entry_lists = possible_entry_lists
-        
-        # Generated every combination of one value per slot 
+
         self.list_of_triu_arrays = [
             np.array(combo, dtype=np.int8)
             for combo in itertools_product(*possible_entry_lists)]
-        
-        # Calculate the complexity of the graph
+
         self.complexity_levels = [int(np.sum(t)) for t in self.list_of_triu_arrays]
         self.unique_complexity_levels = sorted(set(self.complexity_levels))
-        
+
         self.num_possible_graphs = len(self.list_of_triu_arrays)
 
-    # -----------------------------------------------------------------------
-    # identify_potential_combinations(complexity_level,
-    #                                  skip_check_for_valid_subgraphs=False)
-    # -----------------------------------------------------------------------
-    # MIRRORS: identify_potential_combinations in Architecture_Optimizer  (EXACT)
-    #
-    # Filter the full list of topologies at a given complexity level to only
-    # those worth testing (the "potential combinations").
-    #
-    # A topology is a potential combination if:
-    #   cond1: it is NOT a subgraph of any INVALID combination discovered so far.
-    #          (If a simpler graph failed, this more complex one would also fail.)
-    #          check_if_subgraph_triu(self.invalid_combinations, triu_array)
-    #   cond2: no VALID combination is a subgraph of it.
-    #          (A simpler valid graph already exists — this one is redundant.)
-    #          check_if_subgraph_triu(triu_array, self.valid_combinations)
-    #
-    # These two pruning rules are IDENTICAL to AutoScatter's:
-    #   cond1: not check_if_subgraph_upper_triangle(invalid_combos, combo)
-    #   cond2: not check_if_subgraph_upper_triangle(combo, valid_combos)
-    #
-    # This is the key efficiency win: most topologies are pruned before testing.
-    # The BFS visits topologies in order of increasing complexity, so valid
-    # simple topologies prune large parts of the search space at higher complexity.
-
+    # Filter to topologies at complexity_level worth testing: not a
+    # supergraph of a known invalid (would also fail) and not already
+    # covered by a known valid subgraph (redundant). The key BFS speedup.
     def identify_potential_combinations(
         self,
         complexity_level: int,
@@ -1592,86 +1051,20 @@ class CovarianceOptimizer:
         for triu, c in zip(self.list_of_triu_arrays, self.complexity_levels):
             if c != complexity_level:
                 continue
-            # Skip if this triu is a superset of a known invalid
             if self.invalid_combinations:
                 if check_if_subgraph_triu([triu], self.invalid_combinations):
                     continue
-            # Skip if a known valid is already a subgraph of this triu (redundant)
             if not skip_check_for_valid_subgraphs and self.valid_combinations:
                 if check_if_subgraph_triu([triu], self.valid_combinations):
                     continue
             potential.append(triu)
         return potential
 
-    # -----------------------------------------------------------------------
-    # find_valid_combinations(complexity_level, combinations_to_test=None,
-    #                          perform_graph_reduction=True)
-    # -----------------------------------------------------------------------
-    # MIRRORS: find_valid_combinations(complexity_level, ...) in Architecture_Optimizer
-    #          (EXACT analogue, EXTENDED with 3-stage pipeline)
-    #
-    # Test all candidate topologies at a given complexity level.
-    # Runs the THREE-STAGE ALGORITHM (Stage 1→2→3) for each candidate.
-    #
-    # Parameters:
-    #   complexity_level          : int — which layer of the BFS to test
-    #   combinations_to_test      : optional override list (instead of identify_potential)
-    #   perform_graph_reduction   : if True, run check_all_constraints on each
-    #                               successful Stage 3 solution to find its minimal topology.
-    #
-    # Steps (3-stage extension of AutoScatter's find_valid_combinations):
-    #
-    #   potential = identify_potential_combinations(complexity_level)
-    #   For each triu_array in potential:
-    #
-    #       ── STAGE 1: Stability at unit cooperativity ────────────────────
-    #       stable = check_stability_unit_cooperativity(triu_array)
-    #       If not stable:
-    #           continue   ← skip silently. DO NOT add to invalid_combinations.
-    #           Reason: a supergraph (more edges) can be stable even if this
-    #           topology is not. Adding to invalid_combinations would prune
-    #           valid supersets (e.g., TMS-only unstable → would prune BS+TMS).
-    #
-    #       ── STAGE 2: Convergence test (DISABLED in prototype) ────────────
-    #       # u_warm, stage2_ok = check_convergence(triu_array)
-    #       # In prototype: check_convergence always returns (None, True).
-    #       # u_warm = None → Stage 3 starts from random initialisation.
-    #       # No pruning based on convergence in the prototype.
-    #       u_warm, stage2_ok = check_convergence(triu_array)   # returns (None, True)
-    #       # stage2_ok is always True in prototype — no topology is pruned here.
-    #
-    #       ── STAGE 3: Optimise log coupling ratios ────────────────────────
-    #       conditions = translate_triu_to_conditions(triu_array)
-    #       If check_if_subgraph_triu(triu_array, newly_added_combos): skip
-    #       success, all_infos, _ = repeated_optimization(
-    #           conditions=conditions, lambda_scale=LAMBDA_SCALE_DEFAULT,
-    #           u_warm=u_warm, ...)
-    #
-    #       If success:
-    #           If perform_graph_reduction:
-    #               minimal_triu = check_all_constraints(all_infos[-1]['A'], ...)
-    #           Else:
-    #               minimal_triu = triu_array
-    #           self.valid_combinations.append(minimal_triu)
-    #           Store best_info (coupling_ratios, betas, cooperativities, etc.)
-    #           newly_added_combos.append(minimal_triu)
-    #       Else:
-    #           self.invalid_combinations.append(triu_array)
-    #
-    #   Update counters (num_tested_graphs, num_tested_invalid_graphs, etc.)
-    #
-    # Key extension over AutoScatter:
-    #   AutoScatter's find_valid_combinations goes directly from topology → optimizer.
-    #   Here, Stages 1 and 2 are added BEFORE the optimizer call.
-    #   Stage 1 and Stage 2 can prune topologies without any gradient computation,
-    #   making the BFS substantially faster for large topology searches.
-    #
-    # Note on Stage 2 results storage:
-    #   self.valid_combinations stores (triu_array, betas) pairs so that the
-    #   scaling exponents are preserved alongside each valid topology.
-    #   This differs from AutoScatter which stores only triu_arrays.
-
-    # == Takes the canidate graphs and see which ones are valid == 
+    # Run Stage 1->2 on every candidate at complexity_level. Stage 1
+    # failures are NOT added to invalid_combinations (see class docstring —
+    # a supergraph can add stabilising edges); only a Stage-2 success is
+    # recorded as valid (optionally reduced to its minimal topology via
+    # check_all_constraints).
     def find_valid_combinations(
         self,
         complexity_level: int,
@@ -1690,43 +1083,21 @@ class CovarianceOptimizer:
 
         for triu_array in combinations_to_test:
 
-            # STAGE 1: stability at unit cooperativity (fast filter, no gradient)
             if not self.check_stability_unit_cooperativity(triu_array):
-                num_skipped += 1
-                continue  # DO NOT add to invalid_combinations
-
-            # STAGE 2: convergence test — short multi-scale optimisation
-            u_warm, stage2_ok = self.check_convergence(
-                triu_array,
-                loss_threshold=self.kwargs_optimization.get('stage2_loss_threshold'),
-            )
-            if not stage2_ok:
-                # Do NOT add to invalid_combinations.
-                # Reason: the integer subgraph comparison (triu[k] ≤ triu'[k]) does
-                # not preserve physical validity across coupling types.  BS (1) failing
-                # does NOT imply BS+TMS (4) fails — TMS adds qualitatively new physics.
-                # Adding a Stage-2 failure to invalid_combinations would cause
-                # identify_potential_combinations to prune BS+TMS as a "superset of
-                # the invalid BS topology", which is wrong.
-                # Stage 2 here acts as a speed filter (skip Stage 3 for obvious
-                # failures) and warm-start provider only — not a structural prune.
                 num_skipped += 1
                 continue
 
-            # Skip if a newly-found valid is already a subgraph of this triu
             if newly_added and check_if_subgraph_triu([triu_array], newly_added):
                 num_skipped += 1
                 continue
 
-            # STAGE 3: gradient optimisation of log coupling ratios
             conditions = translate_triu_to_conditions(triu_array, self.node_types)
             success, infos, _ = self.repeated_optimization(
                 num_tests=self.kwargs_optimization['num_tests'],
                 conditions=conditions,
-                lambda_scale=LAMBDA_SCALE_DEFAULT,
-                u_warm=u_warm,
                 max_violation_success=self.kwargs_optimization['max_violation_success'],
                 interrupt_if_successful=self.kwargs_optimization['interrupt_if_successful'],
+                optimize_detunings=self.kwargs_optimization['optimize_detunings'],
             )
             num_tested += 1
 
@@ -1743,41 +1114,22 @@ class CovarianceOptimizer:
                 self.valid_combinations.append(minimal_triu)
                 self.best_info_list.append(best_info)
                 newly_added.append(minimal_triu)
-            # NOTE: Stage 3 failures are NOT added to invalid_combinations.
-            # Reason: without Stage 2, a topology that fails (e.g. BS-only can't squeeze)
-            # does NOT imply its supersets fail (BS+TMS = Kronwald CAN squeeze).
-            # Only Stage 2 failures are structural and safe to prune transitively.
+            # Stage 2 failures are NOT added to invalid_combinations either:
+            # a simpler failing topology doesn't imply its supersets fail
+            # (BS-only can't squeeze, but BS+TMS/Kronwald can).
 
         self.tested_complexities.append(complexity_level)
         self.num_tested_graphs.append(num_tested)
         self.num_tested_invalid_graphs.append(num_skipped)
- 
-    # -----------------------------------------------------------------------
-    # cleanup_valid_combinations()
-    # -----------------------------------------------------------------------
-    # MIRRORS: cleanup_valid_combinations() in Architecture_Optimizer  (EXACT)
-    #
-    # Remove REDUNDANT valid combinations from self.valid_combinations.
-    # A combination is redundant if another valid combination is a subgraph of it
-    # (the simpler graph is sufficient — no need to keep the complex one).
-    #
-    # Algorithm:
-    #   Deduplicate valid_combinations (np.unique on triu arrays).
-    #   For each valid_combo in deduplicated list:
-    #       Check if any OTHER valid combo is a subgraph of valid_combo.
-    #       If yes: valid_combo is redundant → remove it.
-    #   Keep only irreducible (minimal) valid combinations.
-    #
-    # Called after each find_valid_combinations to keep the valid list clean.
-    # Mirrors AutoScatter's cleanup_valid_combinations exactly.
 
+    # Drop redundant valid_combinations — any topology that has another
+    # valid topology as a subgraph is superseded by the simpler one.
     def cleanup_valid_combinations(self):
         from reservoir_engineering.topology_search import check_if_subgraph_triu
 
         if not self.valid_combinations:
             return
 
-        # Deduplicate 
         seen = set()
         unique = []
         for t in self.valid_combinations:
@@ -1786,55 +1138,20 @@ class CovarianceOptimizer:
                 seen.add(key)
                 unique.append(t)
 
-        # Remove any triu that has a simpler valid triu as a subgraph (redundant)
         kept = []
         for i, t in enumerate(unique):
             others = unique[:i] + unique[i + 1:]
             if others and check_if_subgraph_triu([t], others):
-                continue  # a simpler valid topology is contained in t → discard t
+                continue
             kept.append(t)
 
         self.valid_combinations = kept
 
-    # -----------------------------------------------------------------------
-    # perform_breadth_first_search() → np.ndarray of valid triu_arrays
-    # -----------------------------------------------------------------------
-    # MIRRORS: perform_breadth_first_search() in Architecture_Optimizer  (EXACT)
-    #
-    # THE MAIN OUTER LOOP — discovers all minimal valid topologies.
-    #
-    # Algorithm:
-    #   1. prepare_all_possible_combinations()
-    #      Print: '%i graphs identified' % num_possible_graphs
-    #   2. For c in self.unique_complexity_levels  (ascending order):
-    #          Print: 'test all graphs with %i degrees of freedom' % c
-    #          find_valid_combinations(c)
-    #          cleanup_valid_combinations()
-    #   3. Return np.array(self.valid_combinations, dtype=int8)
-
-    # ========================================================================
-    # Algorithm: 
-
-    # prepare_all_possible_combinations()
-    # complexity 0 → find_valid_combinations → cleanup
-    # complexity 1 → find_valid_combinations → cleanup
-    # complexity 2 → find_valid_combinations → cleanup   ← Kronwald found here
-    # complexity 3 → find_valid_combinations → cleanup   ← pruned by Kronwald
-
-    # => output is a list of combinations from least complex to most complex
-
-    # =========================================================================
-
-    # This is IDENTICAL to AutoScatter's perform_breadth_first_search.
-    # The outer loop iterates over complexity levels (sparse → dense).
-    # Pruning rules in identify_potential_combinations make it tractable.
-    #
-    # For the Kronwald validation case (N=2, 1 cavity + 1 mechanical):
-    #   Expected: exactly ONE valid minimal topology found at complexity 3
-    #   (1×BEAMSPLITTER + 1×TWO_MODE_SQUEEZING = complexity 1+2=3).
-    #   The algorithm must NOT find valid topologies at lower complexities
-    #   (complexity 1 or 2) because neither BS alone nor TMS alone works.
-
+    # The main outer loop: enumerate all topologies, then walk complexity
+    # levels low->high running find_valid_combinations + cleanup at each.
+    # For Kronwald (1 cavity + 1 mechanical): expect exactly one valid
+    # minimal topology, at complexity 3 (BS+TMS) — neither BS alone nor TMS
+    # alone should succeed at lower complexity.
     def perform_breadth_first_search(self) -> np.ndarray:
         self.prepare_all_possible_combinations()
         print(f'{self.num_possible_graphs} graphs identified')
@@ -1848,114 +1165,23 @@ class CovarianceOptimizer:
 
         if self.valid_combinations:
             return np.array(self.valid_combinations, dtype=np.int8)
-        return np.array([], dtype=np.int8) 
+        return np.array([], dtype=np.int8)
 
-    # -----------------------------------------------------------------------
-    # count_valid_invalid_graphs_layers() → (complexities, valid_counts, invalid_counts)
-    # -----------------------------------------------------------------------
-    # MIRRORS: count_valid_invalid_graphs_layers() in Architecture_Optimizer
-    #
-    # ============ Example output ===========
-    # complexities  = [0, 1, 2, 3, 4, 5, 6, 7]
-    # valid_counts  = [0, 0, 0, 1, 0, 0, 0, 0]
-    # invalid_counts= [0, 1, 2, 0, 0, 0, 0, 0]
-    # =======================================
-    # 
-    # Used for plotting the "landscape" of the search space.
-    # Returns arrays of counts per complexity level, for analysis.py to plot.
-
-    # == Count how many valid/invalid graphs exist at each complexity level == 
+    # Valid/invalid topology counts per complexity level, for analysis.py's
+    # search-space plots.
     def count_valid_invalid_graphs_layers(self):
-
         complexities = getattr(self, 'unique_complexity_levels', [])
         valid_counts = [
             sum(1 for t in self.valid_combinations if int(np.sum(t)) == c)
             for c in complexities]
-         
+
         invalid_counts = [
             sum(1 for t in self.invalid_combinations if int(np.sum(t)) == c)
             for c in complexities]
-        
+
         return complexities, valid_counts, invalid_counts
 
-    # -----------------------------------------------------------------------
-    # extract_cooperativities(conditions, solution_log_ratios, lambda_scale=None) → dict
-    # -----------------------------------------------------------------------
-    # MIRRORS: extract_cooperativities_and_human_defined_parameters(conditions, solution_dict)
-    #          in Architecture_Optimizer  (EXACT analogue)
-    #
-    # Compute and report all physically relevant quantities for the solution.
-    # Accepts LOG coupling ratios u_k (Stage 3 raw output) and converts to
-    # physical quantities.
-    #
-    # Parameters:
-    #   conditions          : list of constraint objects (defines which edges are active)
-    #   solution_log_ratios : np.ndarray (E_free,), u_k = log(C̃_k) per free edge
-    #   lambda_scale        : float, the λ used in Stage 3 (default LAMBDA_SCALE_DEFAULT)
-    #
-    # Returns:
-    #   dict with the following keys per active edge (i, j):
-    #     'u_{i,j}'     : float — log ratio u_k (raw Stage 3 output)
-    #     'C̃_{i,j}'    : float — dimensionless ratio C̃_k = exp(u_k)
-    #     'C_{i,j}'     : float — actual cooperativity C_k = λ · C̃_k
-    #     'g_{i,j}'     : float — physical coupling g_k = sqrt(C_k · decay_i · decay_j / 4)
-    #     'formula'     : str — 'g = sqrt(λ · exp(u) · decay_i · decay_j / 4)'
-    #
-    # For the Kronwald scheme:
-    #   C̃_g = exp(u_BS),  C̃_ν = exp(u_TMS)
-    #   C_g = λ · C̃_g,   C_ν = λ · C̃_ν   (both large at λ=1000)
-    #   squeezing r = atanh(sqrt(C̃_ν / C̃_g))  ← ratio is λ-independent
-    #   g = sqrt(λ · C̃_g · κ · γ / 4)          ← physical coupling for given κ, γ
-    #
-    # AutoScatter uses:  C_{i,j} = 4 * |g_{i,j}|²  (κ_ext normalised to 1).
-    # Here:              C_{i,j} = λ · C̃_i = λ · exp(u_i).
-
-    def extract_cooperativities(
-        self,
-        conditions: list,
-        solution_log_ratios,
-        lambda_scale=None,
-    ) -> dict:
-        from reservoir_engineering.topology_search import translate_conditions_to_triu, TopologyGraph
-
-        if lambda_scale is None:
-            lambda_scale = LAMBDA_SCALE_DEFAULT
-
-        triu_array = translate_conditions_to_triu(conditions, self.num_modes, self.node_types)
-        default_kappa = next((n['kappa'] for n in self.nodes if n['type'] == 'cavity'), 1.0)
-        default_gamma = next((n['gamma'] for n in self.nodes if n['type'] == 'mechanical'), 0.01)
-        nodes, edges = TopologyGraph(self.node_types, triu_array).to_nodes_edges_dicts(
-            default_kappa=default_kappa, default_gamma=default_gamma)
-
-        result = {}
-        for k, edge in enumerate(edges):
-            ni, nj = nodes[edge['i']], nodes[edge['j']]
-            di = ni.get('kappa', ni.get('gamma'))
-            dj = nj.get('kappa', nj.get('gamma'))
-            u_k = float(solution_log_ratios[k])
-            C_tilde = float(np.exp(u_k))
-            C_k = lambda_scale * C_tilde
-            g_k = float(np.sqrt(max(C_k * di * dj / 4., 0.)))
-            label = f"({edge['i']},{edge['j']},{edge['type'][:3]})"
-            result[f'u_{label}']  = u_k
-            result[f'C~_{label}'] = C_tilde
-            result[f'C_{label}']  = C_k
-            result[f'g_{label}']  = g_k
-        result['formula'] = 'g_k = sqrt(lambda * C~_k * decay_i * decay_j / 4)'
-        return result
-
-    # -----------------------------------------------------------------------
-    # dict_extract_relevant_information(solution_cs, conditions) → dict
-    # -----------------------------------------------------------------------
-    # MIRRORS: dict_extract_relevant_information in Architecture_Optimizer
-    #
-    # Build a human-readable dict of the solution:
-    #   {edge_label: coupling_strength}
-    # for all FREE (non-absent) edges.
-    # edge_label format: 'g_{i,j}' for BS, 'nu_{i,j}' for TMS.
-    #
-    # Called inside optimize_given_conditions to build solution_dict.
-
+    # {edge_label: coupling_strength} dict for the free edges in conditions.
     def dict_extract_relevant_information(self, solution_cs, conditions: list) -> dict:
         free_idxs = self.give_free_variable_idxs(conditions)
         result = {}

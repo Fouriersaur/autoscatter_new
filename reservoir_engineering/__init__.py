@@ -2,225 +2,164 @@
 reservoir_engineering
 =====================
 Automated discovery of dissipative quantum state engineering topologies.
-
 MIRRORS: autoscatter/__init__.py in structure and philosophy.
 
 AutoScatter targets a SCATTERING MATRIX (S-matrix, frequency domain) via
-input-output theory.  This package targets a COVARIANCE MATRIX (σ, time
-domain) via the Lyapunov equation.  The pipeline is otherwise identical.
+input-output theory. This package targets a COVARIANCE MATRIX (sigma, time
+domain) via the Lyapunov equation. The pipeline is otherwise identical.
 
-═══════════════════════════════════════════════════════════════════════════════
-FILE STRUCTURE  (mirrors autoscatter/ file-by-file)
-═══════════════════════════════════════════════════════════════════════════════
+File structure (mirrors autoscatter/ file-by-file):
+  scattering.py            -> covariance_physics.py   (S-matrix -> Lyapunov A sigma+sigma A^T+D=0)
+  constraints.py            -> constraints.py           (same two-level constraint hierarchy)
+  architecture.py            -> topology_search.py       (triu encoding, subgraph checks, TopologyGraph)
+  architecture_optimizer.py -> covariance_optimizer.py  (Architecture_Optimizer -> CovarianceOptimizer)
+  symbolic.py / jax_functions.py -> not needed (real quadrature basis, no sympy)
+  (no analogue)              -> targets.py               (standard target covariances + §6 functionals)
+  (no analogue)              -> benchmarks.py             (Kronwald/Wang-Clerk/Woolley-Clerk/... schemes)
+  (partial analogue)         -> analysis.py               (visualisation/analysis tools)
+  (no analogue)               -> gaussian_states.py        (Siegel matrix, dark-state kernel, Approach-A ceiling)
 
-autoscatter/                    reservoir_engineering/
-────────────────────────────    ────────────────────────────────────────────
-scattering.py                → covariance_physics.py
-  S-matrix via input-output      σ-matrix via Lyapunov equation
-  S = I + (-iH - κ/2)⁻¹         Aσ + σAᵀ + D = 0
+Typical workflow:
+  1. Define target state             — targets.py (e.g. squeezed_vacuum(r=1.0))
+  2. Find minimum auxiliary modes     — find_minimum_number_auxiliary_modes(...)
+  3. Run breadth-first topology search — optimizer.perform_breadth_first_search()
+       (per candidate: Stage 1 stability filter, Stage 2 gradient
+        optimisation of the (G-tilde,C-tilde) coupling ratios — see
+        covariance_optimizer.py's module docstring for the full two-stage
+        algorithm)
+  4. Inspect results                  — constraints.plot_graph, analysis.py tools
+  5. Validate against known benchmarks — benchmarks.run_benchmark('kronwald', ...)
+  6. Apply to unknown targets          — e.g. targets.cluster_state(...)
 
-constraints.py               → constraints.py
-  Constraint_coupling_zero       Constraint_coupling_absent
-  Constraint_coupling_phase_zero Constraint_coupling_beamsplitter
-  MinimalAddedInputNoise         Constraint_stability
-  MinimalAddedOutputNoise        Constraint_physical_state
-  plot_graph                     plot_graph (same API)
+Key differences from AutoScatter: couplings are real, not complex (real
+quadrature basis has no phase degree of freedom, so fewer optimisation
+variables and no gauge-phase optimisation — sigma is gauge-invariant);
+stability isn't automatic (TMS edges can destabilise A, unlike AutoScatter's
+always-stable passive systems); sigma_target is for SIGNAL modes while
+AutoScatter's S-matrix is for port modes (auxiliary modes are the
+dissipative resource here, hidden ports there).
 
-architecture.py              → topology_search.py
-  triu_matrix encoding           triu_array encoding (NO_COUPLING=0,
-  NO_COUPLING=0                    BEAMSPLITTER=1,
-  COUPLING_WITHOUT_PHASE=1         TWO_MODE_SQUEEZING=2,
-  COUPLING_WITH_PHASE=2            PARAMETRIC=3)
-  find_min_number_of_pumps       find_min_number_pump_tones
-  check_if_subgraph_upper_tri    check_if_subgraph_triu
-  Architecture class             TopologyGraph class
-
-architecture_optimizer.py    → covariance_optimizer.py
-  Architecture_Optimizer         CovarianceOptimizer
-  S_target (sympy Matrix)        sigma_target (numpy array)
-  mode_types (list of bool)      node_types (list of str)
-  gabs, gphases, Deltas          coupling_strengths (real array, no phases)
-  gauge phases                   (none — σ is gauge-invariant)
-  C_{i,j} = 4|g_{i,j}|²         C_{i,j} = 4g_{i,j}²/(κ_i·κ_j)
-  perform_breadth_first_search   perform_breadth_first_search (same algorithm)
-
-symbolic.py                  → (not needed — real quadrature basis, no sympy)
-jax_functions.py             → (absorbed in covariance_physics.py)
-
-─── no AutoScatter analogue ─   targets.py
-                                  Standard target covariances
-                                  (squeezed_vacuum, two_mode_squeezed, cluster_state...)
-
-─── no AutoScatter analogue ─   benchmarks.py
-                                  Known schemes for validation:
-                                  Kronwald, Wang-Clerk, Woolley-Clerk,
-                                  three-mode cluster, etc.
-
-─── partial analogue ────────   analysis.py
-  (visualization in constraints.py)  Extended visualization + analysis tools
-
-═══════════════════════════════════════════════════════════════════════════════
-TYPICAL WORKFLOW
-═══════════════════════════════════════════════════════════════════════════════
-
-Step 1 — Define target state (targets.py):
-    from reservoir_engineering.targets import squeezed_vacuum
-    sigma_target = squeezed_vacuum(r=1.0)
-
-Step 2 — Find minimum auxiliary modes (covariance_optimizer.py):
-    from reservoir_engineering.covariance_optimizer import find_minimum_number_auxiliary_modes
-    optimizer = find_minimum_number_auxiliary_modes(
-        sigma_target       = sigma_target,
-        target_mode_ids    = [0],           # mechanical mode is signal
-        node_types_signal  = ['mechanical'],
-        start_value=0, max_value=3,
-    )
-    # Discovers: 1 auxiliary cavity is needed (Kronwald topology)
-
-Step 3 — Run breadth-first topology search (covariance_optimizer.py):
-    valid_topologies = optimizer.perform_breadth_first_search()
-    # For EACH candidate topology the BFS runs THREE internal stages:
-    #
-    # STAGE 1 — Stability at unit cooperativity (fast, no gradient):
-    #     Build A from H with all C_{ij}=1 (g_{ij} = sqrt(decay_i·decay_j/4)).
-    #     A is the real 2N×2N "coupling matrix" derived from H via quantum
-    #     Langevin equations.  Discard if any Re(eigenvalue of A) ≥ 0.
-    #
-    # STAGE 2 — Find scaling exponents {β_i} (combinatorial, no gradient):
-    #     Set C_i = λ^{β_i}, rebuild A from H at λ=10,100,1000, test V_system
-    #     convergence.  Search β_i ∈ {0.5,1,2} per edge.  Discard if none converge.
-    #     Kronwald expected result: β_g = β_ν = 1 (same-scaling passes first).
-    #
-    # STAGE 3 — Optimise coupling ratios {C̃_i} at fixed λ=1000 (gradient):
-    #     Rebuild A from H at each step: g_k = sqrt(λ^{β_k}·C̃_k·decay_i·decay_j/4).
-    #     Minimise ½‖V_system − V_target‖²_F over C̃_i > 0 using L-BFGS-B + JAX.
-    #     Actual cooperativity: C_i = λ^{β_i} · C̃_i.
-    #     Physical coupling: g_i = sqrt(λ^{β_i} · C̃_i · decay_i · decay_j / 4).
-    #
-    # Final output per valid topology:
-    #     topology (graph), scaling_exponents {β_i}, coupling_ratios {C̃_i}, λ=1000
-
-Step 4 — Inspect results (constraints.py, analysis.py):
-    from reservoir_engineering.constraints import plot_graph
-    from reservoir_engineering.analysis import (compare_covariance,
-        summarise_search_results, plot_scaling_exponents, plot_cooperativity_ratios)
-    plot_graph(...)
-    plot_scaling_exponents(best_info)      # Stage 2 output: β_i per edge
-    plot_cooperativity_ratios(best_info)   # Stage 3 output: C̃_i per edge
-    summarise_search_results(valid_topologies)
-
-Step 5 — Validate against known benchmarks (benchmarks.py):
-    from reservoir_engineering.benchmarks import run_benchmark
-    results = run_benchmark('kronwald', r_or_param=1.0)
-    print_benchmark_summary(results)
-
-Step 6 — Apply to unknown targets (cluster states):
-    from reservoir_engineering.targets import cluster_state
-    sigma_cluster = cluster_state(n_modes=3, delta=0.3)
-    # Run the same pipeline — discovers the topology for you
-
-═══════════════════════════════════════════════════════════════════════════════
-KEY DIFFERENCE FROM AUTOSCATTER
-═══════════════════════════════════════════════════════════════════════════════
-
-AutoScatter optimises COMPLEX coupling strengths (|g| and phase arg(g)).
-Here, all coupling strengths are REAL (no phase degree of freedom in the
-real quadrature basis). This means:
-  • Fewer optimisation variables per edge (one real number, not two).
-  • No gauge-phase optimisation needed.
-  • The cooperativity C_{i,j} = 4g²/(κ_i·κ_j) is purely real.
-
-AutoScatter targets the S-matrix for PORT modes only; auxiliary modes are
-hidden. Here, sigma_target is for SIGNAL modes (e.g. mechanical modes);
-auxiliary modes (cavities) are the dissipative resource.
+Alignment with gaussian_autoscatter_algorithm.md:
+  §2.1 target predicate {(Q_i, q_i, weight, modes)}
+        -> targets.py: TargetTerm, target_quadratic_form,
+        target_collective_quadrature, target_log_negativity, target_purity;
+        CovarianceOptimizer(target_predicate=[...]) — sigma_target remains
+        supported as the convenience "match every entry at once" case, and
+        may be combined with target_predicate.
+  §1.2 (G,C) machine, A=K+Omega Im(C^dag C), D=Omega Re(C^dag C) Omega^T
+        -> covariance_physics.py: build_hamiltonian_matrix (=K=Omega*G),
+        build_jump_matrix (=C), build_drift_matrix_from_GC, build_diffusion_matrix_from_C
+  §1.3/§1.4 Siegel matrix Z, dark-state kernel, Approach-A ceiling
+        -> gaussian_states.py: sigma_from_siegel, dark_state_nullifiers, optimise_state
+  §2.6 constraint registry (structural/domain/soft)
+        -> constraints.py: Base_Constraint.slot, ConstraintRegistry,
+        Constraint_passivity, Constraint_cooperativity_cap
+        -> covariance_optimizer.CovarianceOptimizer(squeezable_aux_ids=[...]):
+        §2.6(b) domain palette declaring which aux cavity nodes MAY use a
+        squeezed (Bogoliubov) bath instead of plain vacuum; the optimizer
+        (not the human) decides whether/how much — see
+        covariance_physics.build_jump_matrix and info_out['bath_squeezing']
+  §3 inner-loop loss (target + stability + optional purity/reg + soft terms)
+        -> covariance_optimizer.py: CovarianceOptimizer(lambda_pure=,
+        lambda_reg=, normalize_targets=), optimize_given_conditions
+  §4 discrete outer loop (enumerate -> test -> prune -> canonicalise -> reduce)
+        -> covariance_optimizer.py: prepare_all_possible_combinations,
+        find_valid_combinations, cleanup_valid_combinations,
+        perform_breadth_first_search; topology_search.canonicalise_by_gauge
+  §2.5 cost metric / ranking -> covariance_optimizer.rank_by_cost
+  §5 full algorithm (ceiling -> for M in M_min..M_max -> rank)
+        -> covariance_optimizer.run_algorithm
+  §6 target-quantity reference -> targets.py (+ covariance_physics.purity_violation)
 """
 
-# ── Physics layer ─────────────────────────────────────────────────────────
-# Mirrors: autoscatter/scattering.py (S-matrix physics)
+# Physics layer — mirrors autoscatter/scattering.py
 from reservoir_engineering.covariance_physics import (
-    build_hamiltonian_matrix,        # H_quad (2N×2N real) — explicit Hamiltonian matrix
-                                     # analogue of AutoScatter's complex N×N coupling matrix H
-                                     # contains ONLY coherent terms (couplings + detunings, no decay)
-    build_drift_matrix,              # A = H_quad + A_decay  (full drift matrix)
-    build_diffusion_matrix,          # build D from nodes (constant, no coupling dependence)
-    solve_lyapunov_kronecker,        # solve Aσ + σAᵀ + D = 0 via Kronecker trick
-    get_mode_covariance,             # extract σ_sub for target modes
-    check_stability,                 # Stage 1: check A is Hurwitz (all Re(λ) < 0)
-    build_drift_matrix_from_ratios,  # Stage 3: A from coupling ratios C̃_i + exponents β_i
-    covariance_loss,                 # ½‖σ_sub - σ_target‖²_F (JAX-differentiable)
-    covariance_loss_from_ratios,     # Stage 3 loss: same but parametrised by C̃_i
+    build_hamiltonian_matrix,        # K = Omega*G, the coherent drift generator (no decay)
+    build_drift_matrix,              # A = K + Omega Im(C^dag C)
+    build_diffusion_matrix,          # D = Omega Re(C^dag C) Omega^T
+    solve_lyapunov_kronecker,        # solve A sigma + sigma A^T + D = 0
+    get_mode_covariance,             # extract sigma_sub for target modes
+    check_stability,                 # Stage 1: is A Hurwitz?
+    build_drift_diffusion_from_GC_tilde,  # §1.5 (G-tilde,C-tilde), works at decay=0
+    covariance_loss,                 # 1/2||sigma_sub - target||_F^2
+    symplectic_form,                 # Omega
+    build_jump_matrix,               # C, the jump-operator matrix (§1.2)
+    build_drift_matrix_from_GC,      # general (G,C) machine (§1.2)
+    build_diffusion_matrix_from_C,   # general (G,C) machine (§1.2)
+    purity_violation,                # optional §3 purity loss term
+    jnp_symplectic_eigenvalues,      # §6 functionals, JAX-differentiable
+    jnp_purity,
+    jnp_log_negativity,
 )
 
-# ── Constraint objects ────────────────────────────────────────────────────
-# Mirrors: autoscatter/constraints.py (constraint objects + graph plotting)
+# Pure-state / Siegel-matrix layer — no AutoScatter analogue (§1.3/§1.4/§5/§7)
+from reservoir_engineering.gaussian_states import (
+    sigma_from_siegel,          # Z=X+iY -> pure-state covariance
+    dark_state_nullifiers,      # ker(sigma+i/2 Omega) -> ideal dissipator directions
+    optimise_state,             # Approach-A state-level ceiling
+)
+
+# Constraint objects — mirrors autoscatter/constraints.py
 from reservoir_engineering.topology_search import (
-    BEAMSPLITTER_AND_TWO_MODE_SQUEEZING, # edge type constant = 4 (both drives on same pair)
+    BEAMSPLITTER_AND_TWO_MODE_SQUEEZING, # edge type 4: both drives on one pair
 )
 from reservoir_engineering.constraints import (
-    NO_COUPLING,                        # edge type constant = 0
-    BEAMSPLITTER,                       # edge type constant = 1
-    TWO_MODE_SQUEEZING,                 # edge type constant = 2
-    PARAMETRIC,                         # edge type constant = 3 (diagonal only)
-    Constraint_coupling_absent,         # mirrors Constraint_coupling_zero
-    Constraint_coupling_beamsplitter,   # mirrors Constraint_coupling_phase_zero
+    NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING, PARAMETRIC,
+    Constraint_coupling_absent,
+    Constraint_coupling_beamsplitter,
     Constraint_coupling_two_mode_squeezing,
-    Constraint_coupling_symmetric,      # enforces equal coupling strengths between two edges
-    Constraint_stability,               # mirrors MinimalAddedInputNoise
-    Constraint_physical_state,          # mirrors MinimalAddedOutputNoise
+    Constraint_coupling_symmetric,      # ties two edges' coupling strengths together
+    Constraint_stability,
+    Constraint_physical_state,
     Constraint_target_squeezing,
     Constraint_entanglement,
-    setup_constraints,                  # mirrors setup_constraints
-    plot_graph,                         # mirrors plot_graph
-    plot_list_of_graphs,                # mirrors plot_list_of_graphs
+    Constraint_passivity,               # §2.6(b) domain: passive-only modes
+    Constraint_cooperativity_cap,       # §2.6(c) soft: hinge penalty on G_tilde_max
+    ConstraintRegistry,                 # §2.6: structural/domain/soft classifier
+    setup_constraints,
+    plot_graph,
+    plot_list_of_graphs,
 )
 
-# ── Graph encoding utilities ──────────────────────────────────────────────
-# Mirrors: autoscatter/architecture.py (graph data structures)
+# Graph encoding utilities — mirrors autoscatter/architecture.py
 from reservoir_engineering.topology_search import (
-    TopologyGraph,                      # mirrors Architecture class
-    triu_to_edge_matrix,                # mirrors triu_to_adjacency_matrix
-    edge_matrix_to_triu,                # mirrors adjacency_to_triu_matrix
-    check_if_subgraph,                  # mirrors check_if_subgraph
-    check_if_subgraph_triu,             # mirrors check_if_subgraph_upper_triangle
-    translate_triu_to_conditions,       # mirrors translate_upper_triangle_coupling_matrix_to_conditions
-    translate_conditions_to_triu,       # mirrors translate_conditions_to_upper_triangle_coupling_matrix
-    characterize_topology,              # mirrors characterize_architecture
-    find_min_number_pump_tones,         # mirrors find_min_number_of_pumps
-    calc_number_of_possibilities,       # mirrors calc_number_of_possibilities
+    TopologyGraph,
+    triu_to_edge_matrix,
+    edge_matrix_to_triu,
+    check_if_subgraph,
+    check_if_subgraph_triu,
+    translate_triu_to_conditions,
+    translate_conditions_to_triu,
+    characterize_topology,
+    find_min_number_pump_tones,
+    calc_number_of_possibilities,
+    canonicalise_by_gauge,              # §4 step 3 / §5: residual gauge quotient
 )
 
-# ── Main optimiser ────────────────────────────────────────────────────────
-# Mirrors: autoscatter/architecture_optimizer.py (Architecture_Optimizer)
+# Main optimiser — mirrors autoscatter/architecture_optimizer.py
 from reservoir_engineering.covariance_optimizer import (
-    CovarianceOptimizer,                    # mirrors Architecture_Optimizer
-    find_minimum_number_auxiliary_modes,    # mirrors find_minimum_number_auxiliary_modes
+    CovarianceOptimizer,
+    find_minimum_number_auxiliary_modes,
+    rank_by_cost,                           # §2.5 cost metric ranking
+    run_algorithm,                          # §5 full-algorithm top-level driver
     AUTODIFF_FORWARD,
     AUTODIFF_REVERSE,
-    LAMBDA_SCALE_DEFAULT,                   # fixed scale λ = 1000 for optimisation
-    # Stage 2 scaling-discovery constants (disabled in prototype — see covariance_optimizer.py):
-    # LAMBDA_VALUES_STAGE2,                 # convergence test scales [10, 100, 1000]
-    # STAGE2_SHORT_OPT_ITER,               # short optimisation iterations per scale (30)
-    # CONVERGENCE_LOSS_THRESHOLD,          # acceptance threshold on L*(λ_max)
+    KAPPA_0_DEFAULT,                        # §1.5 reference rate
+    DIRECT_LOG_BOUND_DEFAULT,
+    SQUEEZE_AB_BOUND_DEFAULT,                # §2.6(b) squeezed-bath palette bound
 )
 
-# ── Target covariance matrices ────────────────────────────────────────────
-# No AutoScatter analogue (target is given by user as S_target sympy matrix)
+# Target covariance matrices — no AutoScatter analogue
 from reservoir_engineering.targets import (
-    squeezed_vacuum,            # ½ diag(e^{-2r}, e^{+2r})
-    two_mode_squeezed,          # EPR / TMSV state
-    vacuum,                     # ½ I (ground state)
-    thermal,                    # (n̄+½) I
-    cluster_state,              # N-mode Gaussian cluster state
-    is_physical,                # check uncertainty principle
-    symplectic_eigenvalues,     # physical invariants of Gaussian state
-    squeezing_db,               # squeezing in decibels
-    log_negativity,             # entanglement measure
-    duan_criterion,             # inseparability criterion
-    purity,                     # 1/sqrt(det(2σ)) — Gaussian state purity
+    squeezed_vacuum, two_mode_squeezed, vacuum, thermal, cluster_state,
+    is_physical, symplectic_eigenvalues, squeezing_db, log_negativity,
+    duan_criterion, purity,
+    mean_energy, collective_quadrature_variance, fidelity,   # §6
+    TargetTerm, target_quadratic_form, target_collective_quadrature,  # §2.1 target predicate
+    target_log_negativity, target_purity,
 )
 
-# ── Benchmarks ────────────────────────────────────────────────────────────
-# No AutoScatter analogue
+# Benchmarks — no AutoScatter analogue
 from reservoir_engineering.benchmarks import (
     ALL_BENCHMARKS,
     get_benchmark,
@@ -230,22 +169,27 @@ from reservoir_engineering.benchmarks import (
     print_benchmark_summary,
 )
 
-# ── Analysis and visualisation ────────────────────────────────────────────
-# Partial analogue: AutoScatter puts visualisation in constraints.py;
-# here we have a dedicated analysis.py with extended tools.
+# Analysis and visualisation — partial analogue (AutoScatter puts
+# visualisation in constraints.py; this package also has a dedicated module)
 from reservoir_engineering.analysis import (
-    compare_covariance,             # heatmap of achieved vs target
-    print_topology_summary,         # human-readable topology description
-    plot_optimization_history,      # loss vs iteration
-    summarise_search_results,       # ranked table of discovered topologies
-    plot_squeezing_vs_complexity,   # squeezing dB vs num_edges scatter plot
-    validate_kronwald,              # ground-truth validation check
+    compare_covariance,
+    print_topology_summary,
+    plot_optimization_history,
+    summarise_search_results,
+    plot_squeezing_vs_complexity,
+    validate_kronwald,
 )
 
 __all__ = [
     # physics
     'build_drift_matrix', 'build_diffusion_matrix',
     'solve_lyapunov_kronecker', 'get_mode_covariance', 'covariance_loss',
+    'symplectic_form', 'build_jump_matrix',
+    'build_drift_matrix_from_GC', 'build_diffusion_matrix_from_C',
+    'purity_violation',
+    'jnp_symplectic_eigenvalues', 'jnp_purity', 'jnp_log_negativity',
+    # pure-state / Siegel layer (§1.3/§1.4/§5/§7)
+    'sigma_from_siegel', 'dark_state_nullifiers', 'optimise_state',
     # constraints
     'NO_COUPLING', 'BEAMSPLITTER', 'TWO_MODE_SQUEEZING', 'PARAMETRIC',
     'BEAMSPLITTER_AND_TWO_MODE_SQUEEZING',
@@ -253,25 +197,29 @@ __all__ = [
     'Constraint_coupling_two_mode_squeezing', 'Constraint_coupling_symmetric',
     'Constraint_stability', 'Constraint_physical_state',
     'Constraint_target_squeezing', 'Constraint_entanglement',
+    'Constraint_passivity', 'Constraint_cooperativity_cap', 'ConstraintRegistry',
     'setup_constraints', 'plot_graph', 'plot_list_of_graphs',
     # graph utilities
     'TopologyGraph', 'triu_to_edge_matrix', 'edge_matrix_to_triu',
     'check_if_subgraph', 'check_if_subgraph_triu',
     'translate_triu_to_conditions', 'translate_conditions_to_triu',
     'characterize_topology', 'find_min_number_pump_tones',
-    'calc_number_of_possibilities',
-    # physics helpers (Stage 1–3)
+    'calc_number_of_possibilities', 'canonicalise_by_gauge',
+    # physics helpers (Stage 1–2)
     'build_hamiltonian_matrix',
-    'check_stability', 'build_drift_matrix_from_ratios', 'covariance_loss_from_ratios',
+    'check_stability', 'build_drift_diffusion_from_GC_tilde',
     # optimiser
     'CovarianceOptimizer', 'find_minimum_number_auxiliary_modes',
+    'rank_by_cost', 'run_algorithm',
     'AUTODIFF_FORWARD', 'AUTODIFF_REVERSE',
-    'LAMBDA_SCALE_DEFAULT',
-    # 'LAMBDA_VALUES_STAGE2', 'STAGE2_SHORT_OPT_ITER', 'CONVERGENCE_LOSS_THRESHOLD',  # Stage 2 disabled
+    'KAPPA_0_DEFAULT', 'DIRECT_LOG_BOUND_DEFAULT', 'SQUEEZE_AB_BOUND_DEFAULT',
     # targets
     'squeezed_vacuum', 'two_mode_squeezed', 'vacuum', 'thermal',
     'cluster_state', 'is_physical', 'symplectic_eigenvalues',
     'squeezing_db', 'log_negativity', 'duan_criterion', 'purity',
+    'mean_energy', 'collective_quadrature_variance', 'fidelity',
+    'TargetTerm', 'target_quadratic_form', 'target_collective_quadrature',
+    'target_log_negativity', 'target_purity',
     # benchmarks
     'ALL_BENCHMARKS', 'get_benchmark', 'make_benchmark_optimizer',
     'run_benchmark', 'run_all_benchmarks', 'print_benchmark_summary',

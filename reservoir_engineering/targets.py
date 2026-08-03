@@ -2,104 +2,35 @@
 targets.py
 ==========
 Standard target covariance matrices for Gaussian quantum state engineering.
+Provides the RIGHT-HAND SIDE of the optimisation problem: given one of
+these target covariances, the rest of the pipeline discovers which circuit
+topology achieves it.
 
-This module provides the RIGHT-HAND SIDE of the optimisation problem:
-given one of these target covariances, the rest of the pipeline discovers
-WHICH circuit topology achieves it.
+Conventions: real quadrature basis q=(x_0,p_0,x_1,p_1,...), sigma_ij =
+1/2<{q_i,q_j}>. Vacuum sigma_vac = 1/2*I2 per mode. Uncertainty principle:
+sigma + i/2*Omega >= 0, equivalently all symplectic eigenvalues >= 1/2 —
+unphysical targets will confuse the optimizer.
 
-═══════════════════════════════════════════════════════════════════════════════
-CONVENTIONS
-═══════════════════════════════════════════════════════════════════════════════
-
-Real quadrature basis:  q = (x_0, p_0, x_1, p_1, ...)
-Covariance matrix:      σ_ij = ½ ⟨{q_i, q_j}⟩
-
-Vacuum (ground state) noise level:  σ_vac = ½ · I₂ per mode.
-  x-quadrature variance = ½,  p-quadrature variance = ½.
-
-Squeezed state:  one quadrature below ½ (squeezed), the other above ½.
-Entangled state: off-diagonal correlations between modes.
-
-Uncertainty principle (symplectic):  σ + i/2 · Ω ≥ 0
-  where Ω = block-diag([[0, 1], [-1, 0]]) is the symplectic form.
-  Equivalently: all symplectic eigenvalues of σ must be ≥ ½.
-  Physical states satisfy this; unphysical targets will confuse the optimizer.
-
-═══════════════════════════════════════════════════════════════════════════════
-REFERENCE TARGET: KRONWALD SCHEME
-═══════════════════════════════════════════════════════════════════════════════
-
-The primary validation target throughout this package is:
-    squeezed_vacuum(r)  for a single mechanical mode
-This should be matched by a 2-mode system (cavity + mechanics) with BS + TMS
-coupling in the Kronwald topology.  See kronwald_optimizer.py for the analytic
-reference.  Use squeezed_vacuum(r) as the target for all validation tests.
+Reference target: squeezed_vacuum(r) for a single mechanical mode, matched
+by a 2-mode (cavity+mechanics) system with BS+TMS coupling (Kronwald
+topology) — the primary validation target throughout this package.
 """
 
 import numpy as np
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# squeezed_vacuum(r) → np.ndarray shape (2, 2)
-# ───────────────────────────────────────────────────────────────────────────
-# Single-mode squeezed vacuum covariance.
-#
-# Physical meaning:
-#   A single bosonic mode prepared in a vacuum-squeezed state with squeezing
-#   parameter r.  The x-quadrature is squeezed below the vacuum level;
-#   the p-quadrature is anti-squeezed above it.
-#
-# Formula:
-#   σ = ½ · diag(e^{-2r},  e^{+2r})
-#
-#   r = 0:  vacuum state,  σ = ½ · I₂
-#   r > 0:  squeezed in x,  σ_xx = ½ e^{-2r} < ½
-#   r < 0:  squeezed in p,  σ_pp = ½ e^{+2r} < ½  (just relabelling)
-#
-# Squeezing in dB:  S = -10 log10(2 σ_xx) = 20 r / ln(10) ≈ 8.686 · r  dB
-#
-# Typical values used in experiments:
-#   r = 0.5  →  ~4.3 dB squeezing
-#   r = 1.0  →  ~8.7 dB squeezing
-#   r = 1.5  →  ~13  dB squeezing  (challenging)
-
+# Single-mode squeezed vacuum: sigma = 1/2*diag(e^-2r, e^2r). r=0 is vacuum;
+# x squeezed below 1/2 for r>0. Squeezing in dB ~ 8.686*r (r=1.0 -> ~8.7dB).
 def squeezed_vacuum(r: float) -> np.ndarray:
     return 0.5 * np.diag([np.exp(-2*r), np.exp(2*r)])
 
-# ───────────────────────────────────────────────────────────────────────────
-# two_mode_squeezed(r) → np.ndarray shape (4, 4)
-# ───────────────────────────────────────────────────────────────────────────
-# Two-mode squeezed vacuum (TMSV / EPR state) covariance for modes 0 and 1.
-#
-# Physical meaning:
-#   Two modes in a maximally entangled Gaussian state. As r → ∞ this
-#   approaches the ideal Einstein–Podolsky–Rosen (EPR) state with perfect
-#   position–position and momentum–momentum correlations.
-#   Created by a parametric down-conversion process (TMS interaction).
-#
-# Formula (block structure in the (x_0, p_0, x_1, p_1) basis):
-#
-#   σ = ½ · [[ cosh(2r) · I₂    -sinh(2r) · σ_z  ]
-#             [ -sinh(2r) · σ_z   cosh(2r) · I₂   ]]
-#
-#   where σ_z = diag(+1, -1) and I₂ = identity(2).
-#
-#   Explicitly:
-#   σ_00 = σ_11 = ½ cosh(2r)  (both modes equally noisy individually)
-#   σ_01[x,x] = -½ sinh(2r)   (negative x-x correlation)
-#   σ_01[p,p] = +½ sinh(2r)   (positive p-p correlation)
-#
-# Convention note:
-#   This uses the dissipative-engineering (Woolley-Clerk) convention where
-#   x₁+x₂ and p₁-p₂ are the squeezed quadratures.  Equivalent to the
-#   parametric-downconversion convention up to a local π-rotation on mode 0.
-#   Entanglement check: var(x₀+x₁) + var(p₀-p₁) = 2e^{-2r} < 1 for r > 0.
-#
-# Entanglement:
-#   Log negativity = r  (monotonically increasing with squeezing).
-#
-# Usage: target for 3-mode systems with 2 signal modes (cavity mediates).
 
+# Two-mode squeezed vacuum (TMSV/EPR state) for modes 0,1: as r->inf,
+# approaches perfect x-x/p-p correlation (parametric down-conversion).
+#   sigma = 1/2*[[cosh(2r)I2, -sinh(2r)sz], [-sinh(2r)sz, cosh(2r)I2]]
+# Dissipative-engineering (Woolley-Clerk) convention: x0+x1, p0-p1 are the
+# squeezed quadratures (equivalent to the PDC convention up to a
+# pi-rotation on mode 0). Log negativity = r.
 def two_mode_squeezed(r: float) -> np.ndarray:
     c  = np.cosh(2*r)
     s  = np.sinh(2*r)
@@ -109,78 +40,35 @@ def two_mode_squeezed(r: float) -> np.ndarray:
                             [-s*sz, c*I2]])
 
 
-
-# ───────────────────────────────────────────────────────────────────────────
-# vacuum(n_modes=1) → np.ndarray shape (2*n_modes, 2*n_modes)
-# ───────────────────────────────────────────────────────────────────────────
-# Ground (vacuum) state covariance for n_modes uncorrelated modes.
-#
-# Formula:  σ = ½ · I_{2n_modes}
-#
-# This is the trivial target used for sanity-check optimisations:
-# any dissipative system at T=0 without active squeezing should reach vacuum.
-# If the optimizer cannot achieve this target, there is a bug in the physics.
-
+# Ground state, sigma = 1/2*I. Sanity-check target: a dissipative system at
+# T=0 with no active squeezing should always reach this.
 def vacuum(n_modes: int = 1) -> np.ndarray:
     return 0.5 * np.eye(2 * n_modes)
 
-# ───────────────────────────────────────────────────────────────────────────
-# thermal(n_bar, n_modes=1) → np.ndarray shape (2*n_modes, 2*n_modes)
-# ───────────────────────────────────────────────────────────────────────────
-# Thermal state covariance for n_modes uncorrelated modes at occupation n̄.
-#
-# Formula:  σ = (n̄ + ½) · I_{2n_modes}
-#
-# n̄ = 0:  vacuum,  σ = ½ · I
-# n̄ > 0:  added thermal noise
-#
-# Usage: used as the initial (before optimisation) state of the mechanical
-# mode, and as a sanity-check target for the mechanical bath alone.
 
+# Thermal state at occupation n_bar, sigma = (n_bar+1/2)*I.
 def thermal(n_bar: float, n_modes: int = 1) -> np.ndarray:
     return (n_bar + 0.5) * np.eye(2 * n_modes)
 
-# ───────────────────────────────────────────────────────────────────────────
-# cluster_state(n_modes, delta) → np.ndarray shape (2*n_modes, 2*n_modes)
-# ───────────────────────────────────────────────────────────────────────────
-# Approximate cluster (graph) state covariance for quantum computation.
-# Only well-defined for a specific graph structure (chain, grid, etc.).
-#
-# Physical meaning:
-#   Cluster states are universal resources for measurement-based quantum
-#   computation. Gaussian cluster states are generated by CZ gates applied
-#   to momentum-squeezed input modes. Here delta = squeezing parameter;
-#   delta → 0 gives the ideal (infinite squeezing) cluster state.
-#
-# Construction for a LINEAR CHAIN of n_modes:
-#   Start with each mode individually squeezed: σ_i = ½ diag(e^{+2δ}, e^{-2δ})
-#   (squeezing in p, i.e. delta = r > 0 gives σ_pp < ½)
-#   Apply CZ gates between neighbouring modes i and i+1:
-#       CZ gate: symplectic matrix S_CZ = [[I, 0], [Γ, I]] where Γ is the
-#       adjacency matrix of the graph (1 for connected pairs).
-#   Final covariance:  σ_cluster = S_CZ · σ_product · S_CZ^T
-#
-# This is an advanced target — implement after the simpler squeezed_vacuum
-# and two_mode_squeezed cases are working.
-#
-# Note: the circuit topology needed to ENGINEER a cluster state dissipatively
-# is an interesting open question — this is what the searcher is for.
 
-# Used the quadracture naming convention (x₀, p₀, x₁, p₁, x₂, p₂ ...)
+# Gaussian cluster (graph) state for measurement-based quantum computation:
+# each mode individually p-squeezed (delta -> 0 is the ideal infinite-
+# squeezing limit), then CZ gates applied per the adjacency matrix
+# (S_CZ = [[I,0],[Gamma,I]]). Default adjacency is a linear chain.
+# Which topology dissipatively ENGINEERS this state is an open question —
+# that's what the searcher is for.
 def cluster_state(n_modes: int, delta: float, adjacency: np.ndarray = None) -> np.ndarray:
     if adjacency is None:
         adjacency = np.zeros((n_modes, n_modes))
         for i in range(n_modes - 1):
             adjacency[i, i+1] = 1.0
             adjacency[i+1, i] = 1.0
-    
-    # Mechanical Covariance Matrix
+
     sigma_product = np.zeros((2*n_modes, 2*n_modes))
     for i in range(n_modes):
         sigma_product[2*i,   2*i  ] = 0.5 * np.exp(+2*delta)
         sigma_product[2*i+1, 2*i+1] = 0.5 * np.exp(-2*delta)
-    
-    # Control Z Gate Symplectic Transformation
+
     S = np.eye(2*n_modes)
     for i in range(n_modes):
         for j in range(i+1, n_modes):
@@ -192,15 +80,9 @@ def cluster_state(n_modes: int, delta: float, adjacency: np.ndarray = None) -> n
     return S @ sigma_product @ S.T
 
 
+# Variance of each cluster nullifier f_j = p_j - sum_k A[j,k]*x_k. Ideal
+# cluster state: all variances -> e^{-2*delta}/2 as delta -> 0.
 def nullifier_variances(sigma: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
-    """
-    Variance of each cluster nullifier  f_j = p_j - sum_k A[j,k] * x_k.
-    Returns shape (N,).  Ideal cluster state: all variances = e^{-2*delta}/2.
-
-    Var(f_j) = sigma[p_j,p_j]
-             - 2 * sum_k A[j,k] * sigma[p_j, x_k]
-             + sum_{k,l} A[j,k]*A[j,l] * sigma[x_k, x_l]
-    """
     N = sigma.shape[0] // 2
     variances = np.zeros(N)
     for j in range(N):
@@ -215,73 +97,17 @@ def nullifier_variances(sigma: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
     return variances
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# nullifier_variances() 
-# ───────────────────────────────────────────────────────────────────────────
-
-def nullifier_variances(sigma: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
-    """
-    Variance of each cluster nullifier  f_j = p_j - sum_k A[j,k] * x_k.
-    Returns shape (N,).  Ideal cluster state: all variances = e^{-2*delta}/2 → 0.
-
-    Var(f_j) = sigma[p_j,p_j]
-             - 2 * sum_k A[j,k] * sigma[p_j, x_k]
-             + sum_{k,l} A[j,k]*A[j,l] * sigma[x_k, x_l]
-    """
-    N = sigma.shape[0] // 2
-    variances = np.zeros(N)
-    for j in range(N):
-        v = sigma[2*j+1, 2*j+1]
-        for k in range(N):
-            if adjacency[j, k] != 0:
-                v -= 2.0 * adjacency[j, k] * sigma[2*j+1, 2*k]
-                for l in range(N):
-                    if adjacency[j, l] != 0:
-                        v += adjacency[j, k] * adjacency[j, l] * sigma[2*k, 2*l]
-        variances[j] = v
-    return variances
-
-# ───────────────────────────────────────────────────────────────────────────
-# is_physical(sigma) → bool
-# ───────────────────────────────────────────────────────────────────────────
-# Check whether a covariance matrix is physically valid.
-#
-# A covariance matrix σ is physical iff:
-#     σ + i/2 · Ω ≥ 0    (all eigenvalues ≥ 0)
-# where Ω is the 2N × 2N symplectic form:
-#     Ω = block-diag([[0, 1], [-1, 0]])   (one 2×2 block per mode)
-#
-# Equivalently (and numerically more stable): compute the symplectic
-# eigenvalues of σ and check all are ≥ ½.
-# Symplectic eigenvalues = eigenvalues of |iΩσ| (absolute values of
-# eigenvalues of the antisymmetric matrix iΩσ).
-#
-# Returns True if physical, False otherwise.
-# Use this to validate user-defined target covariances before running
-# the optimizer — an unphysical target will produce meaningless results.
-
+# True iff sigma + i/2*Omega >= 0, i.e. all symplectic eigenvalues >= 1/2.
+# Validate user-defined targets before running the optimizer — an
+# unphysical target produces meaningless results.
 def is_physical(sigma):
     return bool(np.all(symplectic_eigenvalues(sigma) >= 0.5 - 1e-10))
 
-# ───────────────────────────────────────────────────────────────────────────
-# symplectic_eigenvalues(sigma) → np.ndarray shape (N,)
-# ───────────────────────────────────────────────────────────────────────────
-# Compute the N symplectic eigenvalues of a 2N × 2N covariance matrix.
-#
-# These are the physical invariants of a Gaussian state — invariant under
-# symplectic (canonical) transformations (rotations, squeezing in phase space).
-#
-# Method:
-#   1. Build the symplectic form Ω (block-diag of [[0,1],[-1,0]]).
-#   2. Compute the matrix product M = iΩσ.
-#   3. Eigenvalues of M come in ±ν_k pairs (real ν_k > 0).
-#   4. Return the N positive values ν_k, sorted ascending.
-#
-# Physical interpretation:
-#   ν_k ≥ ½ for all k  ↔  state is physical (uncertainty principle)
-#   ν_k = ½            ↔  mode k is a pure state (minimum uncertainty)
-#   ν_k > ½            ↔  mode k is mixed (thermal or non-minimum uncertainty)
 
+# The N symplectic eigenvalues of a 2N x 2N covariance matrix — physical
+# invariants under symplectic transformations. nu_k >= 1/2 always (physical);
+# nu_k == 1/2 means mode k is pure; nu_k > 1/2 means mixed/thermal.
+# Eigenvalues of i*Omega*sigma come in +-nu_k pairs; take abs and dedupe.
 def symplectic_eigenvalues(sigma: np.ndarray) -> np.ndarray:
     N = sigma.shape[0] // 2
     Omega = np.zeros_like(sigma)
@@ -290,106 +116,142 @@ def symplectic_eigenvalues(sigma: np.ndarray) -> np.ndarray:
         Omega[2*i+1, 2*i] = -1.
     M = 1j * Omega @ sigma
     eigs = np.linalg.eigvals(M)
-    nus = np.sort(np.abs(eigs.real))   # ±ν_k pairs → take abs, sort ascending
-    return nus[::2]                    # sorted as [ν₁,ν₁,ν₂,ν₂,...] — take every other to get N distinct values
+    nus = np.sort(np.abs(eigs.real))
+    return nus[::2]   # [nu1,nu1,nu2,nu2,...] -> take every other
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# squeezing_db(sigma, mode_id=0) → float
-# ───────────────────────────────────────────────────────────────────────────
-# Squeezing in decibels for a single mode.
-#
-# Formula:  S = -10 · log10(2 · σ_xx)
-#   where σ_xx = sigma[2*mode_id, 2*mode_id]  (x-quadrature variance)
-#
-# S > 0 dB  →  squeezed below shot noise (σ_xx < ½)
-# S = 0 dB  →  shot noise level (vacuum)
-# S < 0 dB  →  above shot noise (thermal or anti-squeezed quadrature)
-#
-# Note: this measures squeezing in the x-quadrature specifically.
-# To find the maximally squeezed quadrature, diagonalise the 2×2 block
-# of the mode and take the minimum eigenvalue.
-
+# Squeezing in dB for one mode's x-quadrature: S = -10*log10(2*sigma_xx).
+# S>0 = squeezed below shot noise, S=0 = vacuum. Diagonalise the mode's 2x2
+# block instead if you need the maximally-squeezed quadrature, not just x.
 def squeezing_db(sigma: np.ndarray, mode_id: int = 0) -> float:
     sigma_xx = sigma[2*mode_id, 2*mode_id]
     return float(-10 * np.log10(2 * sigma_xx))
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# log_negativity(sigma) → float
-# ───────────────────────────────────────────────────────────────────────────
-# Logarithmic negativity for a 2-mode Gaussian state (N=2 only).
-# Quantifies the amount of entanglement.
-#
-# Method (Simon 2000 / Adesso et al.):
-#   1. Compute the partial-transpose covariance matrix σ^PT by flipping
-#      the sign of the p-quadrature of one mode:
-#          σ^PT = T · σ · T    where T = diag(1, 1, 1, -1)
-#   2. Find the symplectic eigenvalues ν̃_1 ≤ ν̃_2 of σ^PT.
-#   3. If ν̃_1 < ½: the state is entangled (PPT criterion violated).
-#   4. Log negativity: E_N = max(0,  -log2(2 ν̃_1))
-#
-# Returns:
-#   E_N ≥ 0  (0 = separable, > 0 = entangled)
-#
-# Only defined for 2-mode states (4×4 covariance matrices).
-# Raise ValueError for other sizes.
-
+# Duan-Simon inseparability criterion for a 2-mode state (4x4 sigma): True
+# iff entangled. Checks both EPR orientations (u=x0-x1,v=p0+p1 and
+# u=x0+x1,v=p0-p1) since the two are convention-dependent (PDC vs
+# dissipative/Woolley-Clerk); separable requires Var(u)+Var(v) >= 1 in both.
 def duan_criterion(sigma: np.ndarray) -> bool:
-    # Check both EPR orientations (convention-independent):
-    # orientation 1: u=x0-x1, v=p0+p1  (parametric-downconversion convention)
-    # orientation 2: u=x0+x1, v=p0-p1  (dissipative Woolley-Clerk convention)
     sum1 = (sigma[0,0] + sigma[2,2] - 2*sigma[0,2]
             + sigma[1,1] + sigma[3,3] + 2*sigma[1,3])
     sum2 = (sigma[0,0] + sigma[2,2] + 2*sigma[0,2]
             + sigma[1,1] + sigma[3,3] - 2*sigma[1,3])
     return bool(sum1 < 1.0 or sum2 < 1.0)
 
-# ───────────────────────────────────────────────────────────────────────────
-# duan_criterion(sigma) → bool
-# ───────────────────────────────────────────────────────────────────────────
-# Duan–Simon inseparability criterion for 2-mode Gaussian states.
-# Returns True if the state is entangled (criterion violated).
-#
-# The criterion: define the EPR-like operators
-#     u = x_0 − x_1      v = p_0 + p_1
-# The state is separable only if:
-#     Var(u) + Var(p) ≥ 1   (in natural units where vacuum = ½ per quadrature)
-#     i.e.  σ_xx(mode 0) + σ_xx(mode 1) - 2σ_{x0,x1}
-#          + σ_pp(mode 0) + σ_pp(mode 1) + 2σ_{p0,p1}  ≥  1
-#
-# If this sum is < 1: state is entangled.
-#
-# Only valid for 2-mode states (4×4 covariance matrix).
-# Simpler to compute than log_negativity; use as a quick entanglement check.
 
+# Logarithmic negativity for a 2-mode state (4x4 sigma only): partial-
+# transpose (flip mode-1's p), take its smallest symplectic eigenvalue
+# nu_min, E_N = max(0, -log2(2*nu_min)). 0 = separable, >0 = entangled.
 def log_negativity(sigma: np.ndarray) -> float:
     if sigma.shape != (4, 4):
         raise ValueError("log_negativity requires a 4x4 (2-mode) covariance matrix")
-    T = np.diag([1., 1., 1., -1.])       # partial transpose: flip p of mode 1
+    T = np.diag([1., 1., 1., -1.])
     sigma_pt = T @ sigma @ T
     nus = symplectic_eigenvalues(sigma_pt)
     nu_min = float(np.min(nus))
     return float(max(0., -np.log2(2 * nu_min)))
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# purity(sigma) → float
-# ───────────────────────────────────────────────────────────────────────────
-# Purity of a Gaussian state from its covariance matrix.
-#
-# Formula:  μ = 1 / sqrt(det(2σ))
-#
-# Pure state:  μ = 1  (all symplectic eigenvalues = ½, det(2σ) = 1)
-# Mixed state: μ < 1
-#
-# When sigma is a REDUCED covariance matrix (signal modes only, cavity traced
-# out), this gives the purity of the engineered signal state — which is the
-# physically relevant quantity. Mixedness comes from two sources:
-#   (1) thermal bath noise (γ, n_th)
-#   (2) residual entanglement with the cavity at finite cooperativity
-# As C → ∞ (resolved sideband, κ >> g >> γ), μ → 1 for both Kronwald and EPR.
-
+# Purity mu = 1/sqrt(det(2*sigma)); 1 for pure, <1 for mixed. On a reduced
+# (signal-modes-only) sigma this is the physically relevant purity of the
+# engineered state — mixedness comes from thermal bath noise and residual
+# entanglement with the auxiliary modes at finite cooperativity (mu -> 1 as
+# C -> infinity in the resolved-sideband limit).
 def purity(sigma: np.ndarray) -> float:
     return float(1.0 / np.sqrt(np.linalg.det(2 * sigma)))
 
+
+# §6 target-quantity reference, remaining functionals (the rest are above:
+# symplectic_eigenvalues, squeezing_db, log_negativity, duan_criterion, purity).
+
+# Mean energy per mode: Tr(sigma)/(2N).
+def mean_energy(sigma: np.ndarray) -> float:
+    return float(np.trace(sigma) / sigma.shape[0])
+
+
+# u^T sigma u for an arbitrary collective quadrature vector u.
+def collective_quadrature_variance(sigma: np.ndarray, u: np.ndarray) -> float:
+    u = np.asarray(u)
+    return float(u @ sigma @ u)
+
+
+# Fidelity between an achieved covariance sigma_a and a PURE reference
+# state sigma_b: F = 1/sqrt(det(sigma_a+sigma_b)) (exact whenever one state
+# is pure — Marian&Marian 2012 / Banchi-Braunstein-Pirandola PRL 115,
+# 260501 (2015), specialised to this package's vacuum=1/2 convention;
+# verified by hand for the single-mode minimum-uncertainty case: F =
+# 2*sqrt(ab)/(a+b), which reduces to F=1 for sigma_a==sigma_b==vacuum).
+# Raises if sigma_b isn't (numerically) pure.
+def fidelity(sigma_a: np.ndarray, sigma_b: np.ndarray) -> float:
+    sigma_a = np.asarray(sigma_a)
+    sigma_b = np.asarray(sigma_b)
+    if sigma_a.shape != sigma_b.shape:
+        raise ValueError("fidelity requires sigma_a and sigma_b of the same shape")
+    if abs(purity(sigma_b) - 1.0) > 1e-6:
+        raise ValueError("fidelity(sigma_a, sigma_b) requires sigma_b to be a pure "
+                          "reference state (purity(sigma_b) == 1); got "
+                          f"purity={purity(sigma_b):.6f}")
+    denom = np.linalg.det(sigma_a + sigma_b)
+    return float(1.0 / np.sqrt(denom))
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# §2.1 target predicate: {(Q_i, q_i, relation, modes)}
+# ───────────────────────────────────────────────────────────────────────────
+# The doc's target is a list of scalar quantities Q_i matched to target
+# values q_i, each on its own mode subset — NOT necessarily a full target
+# covariance matrix (that's the special case of "specific correlations":
+# matching every entry of a block at once, still supported directly via
+# CovarianceOptimizer's sigma_target argument). TargetTerm is one such
+# (Q_i, q_i, weight, modes) entry; CovarianceOptimizer(target_predicate=
+# [...]) accepts a list of these (alongside or instead of sigma_target).
+#
+# fn must be JAX-differentiable (called on a jnp array inside the §3 loss)
+# — use the jnp_* functionals in covariance_physics.py, or
+# target_quadratic_form below for anything expressible as Tr(Q sigma).
+
+class TargetTerm:
+    def __init__(self, fn, q, weight: float = 1.0, modes=None, name: str = None):
+        self.fn = fn
+        self.q = float(q)
+        self.weight = float(weight)
+        self.modes = list(modes) if modes is not None else None
+        self.name = name or getattr(fn, '__name__', 'Q')
+
+    def __repr__(self):
+        return f'TargetTerm({self.name}, q={self.q}, weight={self.weight}, modes={self.modes})'
+
+
+# Any quantity linear in sigma (Tr(Q sigma) = sum(Q * sigma)) as a §2.1 term
+# — covers a single quadrature variance (Q = u u^T), an EPR/Duan-style sum
+# Var(u)+Var(v) (Q = u u^T + v v^T), and individual correlations sigma_ij
+# (Q = symmetrised e_i e_j^T) all with the one primitive (§6 "collective-
+# quadrature squeezing" and "specific correlations").
+def target_quadratic_form(q, Q, modes=None, weight: float = 1.0, name: str = 'quadratic_form') -> TargetTerm:
+    import jax.numpy as jnp
+    Q_arr = jnp.array(Q)
+    fn = lambda sigma: jnp.sum(Q_arr * sigma)
+    return TargetTerm(fn, q, weight, modes, name=name)
+
+
+# u^T sigma u target (single collective quadrature, §6) — the Q=u u^T case
+# of target_quadratic_form, exposed directly since it's the common case
+# (single-mode squeezing: u = one-hot on x or p).
+def target_collective_quadrature(q, u, modes=None, weight: float = 1.0, name: str = 'quadrature_variance') -> TargetTerm:
+    import jax.numpy as jnp
+    u_arr = jnp.array(u)
+    fn = lambda sigma: u_arr @ sigma @ u_arr
+    return TargetTerm(fn, q, weight, modes, name=name)
+
+
+# Logarithmic negativity target (§6), 2-mode (4x4) block.
+def target_log_negativity(q, modes, weight: float = 1.0) -> TargetTerm:
+    from reservoir_engineering.covariance_physics import jnp_log_negativity
+    return TargetTerm(jnp_log_negativity, q, weight, modes, name='log_negativity')
+
+
+# Purity target (§6): q=1.0 for an exactly pure target block.
+def target_purity(q, modes=None, weight: float = 1.0) -> TargetTerm:
+    from reservoir_engineering.covariance_physics import jnp_purity
+    return TargetTerm(jnp_purity, q, weight, modes, name='purity')

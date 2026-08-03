@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import numpy as np
 
 from reservoir_engineering.targets import squeezed_vacuum, purity
-from reservoir_engineering.covariance_optimizer import CovarianceOptimizer, LAMBDA_SCALE_DEFAULT
+from reservoir_engineering.covariance_optimizer import CovarianceOptimizer
 from reservoir_engineering.constraints import Constraint_stability
 from reservoir_engineering.topology_search import BEAMSPLITTER_AND_TWO_MODE_SQUEEZING
 
@@ -127,14 +127,18 @@ def run_kronwald_test(r=1.0, num_tests=10, verbosity=False):
                           mu_achieved > 0.9)
 
         # --- Kronwald coupling ratio check ---
-        # Kronwald predicts: nu/g = tanh(r), so C_nu/C_g = tanh(r)^2
-        log_ratios = info['log_ratios']
-        if len(log_ratios) == 2:
-            u_bs, u_tms = float(log_ratios[0]), float(log_ratios[1])
-            ratio = np.exp(u_tms - u_bs)           # C~_nu / C~_g
-            expected_ratio = np.tanh(r) ** 2
+        # Kronwald predicts: nu/g = tanh(r). G_tilde is LINEAR in g
+        # (g_k = kappa0*exp(u_k) directly), so the G~ ratio itself is
+        # nu/g, not its square (unlike the old cooperativity C~_nu/C~_g,
+        # which was ~g^2 and needed tanh(r)^2).
+        g_tilde = info['G_tilde']
+        bs_key  = next((k for k in g_tilde if k.endswith('bea)')), None)
+        tms_key = next((k for k in g_tilde if k.endswith('two)')), None)
+        if bs_key and tms_key:
+            ratio = g_tilde[tms_key] / g_tilde[bs_key]   # G~_nu / G~_g = nu/g
+            expected_ratio = np.tanh(r)
             all_pass &= check(
-                f'C~_nu/C~_g ≈ tanh(r)^2  (got {ratio:.4f}, want {expected_ratio:.4f})',
+                f'G~_nu/G~_g ≈ tanh(r)  (got {ratio:.4f}, want {expected_ratio:.4f})',
                 abs(ratio - expected_ratio) < 0.05)
 
         print('\n  Covariance matrices:')

@@ -2,71 +2,41 @@
 constraints.py
 ==============
 Constraint objects for encoding graph topology and physics requirements.
+MIRRORS: autoscatter/constraints.py
 
-MIRRORS: autoscatter/constraints.py  (1-to-1 conceptual mapping)
+A "condition" both ENCODES a structural fact about the graph (which edges
+exist, what type) AND EVALUATES how much that fact is violated for a given
+parameter set, e.g. [Constraint_coupling_absent(0,1), Constraint_coupling_beamsplitter(0,2)]
+means "edge (0,1) absent; edge (0,2) is a beamsplitter, not TMS".
 
-The core idea
-Every candidate topology in your BFS needs to answer two questions:
+CovarianceOptimizer uses these to: (1) decide which coupling strengths are
+free vs fixed to 0, (2) add penalty terms to the loss for physics
+requirements (stability, entanglement, ...), (3) after optimising the
+fully-connected graph, read off which constraints are "accidentally"
+satisfied to infer the minimal topology.
 
-What is the graph structure? — which edges exist, and what type (BS or TMS)?
-Is the physics valid? — is the system stable? Does it produce a physical quantum state?
+Two-level hierarchy (mirrors AutoScatter):
+  Coupling_Constraint subclasses — architectural: which edges exist and
+    what type (Constraint_coupling_absent, _beamsplitter, ...).
+  Base_Constraint subclasses — physics requirements added as a loss
+    residual (Constraint_stability, _physical_state, ...).
 
-═══════════════════════════════════════════════════════════════════════════════
-ROLE IN THE PIPELINE
-═══════════════════════════════════════════════════════════════════════════════
+Edge type constants: BS and TMS are both off-diagonal but have different
+block structure in A (I2 vs sigma_z), so unlike AutoScatter's single
+COUPLING_WITH_PHASE they need distinct codes; PARAMETRIC is diagonal-only.
 
-A "condition" in this package is exactly what it is in AutoScatter: a Python
-object that both ENCODES a structural fact about the graph AND EVALUATES how
-much that fact is violated for a given parameter set.
-
-In AutoScatter, a condition list like:
-    [Constraint_coupling_zero(0,1), Constraint_coupling_phase_zero(0,2)]
-means "edge (0,1) is absent; edge (0,2) is a real-valued beamsplitter."
-
-Here, the analogous condition list:
-    [Constraint_coupling_absent(0,1), Constraint_coupling_beamsplitter(0,2)]
-means "edge (0,1) is absent; edge (0,2) is a beamsplitter (not TMS)."
-
-The CovarianceOptimizer (covariance_optimizer.py) uses these objects to:
-  1. Determine which coupling strengths are free (to be optimised) vs fixed to 0.
-     → Absent-edge constraints → remove those strengths from the optimiser variables.
-     → Type constraints → constrain which A-matrix block structure is used.
-  2. Add residual penalty terms to the loss function for physics constraints.
-     → Stability constraint → penalty on positive A eigenvalues.
-  3. After optimising a fully-connected graph, check which constraints are
-     "accidentally" satisfied → infer the minimal discrete topology.
-     (This is how AutoScatter's check_all_constraints / cleanup_valid_combinations works.)
-
-═══════════════════════════════════════════════════════════════════════════════
-TWO-LEVEL HIERARCHY  (mirrors AutoScatter exactly)
-═══════════════════════════════════════════════════════════════════════════════
-
-Level 1 — Architectural / coupling constraints  (Coupling_Constraint subclasses)
-    These encode the GRAPH STRUCTURE: which edges are present and what type they are.
-    They are "architectural" in the sense that they constrain the topology, not the
-    coupling strengths directly.
-    Examples: Constraint_coupling_absent, Constraint_coupling_beamsplitter
-
-Level 2 — Physics constraints  (Base_Constraint subclasses, NOT Coupling_Constraint)
-    These add PHYSICAL REQUIREMENTS on top of the topology: stability, minimum
-    squeezing, entanglement, etc.
-    They evaluate to a residual that is added to the loss function.
-    Examples: Constraint_stability, Constraint_physical_state, Constraint_target_squeezing
-
-═══════════════════════════════════════════════════════════════════════════════
-EDGE TYPE CONSTANTS  (mirrors AutoScatter's NO_COUPLING, DETUNING, etc.)
-═══════════════════════════════════════════════════════════════════════════════
-
-In AutoScatter (architecture.py):
-    NO_COUPLING = 0
-    DETUNING = 1  (diagonal, self-coupling)
-    COUPLING_WITHOUT_PHASE = 1  (beamsplitter)
-    COUPLING_WITH_PHASE = 2     (squeezing or complex beamsplitter)
-
-Here we use four distinct values because:
-    - BS and TMS are BOTH off-diagonal but have different block structures in A
-    - Parametric (single-mode squeezing) is diagonal but distinct from detuning
-    The real quadrature basis makes BS and TMS explicitly different in A.
+Constraint registry (gaussian_autoscatter_algorithm.md §2.6): every
+constraint carries a `.slot` tag routing it to one of three places:
+  'structural' (a) — prunes the palette before enumeration. Free, exact.
+      e.g. Constraint_coupling_absent.
+  'domain'     (b) — restricts edge TYPES / parameterisation. Free, exact.
+      e.g. Constraint_coupling_beamsplitter/_two_mode_squeezing, Constraint_passivity.
+  'soft'       (c) — a weighted penalty term added to the §3 loss.
+      e.g. Constraint_stability, _physical_state, _target_squeezing,
+      _entanglement, Constraint_cooperativity_cap.
+Rule: route to the earliest slot that fits (a before b before c) — (a)/(b)
+are free, (c) enlarges the non-convex landscape. `ConstraintRegistry` below
+just classifies a flat constraint list into these three slots.
 """
 
 import jax.numpy as jnp
@@ -75,19 +45,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import Counter
 
-# ── Edge type constants ──────────────────────────────────────────────────────
-# Mirrors: NO_COUPLING=0, DETUNING=1, COUPLING_WITHOUT_PHASE=1,
-#          COUPLING_WITH_PHASE=2  in autoscatter/architecture.py
-#
-# In the edge matrix (N×N upper-triangle encoding):
-#   0 = no coupling between modes i and j
-#   1 = beamsplitter (BS): A-block = g · I₂  (energy-conserving)
-#   2 = two-mode squeezing (TMS): A-block = ν · σ_z  (parametric)
-#   3 = parametric / single-mode squeezing (diagonal only, i==j)
-#
-# These constants are used throughout topology_search.py and
-# covariance_optimizer.py to build and interpret edge matrices.
-
+# Edge type constants (upper-triangle encoding):
+#   0 = no coupling
+#   1 = beamsplitter (BS): A-block = g*I2 (energy-conserving)
+#   2 = two-mode squeezing (TMS): A-block = nu*sigma_z (parametric)
+#   3 = parametric / single-mode squeezing (diagonal only)
 NO_COUPLING = 0
 BEAMSPLITTER = 1
 TWO_MODE_SQUEEZING = 2
@@ -99,51 +61,18 @@ EDGETYPE_TWO_MODE_SQUEEZING = 'two_mode_squeezing'
 EDGETYPE_PARAMETRIC = 'parametric'
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Base_Constraint
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: Base_Constraint in autoscatter/constraints.py
-#
-# Abstract base class for all constraint objects.
-# Every constraint must implement __call__ which evaluates the residual.
-#
-# __call__(self, A, sigma) → JAX scalar
-#   A     : jnp.ndarray (2N, 2N) — current drift matrix
-#   sigma : jnp.ndarray (2N, 2N) — current steady-state covariance
-#   Returns a scalar residual. Exactly zero = constraint satisfied.
-#   For coupling constraints, this measures ‖A_block‖ (should be 0 if absent).
-#   For physics constraints, this measures the violation (should be ≤ 0).
-#
-# AutoScatter analogue: __call__(self, S, coupling_matrix, kappa_int_matrix, mode_types)
-# Our analogue:        __call__(self, A, sigma)
-# Simplified because: A encodes all coupling info directly (no separate coupling matrix).
-
+# Abstract base: every constraint implements __call__(A, sigma) -> jax
+# scalar residual (0 = satisfied). slot: 'structural'|'domain'|'soft',
+# read by ConstraintRegistry; must be set on each subclass.
 class Base_Constraint:
+    slot = None
+
     def __call__(self, A, sigma):
         raise NotImplementedError
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Coupling_Constraint(i, j)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: Coupling_Constraint in autoscatter/constraints.py  (exact analogue)
-#
-# Base class for all architectural (graph-topology) constraints.
-# Handles canonical index ordering and equality comparison.
-#
-# __init__(i, j):
-#   Store idxs = [min(i,j), max(i,j)] (canonical order, same as AutoScatter).
-#   This ensures Constraint_coupling_absent(0,1) == Constraint_coupling_absent(1,0).
-#
-# __eq__(other):
-#   Two coupling constraints are equal iff same type AND same pair of mode indices.
-#   Exact copy of AutoScatter's implementation.
-#
-# __hash__():
-#   Hash based on (type_name, idx1, idx2).
-#   Required so constraints can be stored in sets and used as dict keys.
-#   AutoScatter's constraints.py defines __hash__ on the subclasses — do the same.
-
+# Base class for architectural (edge-topology) constraints. idxs stored
+# canonically as [min(i,j), max(i,j)] so (0,1) == (1,0).
 class Coupling_Constraint(Base_Constraint):
     def __init__(self, i, j):
         self.idxs = [min(i, j), max(i, j)]
@@ -154,86 +83,29 @@ class Coupling_Constraint(Base_Constraint):
     def __hash__(self):
         return hash((type(self).__name__, self.idxs[0], self.idxs[1]))
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Constraint_coupling_absent(i, j)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: Constraint_coupling_zero(i, j) in autoscatter/constraints.py
-#
-# Architectural constraint: no edge between modes i and j.
-# The 2×2 off-diagonal block A[s_i, s_j] must be zero.
-#
-# __call__(self, A, sigma):
-#   s_i = quadrature_slice(self.idxs[0])
-#   s_j = quadrature_slice(self.idxs[1])
-#   block = A[s_i, s_j]
-#   return jnp.sum(jnp.abs(block))   ← zero iff block is zero
-#
-#   For diagonal (i == j), a different check: return jnp.abs(A[2i, 2i] - A[2i+1, 2i+1])
-#   to check there is no parametric squeezing self-coupling.
-#
-# __str__(self):
-#   'No coupling between mode %i and mode %i' % (idx1, idx2)
-#
-# Usage in CovarianceOptimizer:
-#   When this constraint is in the conditions list for a given topology,
-#   the coupling strength for edge (i,j) is excluded from the free variables
-#   and fixed to 0. Mirrors give_free_variable_idxs in Architecture_Optimizer.
 
+# No edge between modes i,j: residual = ||A[s_i,s_j]||, zero iff block is zero.
 class Constraint_coupling_absent(Coupling_Constraint):
+    slot = 'structural'   # §2.6(a): prunes this edge slot out of enumeration
+
     def __call__(self, A, sigma):
         try:
             from reservoir_engineering.covariance_physics import quadrature_slice
         except ImportError:
             from covariance_physics import quadrature_slice
-        # Get the index to slice the needed part of the Drift Matrix A
         si = quadrature_slice(self.idxs[0])
         sj = quadrature_slice(self.idxs[1])
-        # Returns 0 if there is no coupling between modes i and j
-        # Returns > 0 if there is coupling between modes i and j
         return jnp.sum(jnp.abs(A[si, sj]))
 
     def __str__(self):
         return f'No coupling between mode {self.idxs[0]} and mode {self.idxs[1]}'
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Constraint_coupling_beamsplitter(i, j)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: Constraint_coupling_phase_zero(i, j) in autoscatter/constraints.py
-#
-# Architectural constraint: if an edge exists between i and j, it MUST be a
-# beamsplitter (BS) — i.e., the 2×2 block is proportional to I₂, not σ_z.
-#
-# In AutoScatter, Constraint_coupling_phase_zero forces Im(g_{ij}) = 0
-# which makes the coupling real-valued — that's the beamsplitter condition
-# in the complex-coupling formalism.
-# Here, in the real quadrature basis, BS vs TMS is explicit:
-#   BS block  = g · I₂     (symmetric, identity-like)
-#   TMS block = ν · σ_z    (anti-symmetric, σ_z-like)
-#
-# __call__(self, A, sigma):
-#   s_i = quadrature_slice(self.idxs[0])
-#   s_j = quadrature_slice(self.idxs[1])
-#   block = A[s_i, s_j]    shape (2, 2)
-#   TMS_residual = block[0,0] + block[1,1]   ← zero for pure BS (I₂ has equal diag)
-#   Wait — let me think more carefully:
-#     BS block  = [[g, 0], [0, g]]  (pure I₂)
-#     TMS block = [[ν, 0], [0, -ν]] (pure σ_z)
-#   A mixed block would have both g·I₂ and ν·σ_z components.
-#   To enforce pure BS: penalise the TMS component = block[1,1] + block[0,0]
-#     (for pure I₂: block[0,0] == block[1,1] so block[0,0] - block[1,1] = 0)
-#     Actually: to enforce pure I₂, require block[0,0] == block[1,1] AND off-diagonals = 0.
-#     Residual = (block[0,0] - block[1,1])² + block[0,1]² + block[1,0]²
-#   To enforce pure σ_z: block[0,0] == -block[1,1] AND off-diagonals = 0.
-#   So this constraint enforces "no TMS component" by penalising σ_z structure.
-#
-# Note: in a fully general graph, an edge between (i,j) could have BOTH a BS
-# and a TMS component simultaneously (different drives). This constraint
-# enforces that only the BS component is present for this edge.
-#
-# __str__(self):
-#   'Edge (%i, %i) is a beamsplitter (no TMS component)' % (idx1, idx2)
 
+# If edge (i,j) exists it must be a beamsplitter: block ~ g*I2, so the
+# symmetric (TMS-like) part of the block must vanish.
 class Constraint_coupling_beamsplitter(Coupling_Constraint):
+    slot = 'domain'   # §2.6(b): fixes the TYPE of an active edge
+
     def __call__(self, A, sigma):
         try:
             from reservoir_engineering.covariance_physics import quadrature_slice
@@ -245,25 +117,12 @@ class Constraint_coupling_beamsplitter(Coupling_Constraint):
         sym = (block + block.T) / 2        # TMS component — must be zero for pure BS
         return jnp.sum(sym ** 2)
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Constraint_coupling_two_mode_squeezing(i, j)
-# ───────────────────────────────────────────────────────────────────────────
-# No direct mirror in AutoScatter (TMS is the default for mixed-mode-type pairs).
-#
-# Architectural constraint: if an edge exists between i and j, it MUST be TMS
-# (σ_z block structure, no BS component).
-#
-# __call__(self, A, sigma):
-#   s_i = quadrature_slice(self.idxs[0])
-#   s_j = quadrature_slice(self.idxs[1])
-#   block = A[s_i, s_j]
-#   Residual = (block[0,0] + block[1,1])²  ← zero iff block is pure σ_z
-#            + block[0,1]² + block[1,0]²   ← off-diagonals should be 0
-#
-# Usage: enforce that a discovered BS-looking edge is actually TMS in the
-# physical experiment, or to restrict the search space.
 
+# If edge (i,j) exists it must be TMS: block ~ nu*sigma_z, so the
+# antisymmetric (BS-like) part of the block must vanish.
 class Constraint_coupling_two_mode_squeezing(Coupling_Constraint):
+    slot = 'domain'   # §2.6(b): fixes the TYPE of an active edge
+
     def __call__(self, A, sigma):
         try:
             from reservoir_engineering.covariance_physics import quadrature_slice
@@ -278,70 +137,30 @@ class Constraint_coupling_two_mode_squeezing(Coupling_Constraint):
     def __str__(self):
         return f'Edge ({self.idxs[0]},{self.idxs[1]}) is two-mode squeezing'
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Constraint_stability(penalty_strength=50.0)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: MinimalAddedInputNoise in autoscatter/constraints.py
-#
-# Physics constraint: the drift matrix A must be Hurwitz (all eigenvalues
-# have strictly negative real parts), guaranteeing a unique steady state.
-#
-# This is the single most important physics constraint with no AutoScatter
-# analogue in the simple case, because AutoScatter's passive systems are
-# automatically stable. Here, TMS interactions can make A unstable.
-#
-# __call__(self, A, sigma):
-#   eigenvalues = jnp.linalg.eigvals(A)   ← complex eigenvalues of A
-#   violation = jnp.sum(jnp.maximum(0., jnp.real(eigenvalues)))
-#   return self.penalty_strength * violation
-#
-#   Returns 0 if all eigenvalues have Re < 0 (stable).
-#   Returns a positive penalty proportional to how far into the unstable
-#   region the system is. The penalty_strength acts like a Lagrange multiplier
-#   pushing the optimizer away from instability.
-#
-# Used as an enforced_constraint in CovarianceOptimizer — added to the total
-# loss just like MinimalAddedInputNoise adds to the loss in AutoScatter.
-#
-# Analogy:
-#   AutoScatter's MinimalAddedInputNoise prevents the amplifier from violating
-#   the quantum noise limit (a hard physics constraint, soft-enforced).
-#   Our Constraint_stability prevents the system from having no steady state
-#   (also a hard physics requirement, soft-enforced via penalty).
 
+# A must be Hurwitz (all eigenvalues Re<0) for a steady state to exist.
+# No AutoScatter analogue in the simple case — its passive systems are
+# automatically stable, but TMS interactions here can destabilise A.
+# penalty_strength acts like a Lagrange multiplier pushing away from
+# instability; zero when stable.
 class Constraint_stability(Base_Constraint):
-    # To satisfy the stability condition
+    slot = 'soft'   # §2.6(c): lambda_stab*stab(A) term — must dominate the loss
+
     def __init__(self, penalty_strength=50.0):
         self.penalty_strength = penalty_strength
-    
+
     def __call__(self, A, sigma):
         eigs = jnp.linalg.eigvals(A)
         return self.penalty_strength * jnp.sum(jnp.maximum(0., jnp.real(eigs)))
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Constraint_physical_state(target_mode_ids)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: MinimalAddedOutputNoise in autoscatter/constraints.py
-#
-# Physics constraint: the achieved covariance σ_sub for the target modes
-# must satisfy the uncertainty principle (be a physical quantum state).
-#
-# Specifically: σ_sub + i/2 · Ω ≥ 0, equivalently all symplectic eigenvalues
-# of σ_sub must be ≥ ½ (vacuum noise level).
-#
-# __call__(self, A, sigma):
-#   Import get_mode_covariance from covariance_physics.
-#   sigma_sub = get_mode_covariance(sigma, self.target_mode_ids)
-#   nu_min = minimum symplectic eigenvalue of sigma_sub
-#   violation = jnp.maximum(0., 0.5 - nu_min)   ← 0 if physical
-#   return violation
-#
-# This is automatically satisfied when the Lyapunov equation is solved
-# correctly for a stable system — it's more of a diagnostic than a
-# constraint. Include as an enforced_constraint to guard against numerical
-# precision issues in near-unstable cases.
 
+# sigma_sub must satisfy the uncertainty principle (symplectic eigenvalues
+# >= 1/2). Automatically true once the Lyapunov solve succeeds for a stable
+# A — this is mostly a diagnostic guard against numerical issues near
+# marginal stability.
 class Constraint_physical_state(Base_Constraint):
+    slot = 'soft'   # §2.6(c): diagnostic penalty term
+
     def __init__(self, target_mode_ids):
         self.target_mode_ids = target_mode_ids
 
@@ -359,26 +178,13 @@ class Constraint_physical_state(Base_Constraint):
         eigs = jnp.linalg.eigvals(1j * Omega @ s)
         nu_min = jnp.min(jnp.abs(jnp.real(eigs)))
         return jnp.maximum(0., 0.5 - nu_min)
-        
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Constraint_target_squeezing(mode_id, r_min)
-# ───────────────────────────────────────────────────────────────────────────
-# No direct AutoScatter mirror, but analogous to enforcing a minimum gain.
-#
-# Physics constraint: mode `mode_id` must achieve AT LEAST squeezing r_min.
-# Used to guide the search toward genuinely squeezed solutions.
-#
-# __call__(self, A, sigma):
-#   sigma_mode = sigma[2*mode_id:2*mode_id+2, 2*mode_id:2*mode_id+2]
-#   sigma_xx = sigma_mode[0, 0]   ← x-quadrature variance
-#   r_achieved = -0.5 * jnp.log(2. * sigma_xx)
-#   violation = jnp.maximum(0., self.r_min - r_achieved)
-#   return violation
-#
-# Set r_min = target_r to require the optimizer to match the target squeezing
-# level — this is a "reach at least this squeezing" floor constraint.
 
+
+# mode_id must reach at least squeezing r_min (a "floor" constraint used to
+# steer the search toward genuinely squeezed solutions).
 class Constraint_target_squeezing(Base_Constraint):
+    slot = 'soft'   # §2.6(c): penalty coupled to the value of sigma
+
     def __init__(self, mode_id, r_min):
         self.mode_id = mode_id
         self.r_min = r_min
@@ -388,26 +194,12 @@ class Constraint_target_squeezing(Base_Constraint):
         r_achieved = -0.5 * jnp.log(2. * sigma_xx)
         return jnp.maximum(0., self.r_min - r_achieved)
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Constraint_entanglement(mode_ids)
-# ───────────────────────────────────────────────────────────────────────────
-# No AutoScatter mirror.
-#
-# Physics constraint: the two modes in mode_ids must be entangled, as
-# diagnosed by the Duan criterion (violation of separability).
-#
-# __call__(self, A, sigma):
-#   sigma_sub = get_mode_covariance(sigma, self.mode_ids)   ← 4×4 block
-#   Compute Duan criterion: define u = x_0 - x_1, v = p_0 + p_1
-#   duan_sum = Var(u) + Var(v)  (using sigma_sub)
-#   violation = jnp.maximum(0., duan_sum - 1.0)
-#   Returns 0 if entangled (criterion violated = duan_sum < 1).
-#   Returns positive value if separable.
-#
-# Used as an enforced_constraint when targeting entangled states (e.g.,
-# two-mode squeezed vacuum, cluster states).
 
+# The two modes in mode_ids must be entangled per the Duan criterion
+# (Var(x0-x1) + Var(p0+p1) < 1). Zero when entangled, positive when separable.
 class Constraint_entanglement(Base_Constraint):
+    slot = 'soft'   # §2.6(c): penalty coupled to the value of sigma
+
     def __init__(self, mode_ids):
         self.mode_ids = mode_ids
 
@@ -421,32 +213,10 @@ class Constraint_entanglement(Base_Constraint):
                     s[1,1] + s[3,3] + 2*s[1,3])
         return jnp.maximum(0., duan_sum - 1.0)
 
-# ───────────────────────────────────────────────────────────────────────────
-# FUNCTION: return_edge_type(A, i, j) → str or None
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: return_edge_type(combos, mode_types, idx1, idx2) in autoscatter/constraints.py
-#
-# Infer the edge type between modes i and j from the drift matrix A.
-# Used by plot_graph and by check_all_constraints to read off the topology.
-#
-# Method:
-#   s_i = quadrature_slice(i)
-#   s_j = quadrature_slice(j)
-#   block = A[s_i, s_j]    shape (2, 2)
-#
-#   If ‖block‖_F < threshold:
-#       return EDGETYPE_ABSENT
-#   Else:
-#       BS component  = (block[0,0] + block[1,1]) / 2   ← trace / 2 ≈ g if pure BS
-#       TMS component = (block[0,0] - block[1,1]) / 2   ← (σ_z trace) / 2 ≈ ν if pure TMS
-#       If |TMS component| > |BS component|: return EDGETYPE_TWO_MODE_SQUEEZING
-#       Else: return EDGETYPE_BEAMSPLITTER
-#
-# For diagonal blocks (i == j):
-#   Check if A[2i, 2i] ≈ A[2i+1, 2i+1] (symmetric = no parametric squeezing)
-#   If |A[2i,2i] - A[2i+1,2i+1]| > threshold: return EDGETYPE_PARAMETRIC
-#   Else: return None (only decay, no active squeezing self-coupling)
 
+# Infer the edge type between modes i,j from A's block: near-zero -> absent;
+# else compare the symmetric (BS) vs antisymmetric (TMS) component. Diagonal
+# (i==j): unequal x/p decay rates -> parametric squeezing present.
 def return_edge_type(A, i, j, threshold=1e-4):
     try:
         from reservoir_engineering.covariance_physics import quadrature_slice
@@ -466,21 +236,23 @@ def return_edge_type(A, i, j, threshold=1e-4):
         return EDGETYPE_TWO_MODE_SQUEEZING
     return EDGETYPE_BEAMSPLITTER
 
-# ───────────────────────────────────────────────────────────────────────────
-# CLASS: Constraint_coupling_symmetric(i1, j1, edge_type1, i2, j2, edge_type2)
-# ───────────────────────────────────────────────────────────────────────────
-# Penalises |u_a − u_b|² to enforce equal coupling strengths between two edges.
-# edge_type: 'bea' (beamsplitter) or 'two' (two_mode_squeezing).
-# Called with (log_ratios, edges) instead of (A, sigma) — detected and dispatched
-# specially inside give_conditions_func_with_conditions.
 
+# Penalises |u_a - u_b|^2 to tie two edges' coupling strengths together.
+# edge_type: 'bea'|'two' (first 3 chars). Dispatched specially (called with
+# (log_ratios, edges) rather than (A, sigma)) inside
+# give_conditions_func_with_conditions.
 class Constraint_coupling_symmetric:
+    # Implemented as a soft hinge, not a hard tie of the two variables into
+    # one (which would be the stricter §2.6(b)-domain approach) — tagged
+    # 'soft' to reflect the mechanism actually used.
+    slot = 'soft'
+
     def __init__(self, i1, j1, edge_type1, i2, j2, edge_type2,
                  penalty_strength=10.0, guard_edges=None):
         self.edge_a = (min(i1, j1), max(i1, j1), edge_type1[:3])
         self.edge_b = (min(i2, j2), max(i2, j2), edge_type2[:3])
         self.penalty_strength = penalty_strength
-        # guard_edges: list of (i, j, type_prefix) — ALL must exist before penalty fires
+        # guard_edges: (i,j,type_prefix) that must ALL be present for the penalty to fire
         self.guard_edges = [(min(i, j), max(i, j), t[:3]) for i, j, t in (guard_edges or [])]
 
     def __call__(self, log_ratios, edges):
@@ -499,29 +271,131 @@ class Constraint_coupling_symmetric:
             return 0.0
         return self.penalty_strength * (log_ratios[idx_a] - log_ratios[idx_b]) ** 2
 
-# ───────────────────────────────────────────────────────────────────────────
-# FUNCTION: setup_constraints(edges_absent, edges_beamsplitter, edges_tms) → list
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: setup_constraints(couplings_set_to_zero, coupling_phases_set_to_zero)
-#          in autoscatter/constraints.py
-#
-# Factory function: build a list of constraint objects from index lists.
-#
-# Parameters:
-#   edges_absent       : list of (i, j) pairs — these edges are absent
-#   edges_beamsplitter : list of (i, j) pairs — these edges are BS type
-#   edges_tms          : list of (i, j) pairs — these edges are TMS type
-#
-# Returns:
-#   list of constraint objects (Constraint_coupling_absent, etc.)
-#
-# Example:
-#   conditions = setup_constraints(
-#       edges_absent       = [(0,1)],   # no coupling between modes 0 and 1
-#       edges_beamsplitter = [(0,2)],   # beamsplitter between 0 and 2
-#       edges_tms          = [],
-#   )
 
+# §2.6(b) domain: restricts one beamsplitter edge's coupling to be REAL
+# (phase pinned to 0), i.e. opts INTO the old always-real behaviour for
+# that specific edge. General beamsplitter couplings are complex by
+# default (see covariance_physics.build_hamiltonian_matrix's phase
+# generalisation, and Zippilli & Vitali PRL 126, 020402 (2021) eq.
+# S.27-S.29 — the passivity-preserving phase is generically nonzero, so
+# forcing real is a restriction the user opts into, not the baseline).
+# Detected structurally by CovarianceOptimizer.__init__ (like
+# Constraint_coupling_absent) — the phase variable for a real-pinned edge
+# is never created, not soft-penalized to zero, so this is free/exact.
+class Constraint_real_coupling(Coupling_Constraint):
+    slot = 'domain'   # §2.6(b): fixes the coupling's phase, not just its type
+
+    def __init__(self, i, j, edge_type='beamsplitter'):
+        super().__init__(i, j)
+        self.edge_type = edge_type
+
+    def __call__(self, A, sigma):
+        # Structurally enforced (no phase variable exists for this edge) —
+        # nothing left to penalise in the loss.
+        return 0.0
+
+    def __str__(self):
+        return f'Edge ({self.idxs[0]},{self.idxs[1]}) coupling is real-only'
+
+
+# §2.6 domain example "passivity": bars TMS/squeezing/gain on the given
+# modes. A fully passive network fed by vacuum can't create entanglement or
+# squeezing, so the target's non-passive resource must live elsewhere
+# (typically auxiliary modes). __call__ is a soft-penalty fallback for
+# callers that add this directly to enforced_constraints instead of routing
+# it through ConstraintRegistry's palette masking.
+class Constraint_passivity(Base_Constraint):
+    slot = 'domain'
+
+    def __init__(self, mode_ids):
+        self.mode_ids = list(mode_ids)
+
+    def __call__(self, A, sigma):
+        try:
+            from reservoir_engineering.covariance_physics import quadrature_slice
+        except ImportError:
+            from covariance_physics import quadrature_slice
+        penalty = 0.0
+        N = A.shape[0] // 2
+        for i in self.mode_ids:
+            si = quadrature_slice(i)
+            for j in range(N):
+                if j == i:
+                    continue
+                sj = quadrature_slice(j)
+                block = A[si, sj]
+                sym = (block + block.T) / 2   # TMS/squeezing component
+                penalty = penalty + jnp.sum(sym ** 2)
+        return penalty
+
+    def __str__(self):
+        return f'Modes {self.mode_ids} must be passive (beamsplitter-only, no gain)'
+
+
+# §2.6 soft example "coupling-strength cap": hinge penalty when one edge's
+# dimensionless coupling G~_k=exp(u_k) (i.e. g_k/kappa0 — see
+# covariance_optimizer's (G-tilde,C-tilde) parametrisation) exceeds
+# G_tilde_max. (A hard bound belongs in slot (a) — see
+# DIRECT_LOG_BOUND_DEFAULT in covariance_optimizer.py — use this only when a
+# soft, per-edge trade-off is preferred over one global cap.) Caps the
+# dimensionless ratio directly, not a literal cooperativity C=4g^2/(kappa*gamma)
+# — that would need both endpoints' decay rates, which this per-edge,
+# decay-blind constraint doesn't have; use the achieved solution's
+# post-hoc 'cooperativities' dict (in optimize_given_conditions's info_out)
+# to check the real cooperativity after the fact instead.
+# Dispatched like Constraint_coupling_symmetric: called as (u, edges) where
+# u are the coherent log-ratios only (not the auxiliary log-rates).
+class Constraint_cooperativity_cap:
+    slot = 'soft'
+
+    def __init__(self, i, j, edge_type, G_tilde_max, penalty_strength=1.0):
+        self.edge = (min(i, j), max(i, j), edge_type[:3])
+        self.G_tilde_max = G_tilde_max
+        self.penalty_strength = penalty_strength
+
+    def __call__(self, log_ratios, edges):
+        for k, e in enumerate(edges):
+            key = (min(e['i'], e['j']), max(e['i'], e['j']), e.get('type', '')[:3])
+            if key == self.edge:
+                G_tilde_k = jnp.exp(log_ratios[k])
+                return self.penalty_strength * jnp.maximum(0., G_tilde_k - self.G_tilde_max) ** 2
+        return 0.0
+
+
+# Classifies a flat constraint list into the three §2.6 slots. Thin,
+# non-mutating — structural/domain constraints already flow through
+# translate_triu_to_conditions/give_free_variable_idxs as slots (a)/(b)
+# describe; this just lets a caller inspect where each requirement landed.
+class ConstraintRegistry:
+    def __init__(self, constraints=None):
+        self.constraints = list(constraints or [])
+
+    @property
+    def structural(self):
+        return [c for c in self.constraints if getattr(c, 'slot', None) == 'structural']
+
+    @property
+    def domain(self):
+        return [c for c in self.constraints if getattr(c, 'slot', None) == 'domain']
+
+    @property
+    def soft(self):
+        return [c for c in self.constraints if getattr(c, 'slot', None) == 'soft']
+
+    def add(self, constraint):
+        self.constraints.append(constraint)
+        return self
+
+    def __iter__(self):
+        return iter(self.constraints)
+
+    def __repr__(self):
+        return (f'ConstraintRegistry(structural={len(self.structural)}, '
+                f'domain={len(self.domain)}, soft={len(self.soft)})')
+
+
+# Factory: build a constraint list from index lists, e.g.
+# setup_constraints(edges_absent=[(0,1)], edges_beamsplitter=[(0,2)]).
 def setup_constraints(edges_absent=None, edges_beamsplitter=None, edges_tms=None):
     conditions = []
     for (i,j) in (edges_absent or []):
@@ -532,19 +406,9 @@ def setup_constraints(edges_absent=None, edges_beamsplitter=None, edges_tms=None
         conditions.append(Constraint_coupling_two_mode_squeezing(i, j))
     return conditions
 
-# ───────────────────────────────────────────────────────────────────────────
-# FUNCTION: check_overlapping_constraints(list_of_constraints)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: check_overlapping_constraints in autoscatter/constraints.py
-#
-# Validate that a constraint list has no contradictions:
-#   - Same edge cannot be both absent AND beamsplitter.
-#   - Same edge cannot be both absent AND TMS.
-#   - Same edge cannot appear twice with different types.
-#
-# Raise a descriptive Exception if any overlap is found.
-# Used at the start of optimize_given_conditions to fail fast on bad input.
 
+# Raise if a constraint list is contradictory (same edge marked both absent
+# and typed). Used to fail fast on bad input.
 def check_overlapping_constraints(list_of_constraints):
     from collections import defaultdict
     by_edge = defaultdict(list)
@@ -555,18 +419,8 @@ def check_overlapping_constraints(list_of_constraints):
         if 'Constraint_coupling_absent' in types and len(types) > 1:
             raise ValueError(f"Contradictory constraints on edge {edge}: absent + type")
 
-# ───────────────────────────────────────────────────────────────────────────
-# FUNCTION: cleanup_list_of_constraints(combo) → list
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: cleanup_list_of_constraints in autoscatter/constraints.py
-#
-# Remove redundant constraints from a combo list.
-# If an edge is marked absent AND has a type constraint (BS or TMS), the type
-# constraint is redundant (an absent edge has no type). Remove the type constraint.
-#
-# Returns a cleaned copy of the constraint list.
-# Used by cleanup_valid_combinations to canonicalise discovered topologies.
 
+# Drop redundant type constraints on edges already marked absent.
 def cleanup_list_of_constraints(combo):
     absent = {tuple(c.idxs) for c in combo if isinstance(c, Constraint_coupling_absent)}
     return [c for c in combo
@@ -574,44 +428,10 @@ def cleanup_list_of_constraints(combo):
                                    Constraint_coupling_two_mode_squeezing))
                     and tuple(c.idxs) in absent)]
 
-# ───────────────────────────────────────────────────────────────────────────
-# FUNCTION: plot_graph(nodes, edges_or_triu, coupling_strengths, node_colors,
-#                      mode_types, positions, ax, edge_width, ...)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: plot_graph(...) in autoscatter/constraints.py  (exact analogue)
-#
-# Draw the open quantum system graph using networkx + matplotlib.
-# Directly mirrors the AutoScatter plot_graph function.
-#
-# Parameters:
-#   nodes             : list of node dicts OR None (infer from node_types)
-#   edges_or_triu     : list of edge dicts OR triu_array (upper-triangle encoding)
-#   coupling_strengths: array of coupling values OR None
-#   node_colors       : list of colors, one per node (e.g. 'blue' for cavity,
-#                       'orange' for mechanical) — mirrors AutoScatter's node_colors
-#   mode_types        : list of 'cavity'|'mechanical' (for edge type inference)
-#   positions         : dict {node_idx: (x,y)} for fixed layout, or None
-#   ax                : matplotlib Axes, or None
-#   edge_width        : float (default 2, same as AutoScatter default)
-#
-# Visual encoding:
-#   Node colours: caller-specified via node_colors (same as AutoScatter pattern).
-#   Edge colours (mirrors AutoScatter's color_active, color_passive, color_squeezing):
-#     Beamsplitter (BS)          : green  (mirrors color_passive in AutoScatter)
-#     Two-mode squeezing (TMS)   : blue   (mirrors color_squeezing in AutoScatter)
-#     Parametric (single-mode)   : red    (new, no AutoScatter analogue)
-#   Decay / bath channels: shown as dashed lines from nodes to open circles.
-#
-# Implementation steps:
-#   1. Build networkx Graph G with N nodes.
-#   2. For each non-zero upper-triangle entry in the edge matrix,
-#      determine edge type via return_edge_type and assign colour.
-#   3. Add edges to G with colour attribute.
-#   4. Call nx.draw with node_color, edge_color, and width attributes.
-#
-# Produce plots that look like AutoScatter's output graphs but with the
-# richer colour scheme for the three edge types.
 
+# Draw the graph via networkx+matplotlib: BS edges green, TMS blue,
+# parametric red self-loops; edge width proportional to coupling_strengths
+# if given. Not yet implemented.
 def plot_graph(
     nodes=None,
     edges_or_triu=None,
@@ -628,28 +448,8 @@ def plot_graph(
     pass
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# FUNCTION: plot_list_of_graphs(list_of_triu_arrays, node_types, node_colors,
-#                               positions, architectures_per_row, ...)
-# ───────────────────────────────────────────────────────────────────────────
-# MIRRORS: plot_list_of_graphs in autoscatter/constraints.py  (exact analogue)
-#
-# Plot a grid of graphs — one per element of list_of_triu_arrays.
-# Used after perform_breadth_first_search to visualise all valid topologies.
-#
-# Parameters:
-#   list_of_triu_arrays  : list of 1D arrays (upper-triangle edge encodings)
-#   node_types           : list of 'cavity'|'mechanical' for the N nodes
-#   node_colors          : list of colors per node
-#   positions            : optional fixed layout
-#   architectures_per_row: int, default 5 (same as AutoScatter)
-#   size_per_column      : float, default 2.5 (same as AutoScatter)
-#   size_per_row         : float, default 2.5 (same as AutoScatter)
-#
-# Creates a multi-panel figure with one subplot per topology.
-# Calls plot_graph() for each panel.
-# Axes that have no corresponding graph are turned off.
-
+# Grid of plot_graph panels, one per topology in list_of_triu_arrays. Not
+# yet implemented.
 def plot_list_of_graphs(
     list_of_triu_arrays,
     node_types,

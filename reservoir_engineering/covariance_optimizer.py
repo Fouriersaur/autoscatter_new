@@ -74,6 +74,29 @@ BOUNDS_STRENGTH_DEFAULT      = [0., np.inf]   # strengths are non-negative
 INIT_LOG_RATIO_RANGE_DEFAULT = [-1.0, 1.0]    # initial u_k/v_m draw range (G~_k in [e^-1,e^1])
 DETUNING_BOUND_DEFAULT       = 20.0
 
+# Detunings must NOT be initialised at exactly 0. At Delta=0 a mode can be
+# left completely undamped (a "dark" collective mode decoupled from every
+# dissipative channel), so A has eigenvalues with Re=0 and the Lyapunov
+# equation is SINGULAR: no steady state exists, the loss is undefined, and
+# its gradient blows up (~1e18 in practice). L-BFGS-B's line search then
+# fails on the very first step and the detunings never leave zero — every
+# restart returns Delta=0 exactly. This is not a flat/stationary point the
+# optimiser could climb out of; it is a pole of the objective.
+#
+# Woolley-Clerk-type schemes live exactly here: their Omega*(a^dag a -
+# b^dag b) term exists precisely to split the otherwise DEGENERATE Bogoliubov
+# modes (one combination of which is dark and never cooled), so Delta=0 is
+# the one point at which the scheme is undefined — cf. Woolley & Clerk PRA
+# 89, 063805 (2014) eq. (22a), Omega >> gamma. Starting there makes such
+# topologies unreachable, and the search instead invents a spurious weak
+# coupling whose only job is to break the dark mode and regularise the solve.
+# Each restart therefore draws Delta_i ~ U(-scale, +scale); the jitter also
+# supplies the asymmetry these schemes need (Delta_1 = -Delta_2 != 0).
+# Override via kwargs_optimization['init_detuning_scale'] (0.0 restores the
+# old always-zero behaviour). Note a finite mechanical gamma>0 damps the dark
+# mode and removes the singularity independently of this.
+INIT_DETUNING_SCALE_DEFAULT  = 1.0
+
 # §1.5 (G-tilde, C-tilde) parametrisation: no lambda, no decay_i*decay_j
 # reconstruction — g_k=kappa0*exp(u_k) directly, works identically at
 # decay=0 or decay>0 (see covariance_physics.build_drift_diffusion_from_GC_tilde).
@@ -558,9 +581,11 @@ class CovarianceOptimizer:
         return loss_jit, grad_jit, None
 
     # Sample the initial parameter vector: E+A log-ratios/log-rates ~
-    # Uniform(INIT_LOG_RATIO_RANGE_DEFAULT), plus N detunings at 0 if
-    # optimize_detunings (always start at resonance; the optimiser moves away
-    # from 0 only if the target needs off-resonance driving).
+    # Uniform(INIT_LOG_RATIO_RANGE_DEFAULT), plus N detunings drawn from
+    # Uniform(-init_detuning_scale, +init_detuning_scale) if optimize_detunings.
+    # The detunings are deliberately NOT started at resonance — Delta=0 can be a
+    # singular point of the Lyapunov solve (undamped dark mode), see
+    # INIT_DETUNING_SCALE_DEFAULT.
     def create_initial_guess(
         self,
         conditions: list = [],
@@ -574,7 +599,10 @@ class CovarianceOptimizer:
         u_init = np.random.uniform(lo, hi, E).astype(float)
 
         if optimize_detunings:
-            x0 = np.concatenate([u_init, np.zeros(self.num_modes)])
+            d_scale = self.kwargs_optimization.get('init_detuning_scale',
+                                                    INIT_DETUNING_SCALE_DEFAULT)
+            d_init = np.random.uniform(-d_scale, d_scale, self.num_modes)
+            x0 = np.concatenate([u_init, d_init])
         else:
             x0 = u_init
 
@@ -751,8 +779,22 @@ class CovarianceOptimizer:
         # by the per-edge init alone); ramping the reachable scale up
         # gradually escapes that far more reliably than jumping straight to
         # the full bound. Skipped when there's nothing to warm up.
+        # Detuning init: jittered, never all-zero — see INIT_DETUNING_SCALE_DEFAULT
+        # (Delta=0 is a singular point of the Lyapunov solve, not merely a poor
+        # guess). The warm-up below holds the detunings FIXED at this draw while
+        # it ramps the coupling scale, so it must use the same nonzero values —
+        # pinning them back to 0 there would put the warm-up itself inside the
+        # singular region.
+        if optimize_detunings:
+            d_scale = self.kwargs_optimization.get('init_detuning_scale',
+                                                    INIT_DETUNING_SCALE_DEFAULT)
+            d_init = np.random.uniform(-d_scale, d_scale, N)
+            d_init = np.clip(d_init, -d_bound, d_bound)
+        else:
+            d_init = np.zeros(N)
+
         if n_coupling_vars > 0:
-            zeros_tail = np.zeros(N) if optimize_detunings else np.zeros(0)
+            zeros_tail = d_init if optimize_detunings else np.zeros(0)
 
             def pad(yy):
                 return np.concatenate([yy, zeros_tail]) if optimize_detunings else yy
@@ -773,7 +815,7 @@ class CovarianceOptimizer:
                 y = wres.x
             x0_coupling = y
 
-        x0 = np.concatenate([x0_coupling, np.zeros(N)]) if optimize_detunings else x0_coupling
+        x0 = np.concatenate([x0_coupling, d_init]) if optimize_detunings else x0_coupling
 
         loss_history = []
         def callback(x):
@@ -967,7 +1009,17 @@ class CovarianceOptimizer:
             BEAMSPLITTER_AND_TWO_MODE_SQUEEZING)
 
         if threshold is None:
-            threshold = 1e-6
+            # Must sit ABOVE the smallest representable coupling. With
+            # g_k = kappa0*exp(u_k) and |u_k| <= direct_log_bound, a coupling
+            # the optimiser has fully suppressed cannot reach 0 — it parks at
+            # the floor kappa0*exp(-bound) (=1e-4 for the defaults). The old
+            # hard-coded 1e-6 sat 100x BELOW that floor, so a maximally
+            # suppressed edge always read as "present" and graph reduction
+            # could never prune it, systematically over-reporting edge count.
+            # Take a margin above the floor instead.
+            bound = self.kwargs_optimization.get('direct_log_bound',
+                                                  DIRECT_LOG_BOUND_DEFAULT)
+            threshold = max(1e-6, 10.0 * self.kappa0 * float(np.exp(-bound)))
 
         A_jnp = jnp.array(A)
         sigma_jnp = jnp.array(sigma)

@@ -101,8 +101,39 @@ class Constraint_coupling_absent(Coupling_Constraint):
         return f'No coupling between mode {self.idxs[0]} and mode {self.idxs[1]}'
 
 
-# If edge (i,j) exists it must be a beamsplitter: block ~ g*I2, so the
-# symmetric (TMS-like) part of the block must vanish.
+# Decompose a 2x2 coupling block in the basis {I2, J2, sx, sz} and return
+# (bs_character, tms_character) as squared norms of the two halves.
+#
+# A plain symmetric/antisymmetric split is WRONG here. From
+# covariance_physics.build_hamiltonian_matrix, a beamsplitter with a COMPLEX
+# coupling J=g*e^{i theta} contributes
+#     block = Re(J)*J2 + Im(J)*I2,
+# and I2 is SYMMETRIC. So the symmetric part of a perfectly good beamsplitter
+# block is Im(J)*I2 != 0 whenever the phase is nonzero — and beamsplitter
+# phases are free by DEFAULT in this package. Calling the symmetric part "the
+# TMS component" therefore mislabels every BS edge with |theta|>45deg (where
+# |Im J|>|Re J|) as two_mode_squeezing, corrupting return_edge_type,
+# check_all_constraints and hence the reduced topologies in
+# valid_combinations.
+#
+# The correct invariant split is by which basis matrices each edge type can
+# produce at all:
+#     beamsplitter        -> I2 (Im J) and J2 (Re J)     [the "rotation" half]
+#     two_mode_squeezing  -> sx                          [the "reflection" half]
+#     parametric          -> sz                          (diagonal blocks only)
+# I2/J2 and sx/sz are mutually orthogonal under the Frobenius product, so the
+# projection is exact and phase-independent.
+def _block_bs_tms_character(block):
+    alpha = (block[0, 0] + block[1, 1]) / 2     # I2  coefficient (BS, from Im J)
+    beta  = (block[0, 1] - block[1, 0]) / 2     # J2  coefficient (BS, from Re J)
+    gamma = (block[0, 1] + block[1, 0]) / 2     # sx  coefficient (TMS)
+    delta = (block[0, 0] - block[1, 1]) / 2     # sz  coefficient (parametric-like)
+    return alpha ** 2 + beta ** 2, gamma ** 2 + delta ** 2
+
+
+# If edge (i,j) exists it must be a beamsplitter: its block may only carry
+# I2/J2 character, so the sx/sz (TMS) character must vanish. Phase-independent
+# — see _block_bs_tms_character.
 class Constraint_coupling_beamsplitter(Coupling_Constraint):
     slot = 'domain'   # §2.6(b): fixes the TYPE of an active edge
 
@@ -113,13 +144,14 @@ class Constraint_coupling_beamsplitter(Coupling_Constraint):
             from covariance_physics import quadrature_slice
         si = quadrature_slice(self.idxs[0])
         sj = quadrature_slice(self.idxs[1])
-        block = A[si, sj]
-        sym = (block + block.T) / 2        # TMS component — must be zero for pure BS
-        return jnp.sum(sym ** 2)
+        _, tms_character = _block_bs_tms_character(A[si, sj])
+        return 2.0 * tms_character         # must be zero for a pure BS edge
 
 
-# If edge (i,j) exists it must be TMS: block ~ nu*sigma_z, so the
-# antisymmetric (BS-like) part of the block must vanish.
+# If edge (i,j) exists it must be TMS: its block may only carry sx character,
+# so the I2/J2 (beamsplitter) character must vanish. Counterpart of
+# Constraint_coupling_beamsplitter — see _block_bs_tms_character for why this
+# is not the plain antisymmetric part.
 class Constraint_coupling_two_mode_squeezing(Coupling_Constraint):
     slot = 'domain'   # §2.6(b): fixes the TYPE of an active edge
 
@@ -130,9 +162,8 @@ class Constraint_coupling_two_mode_squeezing(Coupling_Constraint):
             from covariance_physics import quadrature_slice
         si = quadrature_slice(self.idxs[0])
         sj = quadrature_slice(self.idxs[1])
-        block = A[si, sj]
-        asym = (block - block.T) / 2       # BS component — must be zero for pure TMS
-        return jnp.sum(asym ** 2)
+        bs_character, _ = _block_bs_tms_character(A[si, sj])
+        return 2.0 * bs_character          # must be zero for a pure TMS edge
 
     def __str__(self):
         return f'Edge ({self.idxs[0]},{self.idxs[1]}) is two-mode squeezing'
@@ -230,9 +261,11 @@ def return_edge_type(A, i, j, threshold=1e-4):
     block = np.array(A[si, sj])
     if np.linalg.norm(block, 'fro') < threshold:
         return EDGETYPE_ABSENT
-    sym  = (block + block.T) / 2
-    asym = (block - block.T) / 2
-    if np.linalg.norm(sym) > np.linalg.norm(asym):
+    # {I2,J2} vs {sx,sz} projection, NOT symmetric/antisymmetric — a complex
+    # beamsplitter's Im(J)*I2 term is symmetric and would otherwise read as
+    # TMS for any |theta|>45deg. See _block_bs_tms_character.
+    bs_character, tms_character = _block_bs_tms_character(block)
+    if tms_character > bs_character:
         return EDGETYPE_TWO_MODE_SQUEEZING
     return EDGETYPE_BEAMSPLITTER
 

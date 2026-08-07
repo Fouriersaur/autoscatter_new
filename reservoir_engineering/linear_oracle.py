@@ -755,6 +755,76 @@ def attractivity_filter(
 #
 #     Gated on coupled_drains=False: a reservoir shared between two drains
 #     could correlate their components, and then the argument fails.
+# _orthonormal / _nullspace / _restrict: small subspace helpers for the
+# undamped-subspace certificate below. Columns are always kept orthonormal
+# so that C @ C.T is the orthogonal projector onto the subspace.
+def _nullspace(M: np.ndarray, rtol: float = 1e-10) -> np.ndarray:
+    if M.size == 0:
+        return np.eye(M.shape[1] if M.ndim == 2 else 0)
+    _, s, Vt = np.linalg.svd(M)
+    top = float(s[0]) if s.size else 0.0
+    rank = int(np.sum(s > rtol * max(top, 1e-300)))
+    return Vt[rank:].T
+
+
+# undamped_subspace(triu, num_modes, aux_ids) -> basis for the largest
+# subspace W such that, for EVERY admissible (G, Upsilon) on this graph,
+#     A(G,Upsilon)^T W subset W    and    D(Upsilon) W = 0.
+#
+# §4A's "a mode (or Bogoliubov combination) left undamped — unreachable by
+# any dissipative channel through the graph", in its general form.
+#
+# Why a nonzero W certifies invalidity. Pick w in W an eigenvector of the
+# restriction of A^T to W (it exists over C). Then w is a left eigenvector
+# of A, and D w = 0, so by §3's identity 2 Re(lambda) w^dag V w =
+# -w^dag D w = 0, giving Re lambda = 0. A is therefore non-Hurwitz for
+# every admissible choice, so no attractive solution exists on this graph.
+# Sound with no numerical solve at all — it is a property of the generator
+# subspaces, not of any particular solution.
+#
+# The computation is the standard largest-invariant-subspace iteration:
+# start from the directions no diffusion generator can reach, then
+# repeatedly discard anything the drift generators push out, until stable.
+#
+# This SUBSUMES the whole-mode connectivity argument (a disconnected
+# signal component's coordinates form such a W) while also catching
+# collective/Bogoliubov dark modes that no per-mode reachability test can
+# see. Measured on the two-mode-squeezed target it certifies exactly the
+# same 80 graphs as the connectivity argument — there the dark modes of
+# the remaining graphs are parameter-DEPENDENT, so no common W exists —
+# but it is the correct general statement and costs microseconds.
+def undamped_subspace(triu_array, num_modes: int, aux_ids: List[int],
+                       coupled_drains: bool = False, rtol: float = 1e-9) -> np.ndarray:
+    dim = 2 * num_modes
+    h_basis = hamiltonian_basis(triu_array, num_modes,
+                                include_detunings=True, allow_phases=True)
+    d_basis = dissipation_basis(aux_ids, num_modes, coupled_drains=coupled_drains)
+    Om = symplectic_form(num_modes)
+
+    # W must be annihilated by every diffusion generator D_c = Om Re(Y_c) Om^T.
+    Ds = [Om @ Sc @ Om.T for _, Sc, _ in d_basis]
+    W = _nullspace(np.vstack(Ds), rtol) if Ds else np.eye(dim)
+
+    # A^T = -(G - Im Y) Om, so its generators are -G_b Om and +Im(Y_c) Om.
+    gens = [-Gb @ Om for _, Gb in h_basis] + [Tc @ Om for _, _, Tc in d_basis]
+
+    for _ in range(dim + 2):
+        if W.shape[1] == 0:
+            break
+        cur = W
+        for M in gens:
+            if cur.shape[1] == 0:
+                break
+            P = cur @ cur.T                      # cur is orthonormal
+            K = _nullspace((np.eye(dim) - P) @ M @ cur, rtol)
+            cur = cur @ K if K.shape[1] else np.zeros((dim, 0))
+        if cur.shape[1] == W.shape[1]:
+            W = cur
+            break
+        W = cur
+    return W
+
+
 def structural_certificate(
     triu_array,
     V: np.ndarray,
@@ -767,11 +837,21 @@ def structural_certificate(
     rows, cols = np.triu_indices(n)
     aux = set(i for i in range(n) if i not in target_mode_ids)
 
+    # Connectivity is over Hamiltonian edges AND shared dissipators (§4A:
+    # "the graph's connectivity (Hamiltonian edges and shared dissipators)").
+    # With coupled_drains the auxiliary modes may share one reservoir, which
+    # correlates them and therefore bridges components the edges alone leave
+    # separate — so those links must be added before any cut argument.
     adj = [[] for _ in range(n)]
     for k, (i, j) in enumerate(zip(rows, cols)):
         if i != j and int(triu_array[k]) != NO_COUPLING:
             adj[i].append(j)
             adj[j].append(i)
+    if coupled_drains:
+        aux_list = sorted(aux)
+        for a, b in zip(aux_list, aux_list[1:]):
+            adj[a].append(b)
+            adj[b].append(a)
 
     comp = [-1] * n
     for start in range(n):
@@ -795,6 +875,20 @@ def structural_certificate(
                               'zero cannot all have Re < 0, so A is not Hurwitz for any G'
                               .format([i for i in members if i in target_mode_ids]))}
 
+    # (a2) undamped SUBSPACE — the general form of (a), covering collective
+    # and Bogoliubov dark modes that a per-mode connectivity test cannot
+    # see. Checked after (a) only because (a) is cheaper and yields a more
+    # readable certificate when it applies; (a2) subsumes it.
+    W = undamped_subspace(triu_array, n, list(aux), coupled_drains=coupled_drains)
+    if W.shape[1] > 0:
+        return {'kind': 'undamped_subspace', 'dim': int(W.shape[1]),
+                'basis': W,
+                'note': ('a {}-dimensional subspace is annihilated by every admissible '
+                          'diffusion generator AND invariant under every admissible drift '
+                          'generator, so it carries a left eigenvector with Re(lambda) = 0 '
+                          'for EVERY (G, Upsilon) on this graph; A can never be Hurwitz'
+                          .format(W.shape[1]))}
+
     # (b) target demands correlation across a cut
     if not coupled_drains:
         for a in target_mode_ids:
@@ -813,6 +907,213 @@ def structural_certificate(
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# §4B dissipator factorisation: reading the reservoir off the solution
+# ───────────────────────────────────────────────────────────────────────────
+# factor_dissipator(Upsilon, num_modes) -> one entry per dissipative channel.
+#
+# The doc's §4B readout. Rather than deciding vacuum-vs-squeezed by varying
+# the drain STATE and re-solving, take the Upsilon a solve already returned,
+# factor it as C^dag C, and read the reservoir directly off each jump vector:
+#
+#   L = c_x x + c_p p,  and with x = (a + a^dag)/sqrt2, p = (a - a^dag)/(i sqrt2),
+#       L = alpha a + beta a^dag,   alpha = (c_x - i c_p)/sqrt2
+#                                   beta  = (c_x + i c_p)/sqrt2
+#
+# beta is the ANOMALOUS (a^dag) weight. beta = 0 is a plain-loss channel — a
+# vacuum reservoir — and beta != 0 is a Bogoliubov channel, i.e. a squeezed
+# reservoir with
+#       squeezing  s = arctanh(|beta| / |alpha|)
+#       phase      = arg(beta) - arg(alpha), up to convention.
+#
+# Checked against the two closed forms in covariance_physics.build_jump_matrix:
+#   vacuum   c = sqrt(k/2)[1, i]            -> beta = 0,          s = 0
+#   squeezed c = sqrt(k/2)[e^r, i e^{-r}]   -> |beta|/|alpha| = tanh r, s = r
+#
+# This is strictly better than the V_aux scan for REPORTING: it costs one
+# eigendecomposition of a matrix already in hand, needs no extra solves, and
+# works for any number of channels at once. It does NOT replace the scan for
+# SEARCHING, because which schemes are reachable still depends on the frame
+# the graph constraint is written in — see optimise_aux_state.
+def factor_dissipator(Upsilon: np.ndarray, num_modes: int,
+                       tol: float = 1e-9) -> List[Dict]:
+    Y = (Upsilon + Upsilon.conj().T) / 2
+    w, U = np.linalg.eigh(Y)
+    scale = max(float(np.max(np.abs(w))), 1e-300)
+
+    channels = []
+    for k in range(len(w) - 1, -1, -1):
+        if w[k] <= tol * scale:
+            continue
+        # Upsilon = sum_mu conj(c_mu) c_mu^T, so a positive eigenpair
+        # (w, u) contributes c = sqrt(w) * conj(u).
+        c = np.sqrt(w[k]) * np.conj(U[:, k])
+        per_mode = []
+        for m in range(num_modes):
+            cx, cp = c[2 * m], c[2 * m + 1]
+            if abs(cx) < 1e-14 and abs(cp) < 1e-14:
+                continue
+            alpha = (cx - 1j * cp) / np.sqrt(2)
+            beta = (cx + 1j * cp) / np.sqrt(2)
+            ratio = abs(beta) / max(abs(alpha), 1e-300)
+            per_mode.append({
+                'mode': m, 'alpha': complex(alpha), 'beta': complex(beta),
+                'rate': float(abs(alpha) ** 2 - abs(beta) ** 2),
+                'squeezing': float(np.arctanh(min(ratio, 1 - 1e-15))) if ratio < 1 else np.inf,
+                'phase': float(np.angle(beta) - np.angle(alpha)),
+            })
+        channels.append({'eigenvalue': float(w[k]), 'modes': per_mode,
+                         'squeezed': any(p['squeezing'] > 1e-6 for p in per_mode)})
+    return channels
+
+
+# reservoir_summary(Upsilon, num_modes): one-line classification of what
+# bath the solution actually calls for — 'vacuum' when every channel is
+# plain loss, 'squeezed' when any carries an anomalous weight.
+def reservoir_summary(Upsilon: np.ndarray, num_modes: int) -> Dict:
+    ch = factor_dissipator(Upsilon, num_modes)
+    sq = [p for c in ch for p in c['modes'] if p['squeezing'] > 1e-6]
+    return {'channels': len(ch), 'kind': 'squeezed' if sq else 'vacuum',
+            'max_squeezing': max([p['squeezing'] for p in sq], default=0.0),
+            'detail': ch}
+
+
+# physical_parameters(info, triu, node_types, target_mode_ids) -> the
+# experimentally meaningful numbers behind a witness.
+#
+# The witness comes back as matrices (G, Upsilon); this turns them into the
+# quantities somebody actually sets on a bench:
+#
+#   H = sum_i Delta_i a_i^dag a_i
+#       + sum_<ij> ( J_ij a_i^dag a_j + h.c. )          beamsplitter edges
+#       + sum_<ij> ( nu_ij a_i^dag a_j^dag + h.c. )     two-mode-squeezing edges
+#       + sum_i   ( chi_i a_i^dag^2 + h.c. )            parametric self-edges
+#   L_m = sqrt(kappa_m) ( cosh(s_m) a_m + e^{i theta_m} sinh(s_m) a_m^dag )
+#
+# EVERYTHING IS REPORTED AS A RATIO TO THE DRAIN RATE. The solution set is
+# a cone — (G, Upsilon) -> (sG, sUpsilon) leaves the steady state untouched
+# (§1(b)) — so an absolute coupling strength is meaningless and the raw
+# numbers a solve returns can come back at any scale (they routinely arrive
+# around 1e-5). Normalising to kappa fixes that gauge and makes two schemes
+# comparable.
+#
+# Gauge warning on phases: a local rotation a_i -> e^{i phi} a_i shifts
+# arg(J_ij) without changing any physics, so an individual coupling phase
+# is NOT an observable. Magnitudes, detuning patterns and bath squeezings
+# are. Phases are reported for completeness, flagged as gauge-dependent.
+def physical_parameters(info: Dict, triu_array, node_types: List[str],
+                         target_mode_ids: List[int]) -> Dict:
+    n = len(node_types)
+    aux_ids = [i for i in range(n) if i not in target_mode_ids]
+    G, Y = info['G'], info['Upsilon']
+
+    basis = hamiltonian_basis(triu_array, n, include_detunings=True, allow_phases=True)
+    cols = np.column_stack([Gb.ravel() for _, Gb in basis])
+    coeffs, *_ = np.linalg.lstsq(cols, G.ravel(), rcond=None)
+    c = {lbl: float(v) for (lbl, _), v in zip(basis, coeffs)}
+
+    # Drain rate sets the scale. Im(Upsilon) on a drain block is (kappa/2) J2.
+    rates = {}
+    for m in aux_ids:
+        rates[m] = 2.0 * float(np.imag(Y[2 * m, 2 * m + 1]))
+    kappa_ref = max((abs(v) for v in rates.values()), default=0.0)
+    if kappa_ref < 1e-300:
+        kappa_ref = 1.0
+
+    detunings = {i: c.get(f'delta_{i}', 0.0) / kappa_ref for i in range(n)}
+
+    couplings = {}
+    rows, cols_i = np.triu_indices(n)
+    for k, (i, j) in enumerate(zip(rows, cols_i)):
+        if int(np.asarray(triu_array)[k]) == NO_COUPLING:
+            continue
+        if i == j:
+            re, im = c.get(f'par_{i}', 0.0), c.get(f'par90_{i}', 0.0)
+            if abs(re) + abs(im) > 1e-12:
+                z = (re + 1j * im) / kappa_ref
+                couplings[f'chi_{i}'] = {'kind': 'parametric', 'magnitude': abs(z),
+                                          'phase': float(np.angle(z))}
+            continue
+        for pref, kind in (('bs', 'beamsplitter'), ('tms', 'two_mode_squeezing')):
+            re, im = c.get(f'{pref}_{i}{j}', 0.0), c.get(f'{pref}90_{i}{j}', 0.0)
+            if abs(re) + abs(im) > 1e-12:
+                z = (re + 1j * im) / kappa_ref
+                sym = 'J' if pref == 'bs' else 'nu'
+                couplings[f'{sym}_{i}{j}'] = {'kind': kind, 'magnitude': abs(z),
+                                               'phase': float(np.angle(z))}
+
+    drains = {}
+    for chan in factor_dissipator(Y, n):
+        for p in chan['modes']:
+            m = p['mode']
+            drains.setdefault(m, []).append({
+                'kappa': abs(rates.get(m, 0.0)) / kappa_ref,
+                'squeezing': p['squeezing'], 'phase': p['phase'],
+            })
+
+    return {'kappa_reference': kappa_ref, 'detunings': detunings,
+            'couplings': couplings, 'drains': drains,
+            'channels': info.get('upsilon_rank'),
+            'note': 'all rates in units of the drain rate; coupling phases are gauge-dependent'}
+
+
+# format_parameters(...): the above, as a readable block.
+def format_parameters(params: Dict, indent: str = '    ') -> str:
+    out = []
+    out.append(f'{indent}H = sum_i Delta_i a_i+ a_i'
+               ' + (J_ij a_i+ a_j + nu_ij a_i+ a_j+ + chi_i a_i+^2 + h.c.)')
+    out.append(f'{indent}L_m = sqrt(kappa_m)( cosh(s) a_m + e^{{i.theta}} sinh(s) a_m+ )')
+    out.append(f'{indent}[rates in units of the drain rate; phases are gauge-dependent]')
+    for name, d in sorted(params['couplings'].items(),
+                          key=lambda kv: -kv[1]['magnitude']):
+        out.append(f'{indent}  |{name}| = {d["magnitude"]:.6f}   '
+                   f'arg = {d["phase"]:+.4f} rad   ({d["kind"]})')
+    nz = {i: v for i, v in params['detunings'].items() if abs(v) > 1e-9}
+    if nz:
+        out.append(f'{indent}  detunings: ' +
+                   ',  '.join(f'Delta_{i} = {v:+.6f}' for i, v in sorted(nz.items())))
+    else:
+        out.append(f'{indent}  detunings: all zero (resonant)')
+    for m, chans in sorted(params['drains'].items()):
+        for ch in chans:
+            tag = ('plain vacuum' if ch['squeezing'] < 1e-6
+                   else f'SQUEEZED s = {ch["squeezing"]:.6f}, theta = {ch["phase"]:+.4f} rad')
+            out.append(f'{indent}  drain {m}: kappa = {ch["kappa"]:.6f}, {tag}')
+    return '\n'.join(out)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# §2.1 frame change: vacuum-frame solution -> physical squeezed-drain frame
+# ───────────────────────────────────────────────────────────────────────────
+# apply_aux_symplectic(G, Upsilon, S_aux, aux_ids, num_modes).
+#
+# The doc's §2.1 bijection. An auxiliary-local symplectic S = I_T (+) S_A
+# leaves V_TT alone (because V_TA = 0) and only reshapes V_AA, so it relates
+# the convenient vacuum frame to the physical one by
+#       G_phys = S^T G' S,      Upsilon_phys = S^T Upsilon' S,
+# preserving symmetry, positivity and rank (channel count).
+#
+# The caveat the doc flags is the important one in practice: graph sparsity
+# is a PHYSICAL-frame statement, and this map does not preserve it —
+# squeezing a drain turns a beamsplitter edge into beamsplitter+two-mode-
+# squeezing. So use this to translate a FOUND solution between frames, never
+# to argue that searching one frame covers the other.
+def apply_aux_symplectic(G, Upsilon, S_aux, aux_ids, num_modes):
+    S = np.eye(2 * num_modes)
+    for slot, m in enumerate(aux_ids):
+        S[2 * m:2 * m + 2, 2 * m:2 * m + 2] = S_aux[2 * slot:2 * slot + 2,
+                                                     2 * slot:2 * slot + 2]
+    return S.T @ G @ S, S.T @ Upsilon @ S
+
+
+# squeeze_symplectic(r, theta): the single-mode symplectic whose action on
+# the vacuum produces a squeezed vacuum of parameter (r, theta) — the S_A
+# to feed apply_aux_symplectic for a one-drain frame change.
+def squeeze_symplectic(r: float, theta: float = 0.0) -> np.ndarray:
+    R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    return R @ np.diag([np.exp(-r), np.exp(r)]) @ R.T
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # §4B optional SDP path (requires cvxpy; not a hard dependency)
 # ───────────────────────────────────────────────────────────────────────────
 # sdp_feasibility(V, h_basis, d_basis) -> (status, G, Upsilon).
@@ -828,6 +1129,31 @@ def structural_certificate(
 # Returns 'infeasible' (sound INVALID, with a dual certificate available
 # from the solver), 'feasible' (a CANDIDATE only — still needs the filter),
 # or 'unavailable' when cvxpy is not installed.
+#
+# MEASURED LIMITATION — the doc's §4B expects the infeasible branch to be
+# the main source of INVALID certificates. It cannot fire in this regime,
+# and the reason is structural rather than numerical.
+#
+# With lossless signal modes there is a point available on EVERY graph for
+# EVERY pure target: damp the drain with plain loss and leave the signal
+# modes entirely uncoupled (G = 0). The drain relaxes to its own vacuum,
+# the signal modes are frozen at whatever V_TT says, and (**) is satisfied
+# EXACTLY. It is PSD, and it survives any normalisation (its tr(Re Y) can
+# be scaled to 1), so adding tr(Upsilon) = 1 to exclude Upsilon = 0 does
+# not remove it either. Verified: residual 0.00e+00, PSD True, margin 0.
+#
+# So the feasible set is never empty, cvxpy returns 'optimal' for every
+# graph tested — passive, active, and the empty graph alike — and no dual
+# certificate is ever produced. This is the same frozen solution that makes
+# §4A's least-squares residual identically zero; the SDP inherits it
+# because it is a relaxation of the same equations.
+#
+# The consequence is that the doc's two certificate routes (§4A residual,
+# §4B duality) both collapse at Gamma_signal = 0, and INVALID has to come
+# from the structural certificates instead — see structural_certificate.
+# What the SDP still provides is §4B's OTHER contribution: a feasible point
+# whose Upsilon can be factored to read off the reservoir (see
+# factor_dissipator), which works exactly as described.
 def sdp_feasibility(V: np.ndarray, h_basis, d_basis):
     try:
         import cvxpy as cp
@@ -1179,10 +1505,33 @@ def optimise_aux_state(
         drop = float(s[d0]) if d0 < len(s) else 0.0
         return drop + squeeze_cost * float(np.sum(p[0::2] ** 2))
 
+    # COARSE SCAN, then local refine. Pure multistart is not reliable here:
+    # the detector has a sharp zero at the drain state that works, but it
+    # ALSO decays slowly at large squeezing, so a random start in that tail
+    # slides monotonically to the bound and never sees the real well. On the
+    # two-mode-squeezed target the detector reads 0.23 at r = 0.7 and 0.09 at
+    # r = 1.2 while the true zero sits at r = 0.50 — a start above ~0.7 is
+    # simply lost. Random multistart found it only by luck.
+    #
+    # The objective costs one SVD (sub-millisecond), so a coarse sweep is
+    # cheap insurance: the well is ~0.1 wide, so a step of 0.05 cannot skip
+    # it, and the best grid points then seed a local refine that recovers
+    # full precision. This is ordinary global-optimisation hygiene, not
+    # knowledge about the target — the grid is over the SEARCH variable and
+    # says nothing about which value is expected.
+    #
+    # With several drains a full product grid is exponential, so the coarse
+    # pass sweeps the shared-squeezing diagonal only and the refine explores
+    # the full 2*n_aux space from there (plus random restarts).
+    coarse_r = np.arange(0.0, r_max + 1e-9, 0.05)
+    scan = [(objective(np.concatenate([[r, 0.0]] * n_aux)), r) for r in coarse_r]
+    scan.sort()
+    seeds = [np.concatenate([[r, 0.0]] * n_aux) for _, r in scan[:max(3, n_starts // 2)]]
+
     best = (np.inf, np.zeros(2 * n_aux))
-    starts = [np.zeros(2 * n_aux)]                       # vacuum first
+    starts = [np.zeros(2 * n_aux)] + seeds               # vacuum, then best grid points
     starts += [np.concatenate([[rng.uniform(0, r_max), rng.uniform(0, np.pi)]
-                               for _ in range(n_aux)]) for _ in range(n_starts - 1)]
+                               for _ in range(n_aux)]) for _ in range(n_starts)]
     for p0 in starts:
         res = sciopt.minimize(objective, p0, method='Nelder-Mead',
                               options={'maxiter': 2000, 'xatol': 1e-10, 'fatol': 1e-16})
@@ -1265,7 +1614,15 @@ def _witness(G, Y, V, margin, path):
     # no Hurwitz A can exist at all (§3).
     w = np.linalg.svd(Y, compute_uv=False)
     rank = int(np.sum(w > 1e-9 * max(float(w[0]) if w.size else 1.0, 1e-300)))
+    # §4B readout: what reservoir does this solution actually call for?
+    # Taken from the returned Upsilon by factorisation, so it is a property
+    # of the witness rather than of whatever frame the search happened to
+    # run in — validated to recover s = 0.4 / 0.6 / 1.0 exactly on the
+    # closed-form squeezed baths.
+    res = reservoir_summary(Y, G.shape[0] // 2)
     return {'verdict': VALID, 'G': G, 'Upsilon': Y, 'A': A, 'D': D,
             'stability_margin': margin, 'stationarity_residual': resid,
             'forward_error': fwd_err, 'V_forward': V_fwd, 'path': path,
-            'upsilon_psd': _is_psd(Y), 'upsilon_rank': rank}
+            'upsilon_psd': _is_psd(Y), 'upsilon_rank': rank,
+            'reservoir_kind': res['kind'], 'reservoir_squeezing': res['max_squeezing'],
+            'channels': res['detail']}

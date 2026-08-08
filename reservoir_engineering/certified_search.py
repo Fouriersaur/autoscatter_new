@@ -127,6 +127,7 @@ class CertifiedSearch:
         coupled_drains: bool = False,
         use_sdp: bool = False,
         auto_reservoir: bool = False,
+        gap_effort: int = 8,
         verbosity: int = 1,
     ):
         self.node_types      = list(node_types)
@@ -140,10 +141,15 @@ class CertifiedSearch:
         self.V = complete_covariance(self.sigma_target, self.target_mode_ids,
                                       self.num_modes, aux_squeezing=aux_squeezing)
 
+        # gap_effort: §8 Move 1's budget multiplier for the spectral-abscissa
+        # ascent that runs ONLY on graphs about to be filed UNDECIDED. Raising
+        # it shrinks the undecided stratum at linear cost in that stratum
+        # alone; 0 disables the move and reproduces the plain feasibility
+        # oracle.
         self._oracle_kwargs = dict(
             include_detunings=include_detunings, allow_phases=allow_phases,
             coupled_drains=coupled_drains, use_sdp=use_sdp,
-            num_samples=num_samples)
+            num_samples=num_samples, gap_effort=gap_effort)
 
         # Memoized verdicts. §5(ii): this caches the oracle's OWN past
         # computation, never prior knowledge — no scheme is seeded, so
@@ -317,13 +323,28 @@ class CertifiedSearch:
                 part[combo] = UNDECIDED
         return part
 
-    # §5(iii): run both directions and compare their implied partitions.
-    # Under a sound oracle they MUST coincide, because each graph's verdict
-    # is a deterministic function of the graph and cannot depend on
-    # traversal order. A disagreement is therefore an implementation bug —
-    # a wrong tolerance, a broken neighbour relation, a faulty up-/down-set
-    # propagation — and never "one direction lost a scheme". That is what
-    # upgrades this from a sanity test to the primary integrity guarantee.
+    # §5(iii): run both directions and assert they never CONTRADICT.
+    #
+    # The invariant is deliberately the weaker one. With a two-valued oracle
+    # the two passes would have to produce identical partitions, and the doc
+    # originally asserted exactly that. Once the verdict is three-valued that
+    # assertion is WRONG, and would fire on correct runs: UNDECIDED
+    # propagates neither up nor down (§4C), so prune descends until it meets
+    # INVALID while grow ascends until it meets VALID, and each pass leaves a
+    # DIFFERENT shadow of the undecided band unresolved. Identical partitions
+    # are recovered exactly when UNDECIDED is empty, not before.
+    #
+    # What must hold unconditionally, and is what this checks:
+    #     no graph is VALID in one pass and INVALID in the other.
+    # A verdict is a deterministic function of the graph (the per-graph seed
+    # inside decide makes it so), and both propagation rules are sound, so a
+    # direct contradiction can only be an IMPLEMENTATION bug — a wrong
+    # tolerance, a broken neighbour relation, a faulty up-/down-set
+    # propagation. It is a regression test ON soundness, not a completeness
+    # proof.
+    #
+    # 'partitions_identical' is still reported, but as a DIAGNOSTIC: it is the
+    # signal that the undecided stratum has been emptied, not a pass/fail.
     #
     # compare_closures=False falls back to comparing the raw files, which is
     # cheap but only meaningful when the oracle decided every graph it saw.
@@ -337,28 +358,31 @@ class CertifiedSearch:
         if compare_closures:
             ptd, pbu = self.closure_partition(td), self.closure_partition(bu)
             disagree = [g for g in ptd if ptd[g] != pbu[g]]
-            agree_valid = all(ptd[g] != VALID and pbu[g] != VALID
-                              for g in disagree) or not disagree
-            agree_invalid = all(ptd[g] != INVALID and pbu[g] != INVALID
-                                for g in disagree) or not disagree
-            agree = not disagree
+            contradictions = [g for g in disagree
+                              if {ptd[g], pbu[g]} == {VALID, INVALID}]
+            identical = not disagree
         else:
             ptd = pbu = None
             disagree = []
-            agree_valid   = keyset(td['valid'])   == keyset(bu['valid'])
-            agree_invalid = keyset(td['invalid']) == keyset(bu['invalid'])
-            agree = agree_valid and agree_invalid
+            vtd, vbu = keyset(td['valid']), keyset(bu['valid'])
+            itd, ibu = keyset(td['invalid']), keyset(bu['invalid'])
+            contradictions = sorted((vtd & ibu) | (itd & vbu))
+            identical = (vtd == vbu) and (itd == ibu)
+
+        agree = not contradictions          # THE assertion (§5(iii))
 
         mv_td = keyset(self.minimal_valid(td['valid']))
         mv_bu = keyset(self.minimal_valid(bu['valid']))
 
         if self.verbosity:
-            print(f'  bidirectional: closures agree={agree} '
-                  f'({len(disagree)} differing graphs)  '
+            print(f'  bidirectional: no VALID/INVALID contradiction={agree} '
+                  f'({len(contradictions)} contradictions, '
+                  f'{len(disagree)} graphs differing only by UNDECIDED coverage)  '
                   f'minimal-valid sets agree={mv_td == mv_bu}')
         return {'top_down': td, 'bottom_up': bu,
-                'agree': agree, 'agree_valid': agree_valid,
-                'agree_invalid': agree_invalid, 'disagreeing_graphs': disagree,
+                'agree': agree, 'contradictions': contradictions,
+                'partitions_identical': identical,
+                'disagreeing_graphs': disagree,
                 'partition_top_down': ptd, 'partition_bottom_up': pbu,
                 'minimal_valid_agree': mv_td == mv_bu,
                 'minimal_valid': self.minimal_valid(bu['valid'] + td['valid'])}
@@ -453,6 +477,92 @@ class CertifiedSearch:
             kept.append(t)
         return sorted(kept, key=lambda t: int(np.sum(t)))
 
+    # ─── §8 Move 4: the frontier is the only place a verdict is needed ────
+    #
+    # lattice_verdicts(): the verdict every graph in the lattice CARRIES,
+    # obtained by closing the cached verdicts under the propagation rules
+    # rather than by calling the oracle again. VALID if some cached-valid
+    # graph sits inside it, INVALID if it sits inside a cached-invalid one,
+    # else whatever the cache says, else UNDECIDED.
+    def lattice_verdicts(self) -> Dict[tuple, str]:
+        import itertools
+        rows, cols = np.triu_indices(self.num_modes)
+        alphabet = [(_DIAG_VALUES if i == j else _OFFDIAG_VALUES)
+                    for i, j in zip(rows, cols)]
+        valid = [np.array(k) for k, v in self.cache.items() if v['verdict'] == VALID]
+        invalid = [np.array(k) for k, v in self.cache.items() if v['verdict'] == INVALID]
+        out = {}
+        for combo in itertools.product(*alphabet):
+            t = np.array(combo, dtype=int)
+            if valid and check_if_subgraph_triu([t], valid):
+                out[combo] = VALID
+            elif invalid and check_if_subgraph_triu(invalid, [t]):
+                out[combo] = INVALID
+            elif combo in self.cache:
+                out[combo] = self.cache[combo]['verdict']
+            else:
+                out[combo] = UNDECIDED
+        return out
+
+    # certify_irreducible(triu): is this valid graph MINIMAL, provably?
+    #
+    # A graph is irreducible iff it is valid and every one-edge deletion is
+    # invalid. That is the whole content of Move 4: irreducibility is a
+    # statement about the valid/invalid BOUNDARY, so the deep interior of
+    # either region never needs to be decided. Returns one of
+    #   'irreducible'  valid, and every one-slot deletion is certified INVALID
+    #   'reducible'    some one-slot deletion is itself VALID
+    #   'unresolved'   no deletion is valid, but some are UNDECIDED — the
+    #                  claim of minimality is NOT established, and the
+    #                  offending neighbours are listed so an expensive exact
+    #                  method (Move 3) can be pointed at them and nowhere else
+    #   'not_valid'    the graph itself is not valid
+    def certify_irreducible(self, triu, verdicts: Optional[Dict] = None) -> Dict:
+        if verdicts is None:
+            verdicts = self.lattice_verdicts()
+        key = tuple(int(x) for x in np.asarray(triu))
+        if verdicts.get(key) != VALID:
+            return {'status': 'not_valid', 'graph': np.array(key),
+                    'blocking': [], 'verdict': verdicts.get(key)}
+        valid_nb, undec_nb = [], []
+        for nb in _neighbours(np.array(key), self.num_modes, 'prune'):
+            k = tuple(int(x) for x in nb)
+            if verdicts.get(k) == VALID:
+                valid_nb.append(nb)
+            elif verdicts.get(k) == UNDECIDED:
+                undec_nb.append(nb)
+        if valid_nb:
+            status = 'reducible'
+        elif undec_nb:
+            status = 'unresolved'
+        else:
+            status = 'irreducible'
+        return {'status': status, 'graph': np.array(key),
+                'valid_neighbours': valid_nb, 'blocking': undec_nb}
+
+    # frontier_undecided(): the undecided graphs that actually OBSTRUCT the
+    # answer — those sitting one edge below a valid graph, where the search
+    # cannot tell whether descent is allowed.
+    #
+    # This is the number that matters, not the raw UNDECIDED count. An
+    # undecided graph in the interior of the invalid region costs nothing:
+    # nobody is trying to descend through it. Move 3's exponential backstop
+    # is meant to run on THIS set, which is typically a handful, rather than
+    # on the whole stratum.
+    def frontier_undecided(self, verdicts: Optional[Dict] = None) -> List[np.ndarray]:
+        if verdicts is None:
+            verdicts = self.lattice_verdicts()
+        out, seen = [], set()
+        for key, v in verdicts.items():
+            if v != VALID:
+                continue
+            for nb in _neighbours(np.array(key), self.num_modes, 'prune'):
+                k = tuple(int(x) for x in nb)
+                if verdicts.get(k) == UNDECIDED and k not in seen:
+                    seen.add(k)
+                    out.append(np.array(k))
+        return sorted(out, key=lambda t: int(np.sum(t)))
+
 
 # Complete sweep — every graph gets a verdict, but the oracle is called only
 # where PROPAGATION does not already imply one (see verdict_of).
@@ -499,7 +609,14 @@ def sweep_all(
         verdicts[combo] = v
         out[v].append(t)
 
+    # §8 Move 4: separate the undecided graphs that OBSTRUCT the answer (one
+    # edge below a valid graph, so descent cannot be resolved) from those
+    # that merely sit in the interior and cost nothing. The frontier set is
+    # what an exact backstop should be pointed at.
+    frontier = search.frontier_undecided(verdicts)
+
     return {'valid': out[VALID], 'invalid': out[INVALID], 'undecided': out[UNDECIDED],
+            'frontier_undecided': frontier,
             'verdicts': verdicts, 'search': search, 'oracle_calls': n_oracle,
             'num_graphs': len(combos),
             'num_possible': calc_number_of_possibilities(node_types)}
@@ -583,6 +700,12 @@ def reduce_witness(triu, info, num_modes: int, rel_tol: float = 1e-7):
 # permissive on a given mode count, so if IT cannot stabilise the target no
 # subgraph can, and the mode count must go up. Returns the smallest n_aux
 # that works, together with the witness that settled it.
+#
+# The root must be VALID, not merely feasible — the prune pass starts there,
+# and a root that is only stationary (the frozen point, feasible on every
+# graph) would descend through nothing. That is why §8 Move 1's gap
+# maximiser matters most at this call: an UNDECIDED root would wrongly push
+# the search to an extra auxiliary mode it does not need.
 def find_minimum_auxiliary_modes(
     sigma_target: np.ndarray,
     target_mode_ids: List[int],

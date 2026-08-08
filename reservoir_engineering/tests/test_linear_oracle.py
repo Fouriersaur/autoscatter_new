@@ -103,12 +103,17 @@ def test_vitali_passive(r=0.4):
           img['verdict'] == lo.VALID)
 
 
-# Test 3 — search integrity, doc §5(iii). The top-down and bottom-up passes
-# must imply the SAME partition of the graph lattice, and both must agree
-# with an exhaustive sweep that does no pruning at all. Under a sound oracle
-# this is forced: a verdict is a deterministic function of the graph, so it
-# cannot depend on traversal order. A failure localises an implementation
-# bug in the propagation, not a lost scheme.
+# Test 3 — search integrity, doc §5(iii). The assertion is that the top-down
+# and bottom-up passes never CONTRADICT: no graph VALID in one and INVALID in
+# the other. Under a sound oracle that is forced, since a verdict is a
+# deterministic function of the graph and cannot depend on traversal order, so
+# a contradiction localises an implementation bug rather than a lost scheme.
+#
+# Identical partitions are checked too, but as a DIAGNOSTIC. They are only
+# guaranteed once UNDECIDED is empty: undecided graphs propagate nothing, so
+# each pass may leave a different shadow of them unresolved. On this target
+# the stratum IS empty, so identity holds — but the test must not treat that
+# as the invariant, or it would fire on a correct run of a harder target.
 def test_search_integrity(r=0.4):
     print(f'\nTest 3 — bidirectional search integrity, target two_mode_squeezed({r})')
     nt, tmi = ['cavity', 'mechanical', 'mechanical'], [1, 2]
@@ -116,7 +121,10 @@ def test_search_integrity(r=0.4):
 
     s = CertifiedSearch(tgt, tmi, nt, num_samples=48, verbosity=0)
     out = s.run_bidirectional()
-    check('top-down and bottom-up imply identical partitions', out['agree'],
+    check('no VALID/INVALID contradiction between directions (§5(iii))',
+          out['agree'], f'{len(out["contradictions"])} contradictions')
+    check('  partitions identical (holds because UNDECIDED is empty)',
+          out['partitions_identical'],
           f'{len(out["disagreeing_graphs"])} differing graphs')
     check('minimal-valid sets agree between directions', out['minimal_valid_agree'])
 
@@ -218,6 +226,90 @@ def test_reservoir_choice():
           o['verdict'] == lo.VALID and o['reservoir'] == 'vacuum')
 
 
+# Test 7 — the INVALID side (doc §8 Move 2). Three independent properties,
+# each of which caught a real defect when it was first run.
+#
+# (a) SOUNDNESS. No graph carrying a verified Hurwitz witness may also carry
+#     an impossibility certificate. This is the one that must never fail:
+#     a false INVALID propagates to the whole down-set and silently deletes
+#     schemes.
+# (b) PERMUTATION INVARIANCE. Relabelling which mode is the drain cannot
+#     change the physics, so the verdict must be identical on the relabelled
+#     graph. This is what exposed the tolerance bug in the invariant-subspace
+#     iteration: the same problem gave 156 INVALID with the drain called
+#     mode 2 and 80 with it called mode 0.
+# (c) THE CERTIFICATE IS SELF-VERIFYING. Each dark-subspace certificate must
+#     hand over a PBH witness — a lambda on the imaginary axis and a left
+#     eigenvector w with w^T B = 0 — whose residuals are at machine
+#     precision. A certificate that cannot be recomputed independently is
+#     not a certificate.
+def test_invalid_certificates(r=0.5):
+    print(f'\nTest 7 — impossibility certificates, target two_mode_squeezed({r})')
+    import itertools
+    from reservoir_engineering.certified_search import _DIAG_VALUES, _OFFDIAG_VALUES
+
+    rows, cols = np.triu_indices(3)
+    idx = {(i, j): k for k, (i, j) in enumerate(zip(rows, cols))}
+    alpha = [(_DIAG_VALUES if i == j else _OFFDIAG_VALUES) for i, j in zip(rows, cols)]
+    tgt = two_mode_squeezed(r)
+
+    nt, tmi = ['mechanical', 'mechanical', 'cavity'], [0, 1]
+    V = lo.complete_covariance(tgt, tmi, 3)
+
+    condemned, n_inv, n_val, n_und = 0, 0, 0, 0
+    eig_res, dark_res, no_pbh = [], [], 0
+    for combo in itertools.product(*alpha):
+        t = np.array(combo, dtype=int)
+        cert = lo.structural_certificate(t, V, tmi, nt)
+        # decide with the certificate route switched OFF, so the witness
+        # search is a genuinely independent opinion on the same graph.
+        w = lo.decide(t, V, tmi, nt, num_samples=48,
+                      include_solution_set=False, gap_effort=4)
+        if cert is not None:
+            n_inv += 1
+            p = cert.get('pbh')
+            if p is None:
+                no_pbh += 1
+            else:
+                eig_res.append(p['eigen_residual'])
+                dark_res.append(p['darkness_residual'] if p['psd_point'] else 0.0)
+            if w['verdict'] == lo.VALID:
+                condemned += 1
+        elif w['verdict'] == lo.VALID:
+            n_val += 1
+        else:
+            n_und += 1
+
+    check('no graph with a Hurwitz witness is condemned', condemned == 0,
+          f'{condemned} wrongly condemned of {n_val} valid')
+    check('  every graph is decided (undecided stratum empty here)', n_und == 0,
+          f'{n_inv} INVALID / {n_val} VALID / {n_und} UNDECIDED')
+
+    # (b) relabel drain 2 -> 0 and require verdict-for-verdict agreement.
+    def permute(t, p):
+        out = np.zeros(6, dtype=int)
+        for (i, j), k in idx.items():
+            a, b = sorted((p[i], p[j]))
+            out[idx[(a, b)]] = t[k]
+        return out
+
+    nt2, tmi2 = ['cavity', 'mechanical', 'mechanical'], [1, 2]
+    V2 = lo.complete_covariance(tgt, tmi2, 3)
+    flips = 0
+    for combo in itertools.product(*alpha):
+        t = np.array(combo, dtype=int)
+        a = lo.structural_certificate(t, V, tmi, nt) is not None
+        b = lo.structural_certificate(permute(t, [1, 2, 0]), V2, tmi2, nt2) is not None
+        flips += (a != b)
+    check('verdict is invariant under relabelling which mode is the drain',
+          flips == 0, f'{flips} graphs flipped')
+
+    if eig_res:
+        check('  PBH witness residuals at machine precision',
+              max(eig_res) < 1e-10 and max(dark_res) < 1e-10,
+              f'max eigen {max(eig_res):.1e}, max darkness {max(dark_res):.1e}')
+
+
 if __name__ == '__main__':
     test_kronwald()
     test_vitali_passive()
@@ -225,6 +317,7 @@ if __name__ == '__main__':
     test_mixed_target_refused()
     test_basis_completeness()
     test_reservoir_choice()
+    test_invalid_certificates()
     n_pass, n_tot = sum(_results), len(_results)
     print(f'\n{"="*66}\n  {n_pass}/{n_tot} checks passed\n{"="*66}')
     sys.exit(0 if n_pass == n_tot else 1)

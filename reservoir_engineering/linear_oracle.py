@@ -593,7 +593,7 @@ def _is_psd(Y: np.ndarray, tol: float = 1e-9) -> bool:
     return bool(np.min(w) >= -tol * max(1.0, float(np.max(np.abs(w)))))
 
 
-# attractivity_filter(sol, ...) -> (found, z, margin), §4C.
+# attractivity_filter(sol, ...) -> (found, z, margin), §4C / §8 Move 1.
 #
 # Searches the affine solution set z0 + null(M) for a member with strictly
 # Hurwitz A (and, in joint mode, Upsilon >= 0). Strategy: try the
@@ -608,6 +608,27 @@ def _is_psd(Y: np.ndarray, tol: float = 1e-9) -> bool:
 # `seed` is derived from the graph by the caller so the verdict is
 # reproducible: §5(iii)'s bidirectional-agreement assertion compares
 # partitions across two traversals and needs the filter to be deterministic.
+#
+# maximise=False (default) is the DECISION mode: return as soon as any
+# member clears margin_tol, since one witness settles validity and stopping
+# early is the whole point of an existential test.
+#
+# maximise=True is §8 Move 1's GAP MAXIMISER,
+#     gamma* = max over the feasible set of [ -max_i Re lambda_i(A) ],
+# which does not stop at the first witness but keeps ascending the spectral
+# abscissa. Two reasons the doc gives for wanting it, both real:
+#   (a) COMPLETENESS. If a graph is valid its Hurwitz members form a
+#       relatively open, positive-measure subset of the solution set (A
+#       depends continuously on (G,Upsilon) and the Hurwitz set is open), so
+#       a genuine interior ascent finds a witness whenever one exists, while
+#       an early-exit sampler can miss a thin feasible cone. This is the
+#       move that converts UNDECIDED graphs to VALID.
+#   (b) FIGURE OF MERIT. gamma* IS the dissipative gap, so the oracle that
+#       decides validity also returns the relaxation rate the resource-vs-gap
+#       comparison needs — no separate optimisation.
+# The prediction in (a) is empirically untested at scale; it is flagged as
+# such in the doc and should be reported as a proposal, not a theorem about
+# this implementation.
 def attractivity_filter(
     sol: Dict,
     h_basis,
@@ -620,6 +641,7 @@ def attractivity_filter(
     margin_tol: float = MARGIN_TOL_DEFAULT,
     require_psd: bool = False,
     n_polish: int = 4,
+    maximise: bool = False,
 ) -> Tuple[bool, Optional[np.ndarray], float]:
     z0, N = sol['z0'], sol['nullspace']
     n_null = N.shape[1] if N.size else 0
@@ -658,11 +680,11 @@ def attractivity_filter(
         return m
 
     best_z, best_m = z0, margin_of(z0)
-    if best_m > margin_tol:
+    if best_m > margin_tol and not maximise:
         return True, z0, best_m
 
     if n_null == 0:
-        return False, best_z, best_m
+        return (best_m > margin_tol), best_z, best_m
 
     rng = np.random.default_rng(seed)
     scale = sample_scale * max(1.0, float(np.linalg.norm(z0)))
@@ -670,7 +692,7 @@ def attractivity_filter(
     for _ in range(num_samples):
         z = z0 + N @ rng.normal(0., scale, n_null)
         m = margin_of(z)
-        if m > margin_tol:
+        if m > margin_tol and not maximise:
             return True, z, m
         if m > best_m:
             best_z, best_m = z, m
@@ -688,6 +710,12 @@ def attractivity_filter(
         return 1e9 if not np.isfinite(s) else -s
 
     starts = [np.linalg.lstsq(N, best_score_z - z0, rcond=None)[0]]
+    if maximise:
+        # Also restart from the best MARGIN point, not only the best
+        # penalised score: once the ascent is allowed to continue past the
+        # first witness these are different points, and the gap maximiser
+        # wants the one already highest on the abscissa.
+        starts.append(np.linalg.lstsq(N, best_z - z0, rcond=None)[0])
     starts += [rng.normal(0., 1., n_null) for _ in range(max(0, n_polish - 1))]
     for alpha0 in starts:
         res = sciopt.minimize(neg_score, alpha0, method='Nelder-Mead',
@@ -697,7 +725,7 @@ def attractivity_filter(
         m = margin_of(z)
         if m > best_m:
             best_z, best_m = z, m
-        if m > margin_tol:
+        if m > margin_tol and not maximise:
             return True, z, m
     return (best_m > margin_tol), best_z, best_m
 
@@ -758,12 +786,35 @@ def attractivity_filter(
 # _orthonormal / _nullspace / _restrict: small subspace helpers for the
 # undamped-subspace certificate below. Columns are always kept orthonormal
 # so that C @ C.T is the orthogonal projector onto the subspace.
-def _nullspace(M: np.ndarray, rtol: float = 1e-10) -> np.ndarray:
+# `ref` is the scale the singular values are judged against. It MUST be
+# passed whenever the matrix can legitimately be zero, which is exactly the
+# case in the invariant-subspace iterations below: there the block being
+# nulled is (I - P) M W, and it vanishes precisely when W is already
+# invariant under M — the success case. Judging it against its OWN largest
+# singular value then compares 1e-16 with 1e-16, declares full rank, and
+# collapses the subspace to nothing, so the certificate silently fails on
+# the graphs it is meant to catch.
+#
+# That is not hypothetical: with the tolerance self-referenced, the same
+# physical problem gave 156 INVALID with the drain labelled mode 2 and only
+# 80 with it labelled mode 0 — 92 graphs whose verdict flipped under a
+# relabelling that cannot change the physics. Passing the generator norm as
+# `ref` makes the test scale-correct and the verdict permutation-invariant.
+def _orthonormal(X: np.ndarray, rtol: float = 1e-10) -> np.ndarray:
+    if X.size == 0:
+        return X
+    U, s, _ = np.linalg.svd(X, full_matrices=False)
+    rank = int(np.sum(s > rtol * max(float(s[0]), 1e-300)))
+    return U[:, :rank]
+
+
+def _nullspace(M: np.ndarray, rtol: float = 1e-10,
+                ref: Optional[float] = None) -> np.ndarray:
     if M.size == 0:
         return np.eye(M.shape[1] if M.ndim == 2 else 0)
     _, s, Vt = np.linalg.svd(M)
-    top = float(s[0]) if s.size else 0.0
-    rank = int(np.sum(s > rtol * max(top, 1e-300)))
+    scale = float(s[0]) if (ref is None and s.size) else (ref or 0.0)
+    rank = int(np.sum(s > rtol * max(scale, 1e-300)))
     return Vt[rank:].T
 
 
@@ -816,13 +867,253 @@ def undamped_subspace(triu_array, num_modes: int, aux_ids: List[int],
             if cur.shape[1] == 0:
                 break
             P = cur @ cur.T                      # cur is orthonormal
-            K = _nullspace((np.eye(dim) - P) @ M @ cur, rtol)
-            cur = cur @ K if K.shape[1] else np.zeros((dim, 0))
+            # ref = ||M||: the block below is zero exactly when cur is
+            # already M-invariant, so it has no meaningful scale of its own.
+            K = _nullspace((np.eye(dim) - P) @ M @ cur, rtol,
+                            ref=float(np.linalg.norm(M, 2)))
+            cur = _orthonormal(cur @ K) if K.shape[1] else np.zeros((dim, 0))
         if cur.shape[1] == W.shape[1]:
             W = cur
             break
         W = cur
     return W
+
+
+# solution_set_dark_subspace(triu, V, ...) -> dimension of the largest
+# subspace W with, for EVERY solution (G, Upsilon) of (**) at this V,
+#     A(G,Upsilon)^T W subset W    and    D(Upsilon) W = 0.
+#
+# Nonzero => every point of the solution set carries a left eigenvector with
+# Re(lambda) = 0, so no attractive solution exists AT THIS V. A certificate,
+# not a failed search.
+#
+# This is undamped_subspace's condition applied to the SOLUTION SET rather
+# than to the whole admissible set S_G x S_Upsilon, and that distinction is
+# the entire content. Quantifying over every setting the graph permits is
+# far too strong: a generic admissible point is not dark (measured
+# ||w^T A|| = 0.560 on a graph whose solution set is uniformly dark), so
+# undamped_subspace returns 0 and certifies nothing. Restricted to the
+# solutions — the only settings that produce the target at all — the dark
+# subspace is the SAME for every point, with only the oscillation frequency
+# varying (measured: six sampled solutions, dark subspaces agreeing to
+# ||P_i - P_0|| ~ 4e-16).
+#
+# Measured effect on the two-mode-squeezed target, all 512 graphs, r = 0.5,
+# one auxiliary drain, fixed vacuum frame:
+#     connectivity certificates alone     :  80 INVALID, 376 UNDECIDED
+#     with this one                       : 456 INVALID,   0 UNDECIDED
+# i.e. the partition is COMPLETE — every graph is decided, and the 56 VALID
+# graphs are exactly the complement. Audited three ways: no graph carrying a
+# Hurwitz witness is condemned (0 of 56); the verdict is invariant under
+# relabelling the drain; and on 456 graphs x 5 independently drawn solution
+# points the universal claim holds numerically, ||D W|| = 0 exactly and the
+# A^T-invariance defect <= 8.4e-15.
+#
+# Earlier revisions of this file reported 156 INVALID / 300 UNDECIDED here.
+# That figure was a TOLERANCE ARTEFACT, not a weaker certificate: the rank
+# test inside the iteration judged the block (I - P) M W against its own
+# largest singular value, which is ~1e-16 exactly when the subspace IS
+# invariant, so the success case was read as full rank and the subspace
+# collapsed. See _nullspace's header. The give-away was that 156 depended on
+# which mode the drain was called (92 graphs flipped verdict under a
+# relabelling); scale-correct tolerances removed the dependence and the
+# undecided stratum with it.
+#
+# SCOPE: this certifies the graph AT THE GIVEN V. It is frame-dependent —
+# the drain state enters through the solution set — so a graph certified
+# here at a vacuum drain may still be valid with a squeezed one. That is
+# not hypothetical: the two-beamsplitter scheme is exactly such a graph. So
+# `decide` (fixed V) may propagate this verdict, while `optimise_aux_state`
+# (which ranges over drain states) must not treat it as graph-level.
+#
+# return_basis=True returns the (complex, generally non-orthonormal) basis
+# itself instead of its dimension, which is what pbh_certificate needs to
+# exhibit the offending direction rather than merely count it.
+def solution_set_dark_subspace(triu_array, V: np.ndarray, num_modes: int,
+                                aux_ids: List[int], coupled_drains: bool = False,
+                                rtol: float = 1e-9, return_basis: bool = False):
+    dim = 2 * num_modes
+    h_basis = hamiltonian_basis(triu_array, num_modes,
+                                include_detunings=True, allow_phases=True)
+    d_basis = dissipation_basis(aux_ids, num_modes, coupled_drains=coupled_drains)
+    sol = solve_stationarity(V, h_basis, d_basis, None, rtol=rtol)
+    N = sol['nullspace']
+    if N.shape[1] == 0:
+        return np.zeros((dim, 0), dtype=complex) if return_basis else 0
+
+    # Complex counterparts of _nullspace / _orthonormal, with the same
+    # scale-reference discipline: `ref` must be supplied wherever the block
+    # can legitimately be zero (see _nullspace's header for what goes wrong
+    # otherwise — a verdict that depends on which mode the drain is called).
+    def null_c(M, ref=None):
+        if M.size == 0:
+            return np.eye(M.shape[1] if M.ndim == 2 else 0, dtype=complex)
+        _, s, Vh = np.linalg.svd(M)
+        scale = float(s[0]) if (ref is None and s.size) else (ref or 0.0)
+        rank = int(np.sum(s > rtol * max(scale, 1e-300)))
+        return Vh[rank:].conj().T
+
+    def orth_c(X):
+        if X.size == 0:
+            return X
+        U, s, _ = np.linalg.svd(X, full_matrices=False)
+        rank = int(np.sum(s > rtol * max(float(s[0]), 1e-300)))
+        return U[:, :rank]
+
+    As, Ds = [], []
+    for k in range(N.shape[1]):
+        G, Y = _assemble(N[:, k], h_basis, d_basis, None, dim)
+        As.append(drift_matrix(G, Y).T.astype(complex))
+        Ds.append(diffusion_matrix(Y).astype(complex))
+
+    W = orth_c(null_c(np.vstack(Ds)))
+    for _ in range(dim + 2):
+        if W.shape[1] == 0:
+            break
+        cur = W
+        for M in As:
+            if cur.shape[1] == 0:
+                break
+            # cur is kept orthonormal, so P is the projector and ||M|| is the
+            # right scale for the residual block (I - P) M cur.
+            P = cur @ cur.conj().T
+            K = null_c((np.eye(dim) - P) @ M @ cur,
+                        ref=float(np.linalg.norm(M, 2)))
+            cur = orth_c(cur @ K) if K.shape[1] else np.zeros((dim, 0), dtype=complex)
+        if cur.shape[1] == W.shape[1]:
+            W = cur
+            break
+        W = cur
+    return W if return_basis else W.shape[1]
+
+
+# pbh_certificate(...) -> None, or a dict exhibiting an UNCONTROLLABLE
+# IMAGINARY MODE. §8 Move 2, and the auditable form of the two dark-subspace
+# certificates above.
+#
+# The logic chain the doc sets out, in one place:
+#   §3      every solution of (**) with V > 0 already has Re lambda <= 0, so
+#           "not Hurwitz" can only mean an eigenvalue exactly ON the
+#           imaginary axis — there is nothing to check off it.
+#   PBH     (Popov-Belevitch-Hautus) the pair (A, B) with D = B B^T is
+#           uncontrollable at lambda iff rank[A - lambda I | B] < 2n, and the
+#           deficiency is witnessed by a left null vector w:
+#               w^T (A - lambda I) = 0   and   w^T B = 0.
+#   here    D w = B B^T w = 0 is EQUIVALENT to w^T B = 0, so "dark direction"
+#           and "uncontrollable mode" are the same object. A dark mode is an
+#           uncontrollable imaginary mode.
+#
+# So the subspace computations above (undamped_subspace over the whole
+# admissible family; solution_set_dark_subspace over the solution set) do not
+# merely suggest invalidity — each hands over a w that FAILS the PBH rank
+# test, which is a single numerical quantity anyone can recompute. This
+# function produces that number, together with the lambda it sits at.
+#
+# scope='admissible' quantifies over every (G, Upsilon) the graph permits and
+# is therefore FRAME-INDEPENDENT — safe to propagate as a graph-level verdict
+# regardless of drain state. scope='solution_set' quantifies only over the
+# solutions at this V; it is far stronger (80 -> 456 of 512 on the
+# two-mode-squeezed target, emptying the undecided stratum) but
+# frame-DEPENDENT, so a caller that ranges over drain states must not treat
+# it as graph-level. Both are returned; callers pick by scope.
+def pbh_certificate(triu_array, V: np.ndarray, num_modes: int,
+                     aux_ids: List[int], coupled_drains: bool = False,
+                     rtol: float = 1e-9, scope: str = 'solution_set'
+                     ) -> Optional[Dict]:
+    dim = 2 * num_modes
+    h_basis = hamiltonian_basis(triu_array, num_modes,
+                                include_detunings=True, allow_phases=True)
+    d_basis = dissipation_basis(aux_ids, num_modes, coupled_drains=coupled_drains)
+
+    if scope == 'admissible':
+        W = undamped_subspace(triu_array, num_modes, aux_ids,
+                              coupled_drains=coupled_drains, rtol=rtol
+                              ).astype(complex)
+    elif scope == 'solution_set':
+        W = solution_set_dark_subspace(triu_array, V, num_modes, aux_ids,
+                                        coupled_drains=coupled_drains,
+                                        rtol=rtol, return_basis=True)
+    else:
+        raise ValueError("scope must be 'admissible' or 'solution_set'")
+    if W.shape[1] == 0:
+        return None
+
+    # A representative point of the set being quantified over. The subspace
+    # claim is that EVERY point is dark on W, so any representative exhibits
+    # the failure — but the representative must be PHYSICAL, or the PBH rank
+    # test degenerates. A point with Upsilon not PSD has a diffusion matrix
+    # with negative eigenvalues, D = B B^T has no real factor, B comes back
+    # empty, and rank[A - lambda I | B] < 2n reduces to "A - lambda I is
+    # singular" — true by construction and therefore proving nothing. So
+    # draw until Upsilon >= 0 and D != 0, and record whether that succeeded.
+    rng = np.random.default_rng(12345)
+    if scope == 'solution_set':
+        sol = solve_stationarity(V, h_basis, d_basis, None, rtol=rtol)
+        N = sol['nullspace']
+        draw = lambda: N @ rng.normal(0., 1., N.shape[1])
+    else:
+        nz = len(h_basis) + len(d_basis)
+        draw = lambda: rng.normal(0., 1., nz)
+
+    G = Y = None
+    psd_point = False
+    for _ in range(64):
+        z = draw()
+        Gc, Yc = _assemble(z, h_basis, d_basis, None, dim)
+        if G is None:
+            G, Y = Gc, Yc                    # fall-back representative
+        if _is_psd(Yc) and np.linalg.norm(diffusion_matrix(Yc)) > 1e-12:
+            G, Y, psd_point = Gc, Yc, True
+            break
+
+    A = drift_matrix(G, Y)
+    D = diffusion_matrix(Y)
+    # D = B B^T with B from the PSD square root; only its column space
+    # matters to the rank test, so the symmetric root is as good as any
+    # Cholesky factor and does not need D to be nonsingular.
+    ew, ev = np.linalg.eigh((D + D.T) / 2)
+    keep = ew > rtol * max(float(np.max(np.abs(ew))) if ew.size else 1.0, 1e-300)
+    B = (ev[:, keep] * np.sqrt(np.clip(ew[keep], 0., None))) if np.any(keep) \
+        else np.zeros((dim, 0))
+
+    # Restrict A^T to W and diagonalise: every eigenvalue of the restriction
+    # is an eigenvalue of A whose left eigenvector lies in W, hence is dark.
+    Q, _ = np.linalg.qr(W)
+    M = Q.conj().T @ A.T.astype(complex) @ Q
+    lam, vec = np.linalg.eig(M)
+
+    best = None
+    for k in range(len(lam)):
+        w = Q @ vec[:, k]
+        nw = float(np.linalg.norm(w))
+        if nw < 1e-300:
+            continue
+        w = w / nw
+        eig_res = float(np.linalg.norm(A.T.astype(complex) @ w - lam[k] * w))
+        dark_res = float(np.linalg.norm(B.T.astype(complex) @ w)) if B.size \
+            else 0.0
+        stacked = np.hstack([A.astype(complex) - lam[k] * np.eye(dim),
+                             B.astype(complex)]) if B.size else \
+            (A.astype(complex) - lam[k] * np.eye(dim))
+        s = np.linalg.svd(stacked, compute_uv=False)
+        rank = int(np.sum(s > rtol * max(float(s[0]), 1e-300)))
+        cand = {'kind': 'pbh_uncontrollable', 'scope': scope,
+                'dim': int(W.shape[1]), 'lambda': complex(lam[k]),
+                'pbh_rank': rank, 'full_rank': dim,
+                'eigen_residual': eig_res, 'darkness_residual': dark_res,
+                'psd_point': psd_point, 'n_channels': int(B.shape[1]) if B.size else 0,
+                'frame_dependent': (scope == 'solution_set'),
+                'note': ('w^T A = lambda w^T with Re(lambda) = {:.2e} and w^T B = 0, '
+                          'so rank[A - lambda I | B] = {} < {}: the mode is '
+                          'uncontrollable, hence undamped, for every point of the '
+                          '{} set — A can never be Hurwitz there'
+                          .format(float(np.real(lam[k])), rank, dim,
+                                  'solution' if scope == 'solution_set' else 'admissible'))}
+        if rank >= dim:
+            continue                       # not actually rank-deficient; skip
+        if best is None or abs(np.real(lam[k])) < abs(np.real(best['lambda'])):
+            best = cand
+    return best
 
 
 def structural_certificate(
@@ -832,6 +1123,8 @@ def structural_certificate(
     node_types: List[str],
     coupled_drains: bool = False,
     corr_tol: float = 1e-10,
+    include_solution_set: bool = True,
+    attach_pbh: bool = True,
 ) -> Optional[Dict]:
     n = len(node_types)
     rows, cols = np.triu_indices(n)
@@ -879,15 +1172,22 @@ def structural_certificate(
     # and Bogoliubov dark modes that a per-mode connectivity test cannot
     # see. Checked after (a) only because (a) is cheaper and yields a more
     # readable certificate when it applies; (a2) subsumes it.
-    W = undamped_subspace(triu_array, n, list(aux), coupled_drains=coupled_drains)
+    W = undamped_subspace(triu_array, n, sorted(aux), coupled_drains=coupled_drains)
     if W.shape[1] > 0:
-        return {'kind': 'undamped_subspace', 'dim': int(W.shape[1]),
+        cert = {'kind': 'undamped_subspace', 'dim': int(W.shape[1]),
                 'basis': W,
                 'note': ('a {}-dimensional subspace is annihilated by every admissible '
                           'diffusion generator AND invariant under every admissible drift '
                           'generator, so it carries a left eigenvector with Re(lambda) = 0 '
                           'for EVERY (G, Upsilon) on this graph; A can never be Hurwitz'
                           .format(W.shape[1]))}
+        # §8 Move 2: restate the subspace claim as a PBH rank deficiency, the
+        # form that can be recomputed and audited as one number.
+        if attach_pbh:
+            cert['pbh'] = pbh_certificate(triu_array, V, n, sorted(aux),
+                                           coupled_drains=coupled_drains,
+                                           scope='admissible')
+        return cert
 
     # (b) target demands correlation across a cut
     if not coupled_drains:
@@ -903,6 +1203,26 @@ def structural_certificate(
                                       'but this graph puts them in disconnected components with '
                                       'independent baths, so their steady state factorises'
                                       .format(a, b))}
+
+    # (c) uniformly dark solution set — the general certificate, and the one
+    # that does the most work (80 -> 456 of 512 on the two-mode-squeezed
+    # target, leaving nothing undecided there).
+    # FRAME-DEPENDENT: it certifies this graph at THIS V only, so a caller
+    # ranging over drain states must not propagate it as a graph-level
+    # verdict — see solution_set_dark_subspace's scope note.
+    if include_solution_set:
+        d = solution_set_dark_subspace(triu_array, V, n, sorted(aux),
+                                        coupled_drains=coupled_drains)
+        if d > 0:
+            cert = {'kind': 'solution_set_dark', 'dim': int(d), 'frame_dependent': True,
+                    'note': ('every solution of (**) at this drain state shares a '
+                              '{}-dimensional dark subspace, so all of them have '
+                              'Re(lambda) = 0 and none is attractive'.format(d))}
+            if attach_pbh:
+                cert['pbh'] = pbh_certificate(triu_array, V, n, sorted(aux),
+                                               coupled_drains=coupled_drains,
+                                               scope='solution_set')
+            return cert
     return None
 
 
@@ -1211,6 +1531,11 @@ def sdp_feasibility(V: np.ndarray, h_basis, d_basis):
 #                covers every Gaussian bath (thermal, squeezed,
 #                cross-correlated) in one linear space; filter for a member
 #                that is simultaneously PSD and Hurwitz.
+#   gap max    — §8 Move 1: before conceding UNDECIDED, stop asking whether
+#                the feasible set contains a Hurwitz point and MAXIMISE the
+#                spectral gap over it instead. Costs gap_effort x the
+#                sampling budget, but only on the graphs that would
+#                otherwise be undecided.
 #   verdict    — VALID only with a fully verified witness (residual zero,
 #                Upsilon >= 0, A Hurwitz, and the FORWARD Lyapunov solve
 #                reproducing V). Feasible-but-unwitnessed is UNDECIDED,
@@ -1229,6 +1554,8 @@ def decide(
     seed: Optional[int] = None,
     rtol: float = RESIDUAL_RTOL_DEFAULT,
     margin_tol: float = MARGIN_TOL_DEFAULT,
+    include_solution_set: bool = True,
+    gap_effort: int = 8,
 ) -> Dict:
     num_modes = len(node_types)
     dim = 2 * num_modes
@@ -1249,7 +1576,8 @@ def decide(
 
     # ---- structural certificates: the sound INVALID verdicts --------------
     cert = structural_certificate(triu_array, V, target_mode_ids, node_types,
-                                   coupled_drains=coupled_drains)
+                                   coupled_drains=coupled_drains,
+                                   include_solution_set=include_solution_set)
     if cert is not None:
         out['verdict'] = INVALID
         out['certificate'] = cert
@@ -1299,6 +1627,36 @@ def decide(
         out.update(_witness(G, Y, V, margin, 'joint'))
         return out
 
+    # ---- §8 Move 1: gap maximisation before conceding UNDECIDED ------------
+    # The cheap decision-mode filter stops at the first witness and can miss
+    # a thin feasible cone entirely. The doc's Move 1 is to replace the
+    # feasibility question with the OPTIMISATION
+    #     gamma* = max over the feasible set of [-max_i Re lambda_i(A)],
+    # on the grounds that a valid graph's Hurwitz members form a relatively
+    # open, positive-measure subset, so a genuine interior ascent finds one
+    # whenever it exists. Run at gap_effort x the sampling budget, with no
+    # early exit, and only on graphs about to be filed UNDECIDED — so the
+    # cost lands exactly on the stratum it is meant to shrink and nowhere
+    # else. gamma* > 0 is a sound VALID witness; gamma* = 0 still proves
+    # nothing (Move 1 attacks the VALID side only).
+    if gap_effort and gap_effort > 0 and sol['nullspace'].shape[1] > 0:
+        # Budget split: samples scale with gap_effort (each costs one
+        # eigenvalue decomposition) while the Nelder-Mead restarts, which are
+        # three orders of magnitude dearer, grow only additively. The
+        # restarts are what actually walks into a thin feasible cone, so they
+        # cannot be dropped — but 2 + effort of them is already well past the
+        # point where extra ones find anything new.
+        ok, z, margin = attractivity_filter(
+            sol, h_basis, d_basis, None, dim,
+            num_samples=num_samples * int(gap_effort),
+            seed=seed + 1, margin_tol=margin_tol, require_psd=True,
+            n_polish=2 + int(gap_effort), maximise=True)
+        out['gap_star'] = margin
+        if ok:
+            G, Y = _assemble(z, h_basis, d_basis, None, dim)
+            out.update(_witness(G, Y, V, margin, 'joint_gap_max'))
+            return out
+
     if use_sdp:
         status, G, Y = sdp_feasibility(V, h_basis, d_basis)
         out['sdp_status'] = status
@@ -1310,9 +1668,14 @@ def decide(
 
     # Solutions exist but none of them was shown to be attractive. NOT
     # invalid — the search must not prune on this (§4C).
+    # Feasible, no Hurwitz member found, no impossibility certificate: §4C's
+    # third outcome. The true category exists — the graph objectively either
+    # has a Hurwitz member or does not — but the procedure has not computed
+    # it, so it must NOT be pruned on (§4C, §5(i)).
     out['verdict'] = UNDECIDED
-    out['reason'] = ('stationary solutions exist but no strictly Hurwitz, PSD member '
-                      'was found; retry with a larger num_samples')
+    out['reason'] = ('feasible (stationary solutions exist) but no strictly Hurwitz, '
+                      'PSD member was found and no universal certificate applies; '
+                      'raise gap_effort/num_samples, or decide it with §8 Move 3')
     out['best_margin'] = margin
     return out
 
@@ -1450,6 +1813,11 @@ def optimise_aux_state(
     # in `objective` below is what drives r to 0 when no squeezing is
     # needed. Both give the same answer — the flag only trades a little
     # compute for having one fewer hand-written rule in the loop.
+    # The solution-set certificate is FRAME-DEPENDENT, and this function
+    # ranges over drain states, so it must not be allowed to stamp a
+    # graph-level INVALID. Only the frame-independent structural
+    # certificates (connectivity) may do that here.
+    decide_kwargs = dict(decide_kwargs, include_solution_set=False)
     V_vac = complete_covariance(sigma_target, target_mode_ids, num_modes)
     out_vac = decide(triu_array, V_vac, target_mode_ids, node_types, **decide_kwargs)
     if prefer_vacuum and out_vac['verdict'] == VALID:
@@ -1621,6 +1989,11 @@ def _witness(G, Y, V, margin, path):
     # closed-form squeezed baths.
     res = reservoir_summary(Y, G.shape[0] // 2)
     return {'verdict': VALID, 'G': G, 'Upsilon': Y, 'A': A, 'D': D,
+            # 'gap' and 'stability_margin' are the same number under two
+            # names: §8 Move 1 observes that the quantity deciding validity
+            # IS the dissipative gap, so the oracle returns the figure of
+            # merit for the resource-vs-gap comparison for free.
+            'gap': margin,
             'stability_margin': margin, 'stationarity_residual': resid,
             'forward_error': fwd_err, 'V_forward': V_fwd, 'path': path,
             'upsilon_psd': _is_psd(Y), 'upsilon_rank': rank,

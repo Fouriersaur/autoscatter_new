@@ -276,9 +276,49 @@ def main(r=0.5, quick=False, num_samples=24):
               f'graphs in the lattice are valid')
         print('  (every valid graph contains an irreducible one as a subgraph —')
         print('   the extras are the same schemes with redundant edges added)')
-        print('\nClaim: these are the irreducible schemes the oracle could VERIFY.')
-        print('UNDECIDED graphs were never ruled out, so a simpler scheme may exist')
-        print('among them; only the INVALID set is proven.')
+        # ---- Phase 3: §8 Move 4 — what is actually still open ------------
+        #
+        # "N irreducible schemes" is only a complete answer if the lattice
+        # is fully decided. Where it is not, the claim must be qualified
+        # PRECISELY, and the qualification is much narrower than the raw
+        # UNDECIDED count: a graph left undecided in the interior of the
+        # invalid region blocks nothing, because nothing is trying to
+        # descend through it. What blocks the answer is an undecided graph
+        # sitting one edge BELOW a valid one — there the search cannot tell
+        # whether a simpler scheme exists. Those, and only those, are where
+        # an exact backstop (Move 3) would have to run.
+        verdicts = search.lattice_verdicts()
+        from collections import Counter as _C
+        tally = _C(verdicts.values())
+        frontier = search.frontier_undecided(verdicts)
+        print(f'\n{"-" * 76}')
+        print('Lattice status (§4C three-way verdict, closed under propagation):')
+        for k in (lo.VALID, lo.INVALID, lo.UNDECIDED):
+            print(f'  {k:10s} {tally.get(k, 0):5d}')
+        print(f'\n§8 Move 4 — undecided graphs that actually OBSTRUCT the answer')
+        print(f'  (one edge below a valid graph): {len(frontier)} of '
+              f'{tally.get(lo.UNDECIDED, 0)} undecided')
+
+        status = _C()
+        for triu, _ in rows:
+            status[search.certify_irreducible(triu, verdicts)['status']] += 1
+        print(f'\nIrreducibility of the {len(rows)} reported schemes:')
+        print(f'  certified irreducible (every one-edge deletion proven INVALID) '
+              f'{status["irreducible"]}')
+        print(f'  minimality UNPROVEN (some deletion is undecided)              '
+              f'{status["unresolved"]}')
+        # 'reducible' is not a contradiction here: minimality was taken
+        # WITHIN a reservoir class, so a vacuum-drain scheme is kept even
+        # when a subgraph of it is valid with a squeezed drain. Neither
+        # dominates — one trades couplings for not needing a squeezed source.
+        print(f'  has a valid subgraph in the OTHER reservoir class            '
+              f'{status["reducible"]}')
+        if status['unresolved']:
+            print('  -> for those, a simpler scheme may exist; the oracle has not')
+            print('     ruled it out. Point Move 3 at the frontier graphs above.')
+        if not tally.get(lo.UNDECIDED, 0):
+            print('\nThe lattice is FULLY DECIDED: every graph is VALID or INVALID')
+            print('by certificate, so this irreducible set is complete, not partial.')
 
 
 if __name__ == '__main__':

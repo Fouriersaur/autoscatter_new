@@ -149,6 +149,15 @@ def report(r, target, sweep_out, elapsed):
     print('  INVALID settles every subgraph, VALID settles every supergraph,')
     print('  UNDECIDED settles nothing — which is why the saving is modest here:')
     print(f'  {len(by.get(lo.UNDECIDED, []))} of {n_tot} graphs carry a verdict that cannot propagate.')
+
+    # §8 Move 4: of the undecided graphs, only those sitting one edge below a
+    # valid one actually obstruct the answer — they are where the search
+    # cannot tell whether a simpler scheme exists. The rest are interior and
+    # cost nothing, so this number, not the raw undecided count, is the size
+    # of the remaining problem.
+    frontier = sweep_out.get('frontier_undecided', [])
+    print(f'  of those, {len(frontier)} sit one edge below a VALID graph and so')
+    print('  genuinely block a minimality claim (§8 Move 4); the rest are interior.')
     print()
 
     for cls, title in [('VALID/vacuum', 'VACUUM reservoir'),

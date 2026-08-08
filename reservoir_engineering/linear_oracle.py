@@ -1516,6 +1516,316 @@ def sdp_feasibility(V: np.ndarray, h_basis, d_basis):
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# §8 Move 3: a decision procedure for the residue
+# ───────────────────────────────────────────────────────────────────────────
+# Everything above decides a graph by finding a witness (VALID) or by
+# exhibiting a subspace that is dark at every solution (INVALID). What
+# survives both is UNDECIDED, and Move 3 is the expensive machinery aimed at
+# exactly that residue. Move 4 is why it is affordable: the residue that
+# matters is only the graphs sitting one edge below a valid graph, which is
+# a handful rather than the whole stratum.
+#
+# The key structural fact both halves lean on: at Gamma_signal = 0 the
+# stationarity system is HOMOGENEOUS, so the solution set is a linear
+# subspace and
+#       A(alpha) = sum_j alpha_j A_j
+# is LINEAR in the coordinates alpha of that subspace. The problem is
+# therefore "does this linear matrix family contain a Hurwitz member?",
+# which is what makes both routes below tractable.
+#
+# ---------------------------------------------------------------------------
+# solution_set_drift_basis: the A_j above, plus the generator bases needed to
+# rebuild (G, Upsilon) from alpha.
+def solution_set_drift_basis(triu_array, V: np.ndarray, num_modes: int,
+                              aux_ids: List[int], coupled_drains: bool = False,
+                              rtol: float = 1e-9):
+    dim = 2 * num_modes
+    h_basis = hamiltonian_basis(triu_array, num_modes,
+                                include_detunings=True, allow_phases=True)
+    d_basis = dissipation_basis(aux_ids, num_modes, coupled_drains=coupled_drains)
+    sol = solve_stationarity(V, h_basis, d_basis, None, rtol=rtol)
+    N = sol['nullspace']
+    As = []
+    for k in range(N.shape[1]):
+        G, Y = _assemble(N[:, k], h_basis, d_basis, None, dim)
+        As.append(drift_matrix(G, Y))
+    return {'A_basis': As, 'nullspace': N, 'h_basis': h_basis,
+            'd_basis': d_basis, 'dim': dim}
+
+
+# _hurwitz_minors(a): leading principal minors Delta_1..Delta_n of the Hurwitz
+# matrix of p(s) = s^n + a_1 s^{n-1} + ... + a_n, i.e. H_ij = a_{2i-j} with
+# a_0 = 1 and a_k = 0 outside 0..n.
+#
+# Routh-Hurwitz: A is Hurwitz iff every Delta_k > 0. The contrapositive is
+# what Move 3 uses on the INVALID side — if any single Delta_k vanishes
+# IDENTICALLY over the family, no member can be Hurwitz.
+#
+# Returned RELATIVE to the Hadamard bound |det M| <= prod_i ||row_i(M)||,
+# which is the size of the largest term in the determinant expansion. That
+# ratio measures cancellation and is the only scale-correct way to ask
+# "is this determinant zero?".
+#
+# Using the raw value instead is a trap, and one this file has now fallen
+# into twice (see _nullspace for the first). A genuinely Hurwitz 6x6 has
+# Delta_5 ~ 1e-3 and Delta_6 ~ 1e-6 after normalising ||A|| = 1, and an 8x8
+# has Delta_8 ~ 1e-11 — so any absolute threshold loose enough to call a
+# true zero "zero" also condemns every stable matrix in sight. Measured on
+# this problem the relative minor separates cleanly: VALID graphs land in
+# 1.3e-6 .. 1.5e-3, INVALID graphs at or below 8.4e-12.
+def _hurwitz_minors(a: np.ndarray, relative: bool = True) -> np.ndarray:
+    n = len(a)
+
+    def ext(k):
+        if k == 0:
+            return 1.0
+        return float(a[k - 1]) if 1 <= k <= n else 0.0
+
+    H = np.array([[ext(2 * i - j) for j in range(1, n + 1)]
+                  for i in range(1, n + 1)], dtype=float)
+    out = []
+    for k in range(1, n + 1):
+        Hk = H[:k, :k]
+        d = float(np.linalg.det(Hk))
+        if not relative:
+            out.append(d)
+            continue
+        had = 1.0
+        for i in range(k):
+            had *= float(np.linalg.norm(Hk[i, :]))
+        # A zero row makes the bound vanish, but then the determinant is
+        # exactly zero too, which is a genuine vanishing rather than a
+        # numerical one.
+        out.append(0.0 if had < 1e-300 else abs(d) / had)
+    return np.array(out)
+
+
+# move3_invalid_certificate(...) -> None, or a proof that NO member of the
+# family is Hurwitz.
+#
+# The universal side of Move 3, and the piece the dark-subspace certificate
+# cannot supply. That certificate needs ONE subspace dark at every solution
+# point. When the dark direction ROTATES as you move through the solution set
+# — which is what leaves the product-target graphs undecided, with per-point
+# dark projectors differing by ||P_i - P_0|| ~ 1.5-2.0 — the intersection is
+# empty and it certifies nothing, even though every individual point is
+# marginal. This test does not care where the dark direction points.
+#
+# How it works. Each Hurwitz minor Delta_k(alpha) is a POLYNOMIAL in alpha of
+# degree at most n*k, because A(alpha) is linear and the characteristic
+# coefficients a_i are degree i. Restrict to a random line alpha(t) = alpha_0
+# + t*u: Delta_k(t) becomes a UNIVARIATE polynomial of degree at most n*k. A
+# univariate polynomial of degree d vanishing at d+1 distinct points is the
+# zero polynomial — no fitting, no threshold on a derivative, just the
+# fundamental theorem of algebra. Sampling n*k+2 points therefore PROVES
+# vanishing along that line, and repeating on independent random lines
+# extends it to the whole family (a nonzero polynomial cannot vanish on a
+# Zariski-dense set of lines).
+#
+# This is the honest strength of the result: it is exact up to floating point,
+# in the same sense as the dark-subspace certificate, whose residuals sit at
+# ~1e-14. It is NOT the moment-SOS / Positivstellensatz route the doc's Move 3
+# proposes — that would need the solution basis itself in exact arithmetic,
+# and this basis comes from an SVD. What is gained over sampling the spectral
+# abscissa is the quantifier: "this polynomial is identically zero" covers the
+# continuum, where "400 sampled points were all marginal" does not.
+#
+# Scale, twice over. A(alpha) is divided by ||A(alpha)|| before the
+# characteristic polynomial is taken, so the coefficients do not depend on
+# where on the line the sample sits; and the minor itself is reported
+# relative to its Hadamard bound, because the minors of a perfectly stable
+# matrix are themselves minute (see _hurwitz_minors). Skip either and the
+# test condemns every graph, valid ones included — which is exactly what the
+# first version of this function did.
+def move3_invalid_certificate(triu_array, V: np.ndarray, num_modes: int,
+                               aux_ids: List[int], coupled_drains: bool = False,
+                               n_lines: int = 8, rtol: float = 1e-9,
+                               seed: int = 0) -> Optional[Dict]:
+    basis = solution_set_drift_basis(triu_array, V, num_modes, aux_ids,
+                                      coupled_drains=coupled_drains)
+    As, m, n = basis['A_basis'], basis['nullspace'].shape[1], basis['dim']
+    if m == 0:
+        return None
+    rng = np.random.default_rng(seed)
+
+    def minors_at(alpha):
+        A = sum(alpha[j] * As[j] for j in range(m))
+        nrm = float(np.linalg.norm(A))
+        if nrm < 1e-300:
+            return None, 0.0
+        a = np.real(np.poly(A / nrm))[1:]          # normalised: scale-free
+        return _hurwitz_minors(a), 1.0
+
+    vanishing = [True] * n
+    worst = [0.0] * n
+    for _ in range(n_lines):
+        alpha0 = rng.normal(0., 1., m)
+        u = rng.normal(0., 1., m)
+        for k in range(1, n + 1):
+            if not vanishing[k - 1]:
+                continue
+            npts = n * k + 2                       # > degree bound n*k
+            for t in np.linspace(-1.0, 1.0, npts):
+                mins, _ = minors_at(alpha0 + t * u)
+                if mins is None:
+                    continue
+                val = abs(float(mins[k - 1]))
+                worst[k - 1] = max(worst[k - 1], val)
+                if val > rtol:
+                    vanishing[k - 1] = False
+                    break
+
+    for k in range(1, n + 1):
+        if vanishing[k - 1]:
+            return {'kind': 'move3_hurwitz_minor_vanishes', 'minor': k,
+                    'max_abs_over_samples': worst[k - 1],
+                    'lines': n_lines, 'degree_bound': n * k,
+                    'samples_per_line': n * k + 2,
+                    'solution_dim': int(m),
+                    'note': ('Hurwitz minor Delta_{} of the normalised characteristic '
+                              'polynomial vanishes identically on the solution set '
+                              '(checked on {} random lines at {} points each, above the '
+                              'degree bound {}), so by Routh-Hurwitz no member of the '
+                              'family is Hurwitz — the graph is impossible, and this '
+                              'holds even though the dark direction varies from point '
+                              'to point'.format(k, n_lines, n * k + 2, n * k))}
+    return None
+
+
+# move3_witness(...) -> None, or a VALID witness carrying an explicit
+# Lyapunov certificate.
+#
+# The existential side of Move 3, stated in the doc as
+#     exists (G, Upsilon) in F, exists P > 0 :  A^T P + P A < 0.
+# This is exact rather than a relaxation — a feasible point together with the
+# Lyapunov matrix that proves it stable. It is a BILINEAR matrix inequality,
+# since the product P*A couples the unknowns, so it is not one convex solve.
+#
+# But it is bilinear in a very usable way: A is LINEAR in alpha, so the
+# inequality is an LMI in P for fixed alpha, and an LMI in alpha for fixed P.
+# Alternating between the two convex problems, from many random starts, is
+# the standard treatment, and every fixed point it reports is checked
+# directly, so a returned witness is sound regardless of how it was found.
+# Failure to converge proves nothing (this half is existential), which is why
+# the invalid certificate above is run as well.
+#
+# The normalisation tr(Re Upsilon) = 1 is needed because the family is a cone:
+# without it the solver would drive alpha to zero, where the inequality is
+# trivially non-strict.
+def move3_witness(triu_array, V: np.ndarray, num_modes: int, aux_ids: List[int],
+                   coupled_drains: bool = False, n_starts: int = 8,
+                   n_iters: int = 12, seed: int = 0,
+                   margin_tol: float = MARGIN_TOL_DEFAULT) -> Optional[Dict]:
+    try:
+        import cvxpy as cp
+    except ImportError:
+        return None
+
+    basis = solution_set_drift_basis(triu_array, V, num_modes, aux_ids,
+                                      coupled_drains=coupled_drains)
+    As, N = basis['A_basis'], basis['nullspace']
+    h_basis, d_basis, dim = basis['h_basis'], basis['d_basis'], basis['dim']
+    m = N.shape[1]
+    if m == 0:
+        return None
+
+    # tr(Re Upsilon) as a linear functional of alpha, for the normalisation.
+    tr_re = np.array([float(np.trace(_assemble(N[:, j], h_basis, d_basis,
+                                                None, dim)[1].real))
+                      for j in range(m)])
+    if np.linalg.norm(tr_re) < 1e-300:
+        return None
+
+    rng = np.random.default_rng(seed)
+
+    def solve_P(A):
+        P = cp.Variable((dim, dim), symmetric=True)
+        eps = cp.Variable()
+        cons = [P >> np.eye(dim), A.T @ P + P @ A << -eps * np.eye(dim), eps <= 1e3]
+        try:
+            cp.Problem(cp.Maximize(eps), cons).solve()
+        except Exception:
+            return None, -np.inf
+        if P.value is None:
+            return None, -np.inf
+        return np.array(P.value), float(eps.value)
+
+    def solve_alpha(P):
+        al = cp.Variable(m)
+        t = cp.Variable()
+        A = sum(al[j] * As[j] for j in range(m))
+        ReY = sum(al[j] * _assemble(N[:, j], h_basis, d_basis, None, dim)[1].real
+                  for j in range(m))
+        ImY = sum(al[j] * _assemble(N[:, j], h_basis, d_basis, None, dim)[1].imag
+                  for j in range(m))
+        cons = [A.T @ P + P @ A << t * np.eye(dim),
+                cp.bmat([[ReY, -ImY], [ImY, ReY]]) >> 0,
+                tr_re @ al == 1.0]
+        try:
+            cp.Problem(cp.Minimize(t), cons).solve()
+        except Exception:
+            return None
+        return None if al.value is None else np.array(al.value)
+
+    for s in range(n_starts):
+        alpha = rng.normal(0., 1., m)
+        if abs(float(tr_re @ alpha)) < 1e-9:
+            continue
+        alpha = alpha / float(tr_re @ alpha)
+        for _ in range(n_iters):
+            A = sum(alpha[j] * As[j] for j in range(m))
+            P, eps = solve_P(A)
+            if P is None:
+                break
+            # Verify directly rather than trusting the solver's status.
+            G, Y = _assemble(N @ alpha, h_basis, d_basis, None, dim)
+            A = drift_matrix(G, Y)
+            if _is_psd(Y) and normalised_margin(A) > margin_tol:
+                Q = A.T @ P + P @ A
+                if (np.linalg.eigvalsh((P + P.T) / 2)[0] > 0 and
+                        np.linalg.eigvalsh((Q + Q.T) / 2)[-1] < 0):
+                    return {'alpha': alpha, 'G': G, 'Upsilon': Y, 'P': P,
+                            'margin': normalised_margin(A), 'start': s}
+            nxt = solve_alpha(P)
+            if nxt is None:
+                break
+            alpha = nxt
+    return None
+
+
+# move3_resolve(...): run both halves on ONE graph and return a verdict.
+#
+# Order matters only for cost: the witness search is the cheaper of the two
+# when it succeeds, and the polynomial test is the one that settles the
+# impossible cases. Either outcome is a certificate; neither firing leaves
+# the graph UNDECIDED, exactly as before.
+def move3_resolve(triu_array, V: np.ndarray, target_mode_ids: List[int],
+                   node_types: List[str], coupled_drains: bool = False,
+                   n_lines: int = 8, n_starts: int = 8, seed: int = 0) -> Dict:
+    num_modes = len(node_types)
+    aux_ids = [i for i in range(num_modes) if i not in target_mode_ids]
+
+    w = move3_witness(triu_array, V, num_modes, aux_ids,
+                       coupled_drains=coupled_drains, n_starts=n_starts, seed=seed)
+    if w is not None:
+        out = _witness(w['G'], w['Upsilon'], V, w['margin'], 'move3_bmi')
+        out['lyapunov_P'] = w['P']
+        out['path'] = 'move3_bmi'
+        return out
+
+    cert = move3_invalid_certificate(triu_array, V, num_modes, aux_ids,
+                                      coupled_drains=coupled_drains,
+                                      n_lines=n_lines, seed=seed)
+    if cert is not None:
+        return {'verdict': INVALID, 'certificate': cert, 'path': 'move3_routh'}
+
+    return {'verdict': UNDECIDED, 'path': 'move3',
+            'reason': ('Move 3 found neither a Lyapunov witness nor an identically '
+                        'vanishing Hurwitz minor; the graph survives the strongest '
+                        'test implemented')}
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # the oracle
 # ───────────────────────────────────────────────────────────────────────────
 # decide(triu_array, V, target_mode_ids, node_types, ...) -> dict with

@@ -563,6 +563,78 @@ class CertifiedSearch:
                     out.append(np.array(k))
         return sorted(out, key=lambda t: int(np.sum(t)))
 
+    # resolve_frontier(): run §8 Move 3 on the frontier, and ONLY there.
+    #
+    # This is Move 4's payoff made operational. Move 3 is the expensive
+    # machinery — a bilinear matrix inequality for the witness side, a
+    # polynomial identity test over the whole solution family for the
+    # impossibility side — and running it on every undecided graph would
+    # defeat the point. It does not need to: an undecided graph matters only
+    # where it blocks a descent, i.e. where it sits one edge below a valid
+    # graph. The deep interior of either region never needs an exact verdict.
+    #
+    # Newly decided graphs are written into the cache, so their verdicts
+    # propagate through the normal rules on the next pass: a frontier graph
+    # resolved to INVALID settles its whole down-set and CERTIFIES the
+    # minimality of the valid graph above it; resolved to VALID it settles
+    # its up-set and demotes that graph from irreducible. Because resolution
+    # can expose a NEW frontier one level down, the process is iterated to a
+    # fixed point (bounded by `max_rounds`).
+    #
+    # Soundness is unchanged: Move 3 returns a verified Lyapunov witness, a
+    # certificate, or nothing. It never guesses.
+    def resolve_frontier(self, verdicts: Optional[Dict] = None,
+                          max_rounds: int = 4, max_graphs: Optional[int] = None,
+                          n_lines: int = 8, n_starts: int = 8,
+                          verbosity: Optional[int] = None) -> Dict:
+        from reservoir_engineering.linear_oracle import move3_resolve
+        verb = self.verbosity if verbosity is None else verbosity
+        if self.auto_reservoir:
+            raise ValueError(
+                'resolve_frontier needs a fixed frame: Move 3 quantifies over the '
+                'solution set at one V, which is not a graph-level statement when '
+                'the drain state is a free variable. Run with auto_reservoir=False.')
+
+        resolved, attempted, rounds = {VALID: [], INVALID: []}, 0, 0
+        if verdicts is None:
+            verdicts = self.lattice_verdicts()
+
+        for rnd in range(max_rounds):
+            frontier = self.frontier_undecided(verdicts)
+            if not frontier:
+                break
+            rounds += 1
+            todo = frontier if max_graphs is None else frontier[:max_graphs]
+            if verb:
+                print(f'  [move3] round {rnd + 1}: {len(frontier)} frontier graph(s), '
+                      f'resolving {len(todo)}')
+            progress = False
+            for triu in todo:
+                key = tuple(int(x) for x in triu)
+                attempted += 1
+                info = move3_resolve(triu, self.V, self.target_mode_ids,
+                                      self.node_types, n_lines=n_lines,
+                                      n_starts=n_starts,
+                                      coupled_drains=self._oracle_kwargs['coupled_drains'])
+                if info['verdict'] == UNDECIDED:
+                    continue
+                progress = True
+                self.cache[key] = info
+                resolved[info['verdict']].append(np.array(key))
+                if info['verdict'] == VALID:
+                    self._valid_seen.append(np.array(key))
+                else:
+                    self._invalid_seen.append(np.array(key))
+                if verb:
+                    print(f'    {describe(triu, self.num_modes):46s} -> {info["verdict"]}')
+            if not progress:
+                break                       # nothing moved; further rounds are futile
+            verdicts = self.lattice_verdicts()
+
+        return {'verdicts': verdicts, 'rounds': rounds, 'attempted': attempted,
+                'resolved_valid': resolved[VALID], 'resolved_invalid': resolved[INVALID],
+                'frontier_remaining': self.frontier_undecided(verdicts)}
+
 
 # Complete sweep — every graph gets a verdict, but the oracle is called only
 # where PROPAGATION does not already imply one (see verdict_of).

@@ -315,7 +315,15 @@ def main(r=0.5, quick=False, num_samples=24):
               f'{status["reducible"]}')
         if status['unresolved']:
             print('  -> for those, a simpler scheme may exist; the oracle has not')
-            print('     ruled it out. Point Move 3 at the frontier graphs above.')
+            print('     ruled it out. Move 3 is what decides them.')
+        if frontier:
+            # Move 3 quantifies over the solution set at ONE V, so it is a
+            # graph-level statement only in a fixed frame. This search ranges
+            # over drain states, so it cannot be applied here — rerun in the
+            # vacuum gauge (auto_reservoir=False) to resolve the frontier.
+            print('\n  Move 3 not applied: this run searches the drain state, and a')
+            print('  solution-set argument at one drain state is not a graph verdict.')
+            print('  Rerun with auto_reservoir=False to clear the frontier.')
         if not tally.get(lo.UNDECIDED, 0):
             print('\nThe lattice is FULLY DECIDED: every graph is VALID or INVALID')
             print('by certificate, so this irreducible set is complete, not partial.')

@@ -310,6 +310,64 @@ def test_invalid_certificates(r=0.5):
               f'max eigen {max(eig_res):.1e}, max darkness {max(dark_res):.1e}')
 
 
+# Test 8 — §8 Move 3 on the frontier (§8 Move 4).
+#
+# Target: two INDEPENDENTLY squeezed modes. Chosen because the dark-subspace
+# certificate does NOT close this one — the dark direction rotates through
+# the solution set, so no single subspace is dark everywhere and six graphs
+# survive as UNDECIDED. That makes it the case Move 3 exists for.
+#
+# The scale trap is the thing to guard. The Routh-Hurwitz minors of a
+# perfectly stable 6x6 are already ~1e-3 and ~1e-6, so a test that thresholds
+# them absolutely condemns every graph including the valid ones. The first
+# implementation did exactly that. Hence the soundness check comes first.
+def test_move3_frontier():
+    print('\nTest 8 — Move 3 on the frontier, target sq(0.3) (+) sq(0.7)')
+    import scipy.linalg as sla
+    from reservoir_engineering.targets import squeezed_vacuum
+    from reservoir_engineering.certified_search import sweep_all as _sweep
+
+    nt, tmi = ['mechanical', 'mechanical', 'cavity'], [0, 1]
+    tgt = sla.block_diag(squeezed_vacuum(0.3), squeezed_vacuum(0.7))
+    V = lo.complete_covariance(tgt, tmi, 3)
+
+    # The minors of a genuinely Hurwitz matrix must not read as zero.
+    rng = np.random.default_rng(0)
+    M = rng.normal(0, 1, (6, 6))
+    A = M - (abs(np.linalg.eigvals(M).real).max() + 1) * np.eye(6)
+    rel = lo._hurwitz_minors(np.real(np.poly(A / np.linalg.norm(A)))[1:])
+    check('Hurwitz minors of a stable matrix are all clearly nonzero',
+          float(rel.min()) > 1e-9, f'smallest relative minor {rel.min():.2e}')
+
+    out = _sweep(tgt, tmi, nt, num_samples=32, gap_effort=8)
+    search, verdicts = out['search'], out['verdicts']
+    n_und = sum(1 for v in verdicts.values() if v == lo.UNDECIDED)
+    check('this target leaves an undecided stratum for Move 3 to attack',
+          n_und > 0, f'{n_und} undecided')
+
+    # Soundness: the certificate must never fire on a graph with a witness.
+    condemned = sum(1 for c, v in verdicts.items() if v == lo.VALID and
+                    lo.move3_invalid_certificate(np.array(c), V, 3, [2], n_lines=4)
+                    is not None)
+    check('Move 3 condemns no graph that carries a Hurwitz witness',
+          condemned == 0, f'{condemned} wrongly condemned')
+
+    res = search.resolve_frontier(verdicts, verbosity=0)
+    v2 = res['verdicts']
+    check('Move 3 clears the frontier', not res['frontier_remaining'],
+          f'{len(res["frontier_remaining"])} left of {res["attempted"]} attempted')
+    check('  every graph now decided',
+          all(v != lo.UNDECIDED for v in v2.values()),
+          f'{sum(1 for v in v2.values() if v == lo.UNDECIDED)} undecided')
+
+    valid2 = [np.array(k) for k, v in v2.items() if v == lo.VALID]
+    mv = search.minimal_valid(valid2)
+    stat = [search.certify_irreducible(t, v2)['status'] for t in mv]
+    check('  all irreducible schemes now certified minimal',
+          all(s == 'irreducible' for s in stat),
+          f'{stat.count("irreducible")}/{len(stat)}')
+
+
 if __name__ == '__main__':
     test_kronwald()
     test_vitali_passive()
@@ -318,6 +376,7 @@ if __name__ == '__main__':
     test_basis_completeness()
     test_reservoir_choice()
     test_invalid_certificates()
+    test_move3_frontier()
     n_pass, n_tot = sum(_results), len(_results)
     print(f'\n{"="*66}\n  {n_pass}/{n_tot} checks passed\n{"="*66}')
     sys.exit(0 if n_pass == n_tot else 1)

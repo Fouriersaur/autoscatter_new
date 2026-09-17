@@ -1,8 +1,8 @@
 """
 test_linear_oracle.py
 =====================
-Validation for the certifying oracle (linear_oracle.py) and the three-valued
-search (certified_search.py) — the implementation of
+Validation for the oracle (linear_oracle.py) and the search built on it
+(certified_search.py) — the implementation of
 state_stabilization_algorithm.md.
 
 Every test compares against something independent of the oracle itself:
@@ -65,8 +65,8 @@ def test_kronwald(r=1.0):
               w['forward_error'] < 1e-10, f'||V_forward - V||={w["forward_error"]:.2e}')
         check('  Upsilon is PSD (physically realisable)', w['upsilon_psd'])
 
-    check('empty graph is INVALID by certificate', res['empty']['verdict'] == lo.INVALID,
-          res['empty'].get('certificate', {}).get('kind', ''))
+    check('empty graph is INVALID', res['empty']['verdict'] == lo.INVALID,
+          res['empty'].get('reason', ''))
     check('no single sideband is ever reported VALID',
           all(res[k]['verdict'] != lo.VALID for k in ('BS', 'TMS')),
           f"BS={res['BS']['verdict']}, TMS={res['TMS']['verdict']}")
@@ -103,17 +103,12 @@ def test_vitali_passive(r=0.4):
           img['verdict'] == lo.VALID)
 
 
-# Test 3 — search integrity, doc §5(iii). The assertion is that the top-down
-# and bottom-up passes never CONTRADICT: no graph VALID in one and INVALID in
-# the other. Under a sound oracle that is forced, since a verdict is a
-# deterministic function of the graph and cannot depend on traversal order, so
-# a contradiction localises an implementation bug rather than a lost scheme.
-#
-# Identical partitions are checked too, but as a DIAGNOSTIC. They are only
-# guaranteed once UNDECIDED is empty: undecided graphs propagate nothing, so
-# each pass may leave a different shadow of them unresolved. On this target
-# the stratum IS empty, so identity holds — but the test must not treat that
-# as the invariant, or it would fire on a correct run of a harder target.
+# Test 3 — search integrity, doc §5(iii). The top-down and bottom-up passes
+# should reach the same partition. That is no longer forced — pruning on an
+# unproven INVALID is direction-dependent, so a disagreement can be the
+# attractivity filter rather than a bug — but on this target, where every
+# graph is comfortably decided, it does hold, and a regression here is worth
+# looking at. The exhaustive-sweep comparison below is the sharper check.
 def test_search_integrity(r=0.4):
     print(f'\nTest 3 — bidirectional search integrity, target two_mode_squeezed({r})')
     nt, tmi = ['cavity', 'mechanical', 'mechanical'], [1, 2]
@@ -121,11 +116,8 @@ def test_search_integrity(r=0.4):
 
     s = CertifiedSearch(tgt, tmi, nt, num_samples=48, verbosity=0)
     out = s.run_bidirectional()
-    check('no VALID/INVALID contradiction between directions (§5(iii))',
-          out['agree'], f'{len(out["contradictions"])} contradictions')
-    check('  partitions identical (holds because UNDECIDED is empty)',
-          out['partitions_identical'],
-          f'{len(out["disagreeing_graphs"])} differing graphs')
+    check('the two directions reach the same partition (§5(iii))',
+          out['agree'], f'{len(out["disagreeing_graphs"])} differing graphs')
     check('minimal-valid sets agree between directions', out['minimal_valid_agree'])
 
     sweep = sweep_all(tgt, tmi, nt, num_samples=48)
@@ -139,8 +131,8 @@ def test_search_integrity(r=0.4):
     check('minimal scheme is the two-drain-edge BS+TMS pair',
           len(mv) > 0 and describe(mv[0], 3) == '(0,1)BS+TMS, (0,2)BS+TMS',
           describe(mv[0], 3) if mv else '(none)')
-    print(f'    {len(sweep["valid"])} VALID / {len(sweep["invalid"])} INVALID / '
-          f'{len(sweep["undecided"])} UNDECIDED out of 512 graphs')
+    print(f'    {len(sweep["valid"])} VALID / {len(sweep["invalid"])} INVALID '
+          f'out of 512 graphs')
 
 
 # Test 4 — scope guard. A mixed target has nonzero signal-drain correlation,
@@ -226,25 +218,16 @@ def test_reservoir_choice():
           o['verdict'] == lo.VALID and o['reservoir'] == 'vacuum')
 
 
-# Test 7 — the INVALID side (doc §8 Move 2). Three independent properties,
-# each of which caught a real defect when it was first run.
+# Test 7 — permutation invariance of the verdict.
 #
-# (a) SOUNDNESS. No graph carrying a verified Hurwitz witness may also carry
-#     an impossibility certificate. This is the one that must never fail:
-#     a false INVALID propagates to the whole down-set and silently deletes
-#     schemes.
-# (b) PERMUTATION INVARIANCE. Relabelling which mode is the drain cannot
-#     change the physics, so the verdict must be identical on the relabelled
-#     graph. This is what exposed the tolerance bug in the invariant-subspace
-#     iteration: the same problem gave 156 INVALID with the drain called
-#     mode 2 and 80 with it called mode 0.
-# (c) THE CERTIFICATE IS SELF-VERIFYING. Each dark-subspace certificate must
-#     hand over a PBH witness — a lambda on the imaginary axis and a left
-#     eigenvector w with w^T B = 0 — whose residuals are at machine
-#     precision. A certificate that cannot be recomputed independently is
-#     not a certificate.
-def test_invalid_certificates(r=0.5):
-    print(f'\nTest 7 — impossibility certificates, target two_mode_squeezed({r})')
+# Relabelling which mode is the drain cannot change the physics, so the
+# verdict must be identical on the relabelled graph. This is what exposed a
+# tolerance bug in the old invariant-subspace iteration: the same problem
+# gave 156 INVALID with the drain called mode 2 and 80 with it called mode 0.
+# It remains the sharpest cheap check on the oracle now that INVALID carries
+# no proof — an asymmetry here is an implementation bug, not a search budget.
+def test_permutation_invariance(r=0.5):
+    print(f'\nTest 7 — relabelling invariance, target two_mode_squeezed({r})')
     import itertools
     from reservoir_engineering.certified_search import _DIAG_VALUES, _OFFDIAG_VALUES
 
@@ -253,39 +236,6 @@ def test_invalid_certificates(r=0.5):
     alpha = [(_DIAG_VALUES if i == j else _OFFDIAG_VALUES) for i, j in zip(rows, cols)]
     tgt = two_mode_squeezed(r)
 
-    nt, tmi = ['mechanical', 'mechanical', 'cavity'], [0, 1]
-    V = lo.complete_covariance(tgt, tmi, 3)
-
-    condemned, n_inv, n_val, n_und = 0, 0, 0, 0
-    eig_res, dark_res, no_pbh = [], [], 0
-    for combo in itertools.product(*alpha):
-        t = np.array(combo, dtype=int)
-        cert = lo.structural_certificate(t, V, tmi, nt)
-        # decide with the certificate route switched OFF, so the witness
-        # search is a genuinely independent opinion on the same graph.
-        w = lo.decide(t, V, tmi, nt, num_samples=48,
-                      include_solution_set=False, gap_effort=4)
-        if cert is not None:
-            n_inv += 1
-            p = cert.get('pbh')
-            if p is None:
-                no_pbh += 1
-            else:
-                eig_res.append(p['eigen_residual'])
-                dark_res.append(p['darkness_residual'] if p['psd_point'] else 0.0)
-            if w['verdict'] == lo.VALID:
-                condemned += 1
-        elif w['verdict'] == lo.VALID:
-            n_val += 1
-        else:
-            n_und += 1
-
-    check('no graph with a Hurwitz witness is condemned', condemned == 0,
-          f'{condemned} wrongly condemned of {n_val} valid')
-    check('  every graph is decided (undecided stratum empty here)', n_und == 0,
-          f'{n_inv} INVALID / {n_val} VALID / {n_und} UNDECIDED')
-
-    # (b) relabel drain 2 -> 0 and require verdict-for-verdict agreement.
     def permute(t, p):
         out = np.zeros(6, dtype=int)
         for (i, j), k in idx.items():
@@ -293,79 +243,21 @@ def test_invalid_certificates(r=0.5):
             out[idx[(a, b)]] = t[k]
         return out
 
+    nt, tmi = ['mechanical', 'mechanical', 'cavity'], [0, 1]
+    V = lo.complete_covariance(tgt, tmi, 3)
     nt2, tmi2 = ['cavity', 'mechanical', 'mechanical'], [1, 2]
     V2 = lo.complete_covariance(tgt, tmi2, 3)
-    flips = 0
+
+    kw = dict(num_samples=48, gap_effort=4)
+    flips, n_val = 0, 0
     for combo in itertools.product(*alpha):
         t = np.array(combo, dtype=int)
-        a = lo.structural_certificate(t, V, tmi, nt) is not None
-        b = lo.structural_certificate(permute(t, [1, 2, 0]), V2, tmi2, nt2) is not None
+        a = lo.decide(t, V, tmi, nt, **kw)['verdict']
+        b = lo.decide(permute(t, [1, 2, 0]), V2, tmi2, nt2, **kw)['verdict']
+        n_val += (a == lo.VALID)
         flips += (a != b)
     check('verdict is invariant under relabelling which mode is the drain',
-          flips == 0, f'{flips} graphs flipped')
-
-    if eig_res:
-        check('  PBH witness residuals at machine precision',
-              max(eig_res) < 1e-10 and max(dark_res) < 1e-10,
-              f'max eigen {max(eig_res):.1e}, max darkness {max(dark_res):.1e}')
-
-
-# Test 8 — §8 Move 3 on the frontier (§8 Move 4).
-#
-# Target: two INDEPENDENTLY squeezed modes. Chosen because the dark-subspace
-# certificate does NOT close this one — the dark direction rotates through
-# the solution set, so no single subspace is dark everywhere and six graphs
-# survive as UNDECIDED. That makes it the case Move 3 exists for.
-#
-# The scale trap is the thing to guard. The Routh-Hurwitz minors of a
-# perfectly stable 6x6 are already ~1e-3 and ~1e-6, so a test that thresholds
-# them absolutely condemns every graph including the valid ones. The first
-# implementation did exactly that. Hence the soundness check comes first.
-def test_move3_frontier():
-    print('\nTest 8 — Move 3 on the frontier, target sq(0.3) (+) sq(0.7)')
-    import scipy.linalg as sla
-    from reservoir_engineering.targets import squeezed_vacuum
-    from reservoir_engineering.certified_search import sweep_all as _sweep
-
-    nt, tmi = ['mechanical', 'mechanical', 'cavity'], [0, 1]
-    tgt = sla.block_diag(squeezed_vacuum(0.3), squeezed_vacuum(0.7))
-    V = lo.complete_covariance(tgt, tmi, 3)
-
-    # The minors of a genuinely Hurwitz matrix must not read as zero.
-    rng = np.random.default_rng(0)
-    M = rng.normal(0, 1, (6, 6))
-    A = M - (abs(np.linalg.eigvals(M).real).max() + 1) * np.eye(6)
-    rel = lo._hurwitz_minors(np.real(np.poly(A / np.linalg.norm(A)))[1:])
-    check('Hurwitz minors of a stable matrix are all clearly nonzero',
-          float(rel.min()) > 1e-9, f'smallest relative minor {rel.min():.2e}')
-
-    out = _sweep(tgt, tmi, nt, num_samples=32, gap_effort=8)
-    search, verdicts = out['search'], out['verdicts']
-    n_und = sum(1 for v in verdicts.values() if v == lo.UNDECIDED)
-    check('this target leaves an undecided stratum for Move 3 to attack',
-          n_und > 0, f'{n_und} undecided')
-
-    # Soundness: the certificate must never fire on a graph with a witness.
-    condemned = sum(1 for c, v in verdicts.items() if v == lo.VALID and
-                    lo.move3_invalid_certificate(np.array(c), V, 3, [2], n_lines=4)
-                    is not None)
-    check('Move 3 condemns no graph that carries a Hurwitz witness',
-          condemned == 0, f'{condemned} wrongly condemned')
-
-    res = search.resolve_frontier(verdicts, verbosity=0)
-    v2 = res['verdicts']
-    check('Move 3 clears the frontier', not res['frontier_remaining'],
-          f'{len(res["frontier_remaining"])} left of {res["attempted"]} attempted')
-    check('  every graph now decided',
-          all(v != lo.UNDECIDED for v in v2.values()),
-          f'{sum(1 for v in v2.values() if v == lo.UNDECIDED)} undecided')
-
-    valid2 = [np.array(k) for k, v in v2.items() if v == lo.VALID]
-    mv = search.minimal_valid(valid2)
-    stat = [search.certify_irreducible(t, v2)['status'] for t in mv]
-    check('  all irreducible schemes now certified minimal',
-          all(s == 'irreducible' for s in stat),
-          f'{stat.count("irreducible")}/{len(stat)}')
+          flips == 0, f'{flips} of 64 graphs flipped ({n_val} VALID)')
 
 
 if __name__ == '__main__':
@@ -375,8 +267,7 @@ if __name__ == '__main__':
     test_mixed_target_refused()
     test_basis_completeness()
     test_reservoir_choice()
-    test_invalid_certificates()
-    test_move3_frontier()
+    test_permutation_invariance()
     n_pass, n_tot = sum(_results), len(_results)
     print(f'\n{"="*66}\n  {n_pass}/{n_tot} checks passed\n{"="*66}')
     sys.exit(0 if n_pass == n_tot else 1)

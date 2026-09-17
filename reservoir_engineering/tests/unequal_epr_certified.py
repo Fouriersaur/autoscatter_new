@@ -29,8 +29,8 @@ the minimal scheme here, and nothing symmetric is imposed anywhere.
 Reading the output:
   reservoir = vacuum    the graph works with an unsqueezed drain
   reservoir = squeezed  the drain must be squeezed, and r* says by how much
-  reservoir = none      no drain state makes this graph work (or the
-                        attractivity search declined — see UNDECIDED)
+  reservoir = none      no drain state was found that makes this graph
+                        work (which is not a proof that none exists)
 
 Usage:
     python3 unequal_epr_certified.py                 # r=0.5, r1=0.2, r2=-0.1
@@ -138,10 +138,9 @@ def report(r, r1, r2, target, sweep_out, elapsed):
     n_tot = sweep_out['num_graphs']
     print(f'\nSubgraph propagation: {n_call} oracle calls for {n_tot} graphs '
           f'({100 * (1 - n_call / n_tot):.0f}% skipped).')
-    frontier = sweep_out.get('frontier_undecided', [])
-    print(f'  {counts.get(lo.UNDECIDED, 0)} graphs carry a verdict that cannot propagate;')
-    print(f'  of those, {len(frontier)} sit one edge below a VALID graph and so')
-    print('  genuinely block a minimality claim (§8 Move 4); the rest are interior.')
+    print('  INVALID settles every subgraph, VALID settles every supergraph;')
+    print('  only the VALID direction is a proof, so minimality here is')
+    print('  "minimal among what the filter could find".')
 
     # The VALID count above counts GRAPHS, not reservoir classes: most were
     # settled by propagation and so were never asked which reservoir they

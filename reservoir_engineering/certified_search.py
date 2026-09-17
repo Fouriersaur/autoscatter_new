@@ -2,7 +2,7 @@
 certified_search.py
 ===================
 The discrete search of state_stabilization_algorithm.md §5, wrapped around
-the certifying oracle in linear_oracle.py.
+the oracle in linear_oracle.py.
 
 MIRRORS covariance_optimizer.CovarianceOptimizer's outer loop, and keeps its
 graph encoding (topology_search.py) unchanged. What changes is the inner
@@ -10,24 +10,30 @@ loop and, because of it, what the verdicts mean:
 
   covariance_optimizer          certified_search
   --------------------          ----------------
-  Stage 1 unit-cooperativity    structural certificate (exact, provable)
-    stability pre-filter
   Stage 2 multi-restart         one global linear solve + attractivity
     L-BFGS-B on log-couplings     filter (linear_oracle.decide)
   success = loss < tol          VALID = verified witness (residual ~1e-15,
                                   Upsilon >= 0, A Hurwitz, forward Lyapunov
                                   solve reproduces the target)
-  failure = "gave up"           INVALID = certificate, or UNDECIDED
-  2 verdicts                    3 verdicts
+  failure = "gave up"           INVALID = no witness found
 
-The three-valued verdict is the load-bearing difference. The old optimiser
-could not distinguish "this graph is impossible" from "30 restarts of
-L-BFGS-B did not find it", so it could never prune soundly on a failure —
-which is exactly the false-negative risk AUTOSCATTER mitigates by rerunning.
-Here INVALID is only ever issued from a proof, so it may be propagated to
-the whole down-set; UNDECIDED is issued when the oracle genuinely does not
-know, and propagates NOWHERE. The search stays sound: a graph can be lost
-only if it is provably impossible.
+WHAT THE VERDICTS MEAN, AND WHAT THIS SEARCH IS FOR. VALID is a proof: a
+witness that was verified end to end. INVALID is not — it means the oracle
+looked and found nothing, which on the one nonconvex step (the attractivity
+filter) is not the same as impossibility.
+
+The search prunes on INVALID all the same: it propagates to the whole
+down-set, on the reasoning that a subgraph has a SMALLER solution set, so a
+search that found no Hurwitz member here is not expected to find one below.
+Sound for the VALID direction (the witness embeds in every supergraph),
+heuristic for this one.
+
+The deliberate consequence: the minimal valid graphs returned here are
+verified and minimal ENOUGH, but the set is NOT guaranteed to be the
+complete set of irreducible graphs — a scheme whose Hurwitz cone the
+sampler missed is filed INVALID and its whole down-set goes with it. Raise
+gap_effort/num_samples to shrink that gap. If a complete irreducible set is
+what is wanted, this is the wrong module.
 
 INPUT IS A COVARIANCE MATRIX ONLY. There is no target_predicate — see
 linear_oracle's module docstring for why that is structural (a scalar
@@ -50,7 +56,7 @@ from reservoir_engineering.topology_search import (
     BEAMSPLITTER_AND_TWO_MODE_SQUEEZING,
     _is_subgraph_slot, check_if_subgraph_triu, calc_number_of_possibilities)
 from reservoir_engineering.linear_oracle import (
-    VALID, INVALID, UNDECIDED, complete_covariance, decide, optimise_aux_state)
+    VALID, INVALID, complete_covariance, decide, optimise_aux_state)
 
 # Per-slot alphabets, as in covariance_optimizer.prepare_all_possible_combinations.
 _DIAG_VALUES    = [NO_COUPLING, PARAMETRIC]
@@ -125,7 +131,6 @@ class CertifiedSearch:
         include_detunings: bool = True,
         allow_phases: bool = True,
         coupled_drains: bool = False,
-        use_sdp: bool = False,
         auto_reservoir: bool = False,
         gap_effort: int = 8,
         verbosity: int = 1,
@@ -142,13 +147,13 @@ class CertifiedSearch:
                                       self.num_modes, aux_squeezing=aux_squeezing)
 
         # gap_effort: §8 Move 1's budget multiplier for the spectral-abscissa
-        # ascent that runs ONLY on graphs about to be filed UNDECIDED. Raising
-        # it shrinks the undecided stratum at linear cost in that stratum
-        # alone; 0 disables the move and reproduces the plain feasibility
-        # oracle.
+        # ascent that runs ONLY on graphs about to be filed INVALID. Raising it
+        # moves graphs out of that stratum at linear cost in the stratum alone,
+        # which is the one knob that directly buys back the completeness given
+        # up by pruning on an unproven INVALID; 0 disables the move.
         self._oracle_kwargs = dict(
             include_detunings=include_detunings, allow_phases=allow_phases,
-            coupled_drains=coupled_drains, use_sdp=use_sdp,
+            coupled_drains=coupled_drains,
             num_samples=num_samples, gap_effort=gap_effort)
 
         # Memoized verdicts. §5(ii): this caches the oracle's OWN past
@@ -157,8 +162,10 @@ class CertifiedSearch:
         # search rather than an input to it.
         self.cache: Dict[tuple, Dict] = {}
 
-        # Graphs with a PROPAGATING verdict, i.e. one that settles other
-        # graphs without an oracle call. Only VALID and INVALID qualify.
+        # Graphs whose verdict settles other graphs without an oracle call.
+        # A verdict carrying propagates=False (solver_constraints' combinatorial
+        # gate) is NOT filed here: it is true of that graph alone and is not
+        # monotone in the subgraph order.
         self._valid_seen: List[np.ndarray] = []
         self._invalid_seen: List[np.ndarray] = []
 
@@ -177,10 +184,9 @@ class CertifiedSearch:
         key = tuple(int(x) for x in np.asarray(triu))
         if key not in self.cache:
             if self.auto_reservoir:
-                kw = {k: v for k, v in self._oracle_kwargs.items() if k != 'use_sdp'}
                 self.cache[key] = optimise_aux_state(
                     np.array(key), self._sigma_target, self.target_mode_ids,
-                    self.node_types, **kw)
+                    self.node_types, **self._oracle_kwargs)
             else:
                 self.cache[key] = decide(np.array(key), self.V, self.target_mode_ids,
                                           self.node_types, **self._oracle_kwargs)
@@ -189,13 +195,17 @@ class CertifiedSearch:
     # verdict_of(triu): the verdict for a graph, using PROPAGATION first and
     # the oracle only when nothing already implies an answer.
     #
-    # This is the mechanism that must never be bypassed: an INVALID verdict
-    # holds for every SUBgraph (shrinking the admissible subspace can only
-    # shrink the solution set, so if no Hurwitz member existed before, none
-    # exists now), and a VALID verdict holds for every SUPERgraph (the
-    # witness embeds unchanged). Both directions stay sound with
-    # auto_reservoir on, because the drain state is part of the witness and
-    # travels with it. UNDECIDED implies nothing and never propagates.
+    # A VALID verdict holds for every SUPERgraph (the witness embeds
+    # unchanged) — sound. An INVALID verdict is carried to every SUBgraph,
+    # since shrinking the admissible subspace can only shrink the solution
+    # set, so a search that found nothing here is not expected to find
+    # anything below: that direction is a heuristic, and it is where the
+    # completeness of the result is spent (see the module docstring). Both
+    # survive auto_reservoir, because the drain state is part of the witness
+    # and travels with it.
+    #
+    # A verdict marked propagates=False implies nothing about any other
+    # graph and is never filed.
     #
     # Returns (verdict, info, used_oracle) so callers can report how much
     # the propagation actually saved.
@@ -208,10 +218,11 @@ class CertifiedSearch:
         if self._invalid_seen and check_if_subgraph_triu(self._invalid_seen, [np.asarray(triu)]):
             return INVALID, None, False        # this graph sits inside a known-invalid one
         info = self.oracle(triu)
-        if info['verdict'] == VALID:
-            self._valid_seen.append(np.asarray(triu))
-        elif info['verdict'] == INVALID:
-            self._invalid_seen.append(np.asarray(triu))
+        if info.get('propagates', True):
+            if info['verdict'] == VALID:
+                self._valid_seen.append(np.asarray(triu))
+            elif info['verdict'] == INVALID:
+                self._invalid_seen.append(np.asarray(triu))
         return info['verdict'], info, True
 
     # One directional pass (§5's shared, direction-dual BFS body).
@@ -226,7 +237,7 @@ class CertifiedSearch:
             raise ValueError("direction must be 'prune' or 'grow'")
 
         root = _fully_connected(self.num_modes) if direction == 'prune' else _empty(self.num_modes)
-        valid, invalid, undecided = [], [], []
+        valid, invalid = [], []
         seen = set()
         frontier = [root]
 
@@ -259,7 +270,16 @@ class CertifiedSearch:
                     frontier.extend(_neighbours(triu, self.num_modes, 'grow'))
                 continue
 
-            v = self.oracle(triu)['verdict']
+            info = self.oracle(triu)
+            v = info['verdict']
+
+            # A non-monotone verdict (solver_constraints' combinatorial gate)
+            # is true of this graph alone: record nothing, but keep the
+            # frontier moving in both directions past it, exactly as an
+            # unfiled graph must.
+            if not info.get('propagates', True):
+                frontier.extend(_neighbours(triu, self.num_modes, direction))
+                continue
 
             if v == VALID:
                 valid.append(triu)
@@ -274,80 +294,63 @@ class CertifiedSearch:
                 if direction == 'prune':
                     frontier.extend(_neighbours(triu, self.num_modes, 'prune'))
                 # grow: the whole up-set is valid, stop ascending
-            elif v == INVALID:
+            else:
                 invalid.append(triu)
                 if direction == 'grow':
                     frontier.extend(_neighbours(triu, self.num_modes, 'grow'))
-                # prune: the whole down-set is invalid, stop descending
-            else:
-                # UNDECIDED propagates NOTHING (§4C). The up-/down-set is
-                # unresolved, so keep exploring past it rather than pruning.
-                undecided.append(triu)
-                frontier.extend(_neighbours(triu, self.num_modes, direction))
+                # prune: the whole down-set is taken to be invalid, stop
+                # descending — the heuristic half of the propagation
 
         if self.verbosity:
             print(f'  [{direction}] visited {len(seen)}  valid {len(valid)}  '
-                  f'invalid {len(invalid)}  undecided {len(undecided)}')
-        return {'valid': valid, 'invalid': invalid, 'undecided': undecided,
+                  f'invalid {len(invalid)}')
+        return {'valid': valid, 'invalid': invalid,
                 'visited': len(seen), 'direction': direction}
 
     # closure_partition(pass_result): the verdict a pass IMPLIES for every
     # graph, not just the ones it happened to visit — VALID if some
-    # explicitly-valid graph is a subgraph of it, INVALID if it is a
-    # subgraph of an explicitly-invalid one, UNDECIDED otherwise.
+    # explicitly-valid graph is a subgraph of it, INVALID otherwise.
     #
-    # This is the object the §5(iii) agreement test must compare, and it is
-    # an AMENDMENT to the doc, which compares the raw Valid/Invalid files.
-    # Those files are not comparable once the oracle is three-valued: prune
-    # descends until it hits INVALID and grow ascends until it hits VALID,
-    # so an UNDECIDED band between the two frontiers is traversed from
-    # opposite sides and each pass records a different slice of it. The raw
-    # lists then differ by COVERAGE while agreeing on every graph both
-    # actually decided — which they must, since verdicts are memoized and
-    # deterministic. Comparing closures tests what the doc meant: that the
-    # two traversals imply the same partition of the whole lattice.
+    # The asymmetry is the search's own rule written out: VALID is the only
+    # verdict that is established, so the valid closure is the whole content
+    # of a pass and everything outside it is filed INVALID.
+    #
+    # Comparing closures rather than the raw Valid/Invalid files is an
+    # AMENDMENT to the doc: the raw lists differ by COVERAGE (prune descends
+    # to the invalid boundary, grow ascends to the valid one, so each records
+    # a different slice) while implying the same partition.
     def closure_partition(self, pass_result: Dict) -> Dict[tuple, str]:
         import itertools
         rows, cols = np.triu_indices(self.num_modes)
         alphabets = [(_DIAG_VALUES if i == j else _OFFDIAG_VALUES)
                      for i, j in zip(rows, cols)]
-        valid, invalid = pass_result['valid'], pass_result['invalid']
+        valid = pass_result['valid']
         part = {}
         for combo in itertools.product(*alphabets):
             t = np.array(combo, dtype=int)
-            if valid and check_if_subgraph_triu([t], valid):
-                part[combo] = VALID
-            elif invalid and check_if_subgraph_triu(invalid, [t]):
-                part[combo] = INVALID
-            else:
-                part[combo] = UNDECIDED
+            part[combo] = (VALID if (valid and check_if_subgraph_triu([t], valid))
+                           else INVALID)
         return part
 
-    # §5(iii): run both directions and assert they never CONTRADICT.
+    # §5(iii): run both directions and compare what each one implies.
     #
-    # The invariant is deliberately the weaker one. With a two-valued oracle
-    # the two passes would have to produce identical partitions, and the doc
-    # originally asserted exactly that. Once the verdict is three-valued that
-    # assertion is WRONG, and would fire on correct runs: UNDECIDED
-    # propagates neither up nor down (§4C), so prune descends until it meets
-    # INVALID while grow ascends until it meets VALID, and each pass leaves a
-    # DIFFERENT shadow of the undecided band unresolved. Identical partitions
-    # are recovered exactly when UNDECIDED is empty, not before.
+    # This is a DIAGNOSTIC, not an invariant, and the difference matters.
+    # Were INVALID a proof, the two passes would have to agree graph for
+    # graph and any disagreement would localise an implementation bug — a
+    # wrong tolerance, a broken neighbour relation, a faulty up-/down-set
+    # propagation. It is not a proof here: prune stops descending at the
+    # first graph whose Hurwitz cone the sampler missed, and grow can walk
+    # straight past that graph and find valid territory above it. So the two
+    # passes CAN legitimately disagree, and where they do, the grow pass is
+    # the one that found more.
     #
-    # What must hold unconditionally, and is what this checks:
-    #     no graph is VALID in one pass and INVALID in the other.
-    # A verdict is a deterministic function of the graph (the per-graph seed
-    # inside decide makes it so), and both propagation rules are sound, so a
-    # direct contradiction can only be an IMPLEMENTATION bug — a wrong
-    # tolerance, a broken neighbour relation, a faulty up-/down-set
-    # propagation. It is a regression test ON soundness, not a completeness
-    # proof.
-    #
-    # 'partitions_identical' is still reported, but as a DIAGNOSTIC: it is the
-    # signal that the undecided stratum has been emptied, not a pass/fail.
+    # A disagreement is therefore worth looking at — it names graphs where
+    # the attractivity filter is the binding constraint — but it is not a
+    # failure. Run both directions and take the union of the valid sets,
+    # which is what 'minimal_valid' below is computed from.
     #
     # compare_closures=False falls back to comparing the raw files, which is
-    # cheap but only meaningful when the oracle decided every graph it saw.
+    # cheap but only reports the graphs each pass explicitly visited.
     def run_bidirectional(self, compare_closures: bool = True) -> Dict:
         td = self.run('prune')
         bu = self.run('grow')
@@ -358,29 +361,26 @@ class CertifiedSearch:
         if compare_closures:
             ptd, pbu = self.closure_partition(td), self.closure_partition(bu)
             disagree = [g for g in ptd if ptd[g] != pbu[g]]
-            contradictions = [g for g in disagree
-                              if {ptd[g], pbu[g]} == {VALID, INVALID}]
             identical = not disagree
         else:
             ptd = pbu = None
-            disagree = []
             vtd, vbu = keyset(td['valid']), keyset(bu['valid'])
             itd, ibu = keyset(td['invalid']), keyset(bu['invalid'])
-            contradictions = sorted((vtd & ibu) | (itd & vbu))
+            disagree = sorted((vtd & ibu) | (itd & vbu))
             identical = (vtd == vbu) and (itd == ibu)
 
-        agree = not contradictions          # THE assertion (§5(iii))
+        agree = not disagree                # a diagnostic, not an assertion
 
         mv_td = keyset(self.minimal_valid(td['valid']))
         mv_bu = keyset(self.minimal_valid(bu['valid']))
 
         if self.verbosity:
-            print(f'  bidirectional: no VALID/INVALID contradiction={agree} '
-                  f'({len(contradictions)} contradictions, '
-                  f'{len(disagree)} graphs differing only by UNDECIDED coverage)  '
+            print(f'  bidirectional: passes agree={agree} '
+                  f'({len(disagree)} graphs where they differ — the filter, not '
+                  f'a bug; see run_bidirectional)  '
                   f'minimal-valid sets agree={mv_td == mv_bu}')
         return {'top_down': td, 'bottom_up': bu,
-                'agree': agree, 'contradictions': contradictions,
+                'agree': agree,
                 'partitions_identical': identical,
                 'disagreeing_graphs': disagree,
                 'partition_top_down': ptd, 'partition_bottom_up': pbu,
@@ -477,178 +477,58 @@ class CertifiedSearch:
             kept.append(t)
         return sorted(kept, key=lambda t: int(np.sum(t)))
 
-    # ─── §8 Move 4: the frontier is the only place a verdict is needed ────
-    #
     # lattice_verdicts(): the verdict every graph in the lattice CARRIES,
     # obtained by closing the cached verdicts under the propagation rules
     # rather than by calling the oracle again. VALID if some cached-valid
-    # graph sits inside it, INVALID if it sits inside a cached-invalid one,
-    # else whatever the cache says, else UNDECIDED.
+    # graph sits inside it; otherwise INVALID — including graphs the search
+    # never visited, which is the same rule the traversal itself uses when
+    # it stops descending.
     def lattice_verdicts(self) -> Dict[tuple, str]:
         import itertools
         rows, cols = np.triu_indices(self.num_modes)
         alphabet = [(_DIAG_VALUES if i == j else _OFFDIAG_VALUES)
                     for i, j in zip(rows, cols)]
         valid = [np.array(k) for k, v in self.cache.items() if v['verdict'] == VALID]
-        invalid = [np.array(k) for k, v in self.cache.items() if v['verdict'] == INVALID]
         out = {}
         for combo in itertools.product(*alphabet):
             t = np.array(combo, dtype=int)
-            if valid and check_if_subgraph_triu([t], valid):
-                out[combo] = VALID
-            elif invalid and check_if_subgraph_triu(invalid, [t]):
-                out[combo] = INVALID
-            elif combo in self.cache:
-                out[combo] = self.cache[combo]['verdict']
-            else:
-                out[combo] = UNDECIDED
+            out[combo] = (VALID if (valid and check_if_subgraph_triu([t], valid))
+                          else INVALID)
         return out
 
-    # certify_irreducible(triu): is this valid graph MINIMAL, provably?
+    # is_minimal(triu): is this valid graph minimal, as far as the search
+    # can tell? Returns one of
+    #   'minimal'    valid, and no one-slot deletion came back valid
+    #   'reducible'  some one-slot deletion is itself valid
+    #   'not_valid'  the graph itself is not valid
     #
-    # A graph is irreducible iff it is valid and every one-edge deletion is
-    # invalid. That is the whole content of Move 4: irreducibility is a
-    # statement about the valid/invalid BOUNDARY, so the deep interior of
-    # either region never needs to be decided. Returns one of
-    #   'irreducible'  valid, and every one-slot deletion is certified INVALID
-    #   'reducible'    some one-slot deletion is itself VALID
-    #   'unresolved'   no deletion is valid, but some are UNDECIDED — the
-    #                  claim of minimality is NOT established, and the
-    #                  offending neighbours are listed so an expensive exact
-    #                  method (Move 3) can be pointed at them and nowhere else
-    #   'not_valid'    the graph itself is not valid
-    def certify_irreducible(self, triu, verdicts: Optional[Dict] = None) -> Dict:
+    # 'minimal' is bounded by the attractivity filter, not proved: a deletion
+    # is "not valid" only in the sense that no witness was found for it.
+    def is_minimal(self, triu, verdicts: Optional[Dict] = None) -> Dict:
         if verdicts is None:
             verdicts = self.lattice_verdicts()
         key = tuple(int(x) for x in np.asarray(triu))
         if verdicts.get(key) != VALID:
             return {'status': 'not_valid', 'graph': np.array(key),
-                    'blocking': [], 'verdict': verdicts.get(key)}
-        valid_nb, undec_nb = [], []
-        for nb in _neighbours(np.array(key), self.num_modes, 'prune'):
-            k = tuple(int(x) for x in nb)
-            if verdicts.get(k) == VALID:
-                valid_nb.append(nb)
-            elif verdicts.get(k) == UNDECIDED:
-                undec_nb.append(nb)
-        if valid_nb:
-            status = 'reducible'
-        elif undec_nb:
-            status = 'unresolved'
-        else:
-            status = 'irreducible'
-        return {'status': status, 'graph': np.array(key),
-                'valid_neighbours': valid_nb, 'blocking': undec_nb}
-
-    # frontier_undecided(): the undecided graphs that actually OBSTRUCT the
-    # answer — those sitting one edge below a valid graph, where the search
-    # cannot tell whether descent is allowed.
-    #
-    # This is the number that matters, not the raw UNDECIDED count. An
-    # undecided graph in the interior of the invalid region costs nothing:
-    # nobody is trying to descend through it. Move 3's exponential backstop
-    # is meant to run on THIS set, which is typically a handful, rather than
-    # on the whole stratum.
-    def frontier_undecided(self, verdicts: Optional[Dict] = None) -> List[np.ndarray]:
-        if verdicts is None:
-            verdicts = self.lattice_verdicts()
-        out, seen = [], set()
-        for key, v in verdicts.items():
-            if v != VALID:
-                continue
-            for nb in _neighbours(np.array(key), self.num_modes, 'prune'):
-                k = tuple(int(x) for x in nb)
-                if verdicts.get(k) == UNDECIDED and k not in seen:
-                    seen.add(k)
-                    out.append(np.array(k))
-        return sorted(out, key=lambda t: int(np.sum(t)))
-
-    # resolve_frontier(): run §8 Move 3 on the frontier, and ONLY there.
-    #
-    # This is Move 4's payoff made operational. Move 3 is the expensive
-    # machinery — a bilinear matrix inequality for the witness side, a
-    # polynomial identity test over the whole solution family for the
-    # impossibility side — and running it on every undecided graph would
-    # defeat the point. It does not need to: an undecided graph matters only
-    # where it blocks a descent, i.e. where it sits one edge below a valid
-    # graph. The deep interior of either region never needs an exact verdict.
-    #
-    # Newly decided graphs are written into the cache, so their verdicts
-    # propagate through the normal rules on the next pass: a frontier graph
-    # resolved to INVALID settles its whole down-set and CERTIFIES the
-    # minimality of the valid graph above it; resolved to VALID it settles
-    # its up-set and demotes that graph from irreducible. Because resolution
-    # can expose a NEW frontier one level down, the process is iterated to a
-    # fixed point (bounded by `max_rounds`).
-    #
-    # Soundness is unchanged: Move 3 returns a verified Lyapunov witness, a
-    # certificate, or nothing. It never guesses.
-    def resolve_frontier(self, verdicts: Optional[Dict] = None,
-                          max_rounds: int = 4, max_graphs: Optional[int] = None,
-                          n_lines: int = 8, n_starts: int = 8,
-                          verbosity: Optional[int] = None) -> Dict:
-        from reservoir_engineering.linear_oracle import move3_resolve
-        verb = self.verbosity if verbosity is None else verbosity
-        if self.auto_reservoir:
-            raise ValueError(
-                'resolve_frontier needs a fixed frame: Move 3 quantifies over the '
-                'solution set at one V, which is not a graph-level statement when '
-                'the drain state is a free variable. Run with auto_reservoir=False.')
-
-        resolved, attempted, rounds = {VALID: [], INVALID: []}, 0, 0
-        if verdicts is None:
-            verdicts = self.lattice_verdicts()
-
-        for rnd in range(max_rounds):
-            frontier = self.frontier_undecided(verdicts)
-            if not frontier:
-                break
-            rounds += 1
-            todo = frontier if max_graphs is None else frontier[:max_graphs]
-            if verb:
-                print(f'  [move3] round {rnd + 1}: {len(frontier)} frontier graph(s), '
-                      f'resolving {len(todo)}')
-            progress = False
-            for triu in todo:
-                key = tuple(int(x) for x in triu)
-                attempted += 1
-                info = move3_resolve(triu, self.V, self.target_mode_ids,
-                                      self.node_types, n_lines=n_lines,
-                                      n_starts=n_starts,
-                                      coupled_drains=self._oracle_kwargs['coupled_drains'])
-                if info['verdict'] == UNDECIDED:
-                    continue
-                progress = True
-                self.cache[key] = info
-                resolved[info['verdict']].append(np.array(key))
-                if info['verdict'] == VALID:
-                    self._valid_seen.append(np.array(key))
-                else:
-                    self._invalid_seen.append(np.array(key))
-                if verb:
-                    print(f'    {describe(triu, self.num_modes):46s} -> {info["verdict"]}')
-            if not progress:
-                break                       # nothing moved; further rounds are futile
-            verdicts = self.lattice_verdicts()
-
-        return {'verdicts': verdicts, 'rounds': rounds, 'attempted': attempted,
-                'resolved_valid': resolved[VALID], 'resolved_invalid': resolved[INVALID],
-                'frontier_remaining': self.frontier_undecided(verdicts)}
+                    'valid_neighbours': [], 'verdict': verdicts.get(key)}
+        valid_nb = [nb for nb in _neighbours(np.array(key), self.num_modes, 'prune')
+                    if verdicts.get(tuple(int(x) for x in nb)) == VALID]
+        return {'status': 'reducible' if valid_nb else 'minimal',
+                'graph': np.array(key), 'valid_neighbours': valid_nb}
 
 
 # Complete sweep — every graph gets a verdict, but the oracle is called only
 # where PROPAGATION does not already imply one (see verdict_of).
 #
-# propagate=True (the default) is what you want in every real run: it gives
-# exactly the same partition as calling the oracle on all of them, because
-# the propagation rules are sound in both directions, while skipping the
-# calls whose answers were already determined.
+# propagate=True (the default) is what you want in every real run: it skips
+# the calls whose answers the VALID/INVALID closure already implies.
 #
-# propagate=False forces an oracle call on every graph. That is the
-# verification reference, not a production path: the two must agree
-# graph-for-graph, so any difference localises a bug in the propagation
-# rather than in the oracle. `check_propagation` below runs exactly that
-# comparison.
+# propagate=False forces an oracle call on every graph. It is the more
+# thorough run, not merely a verification reference: propagation carries
+# INVALID downward on a heuristic, so a graph the closure writes off as
+# invalid can still come back VALID when the oracle is actually asked.
+# `check_propagation` below measures exactly that difference — treat its
+# disagreements as extra schemes found, not as a propagation bug.
 #
 # Graphs are visited in ASCENDING complexity so that valid graphs — which
 # tend to be sparse for these targets, the minimal EPR scheme being two
@@ -669,7 +549,7 @@ def sweep_all(
                              verbosity=0, **kwargs)
     combos = sorted(itertools.product(*alphabets), key=sum)
 
-    out = {VALID: [], INVALID: [], UNDECIDED: []}
+    out = {VALID: [], INVALID: []}
     verdicts, n_oracle = {}, 0
     for combo in combos:
         t = np.array(combo, dtype=int)
@@ -681,23 +561,16 @@ def sweep_all(
         verdicts[combo] = v
         out[v].append(t)
 
-    # §8 Move 4: separate the undecided graphs that OBSTRUCT the answer (one
-    # edge below a valid graph, so descent cannot be resolved) from those
-    # that merely sit in the interior and cost nothing. The frontier set is
-    # what an exact backstop should be pointed at.
-    frontier = search.frontier_undecided(verdicts)
-
-    return {'valid': out[VALID], 'invalid': out[INVALID], 'undecided': out[UNDECIDED],
-            'frontier_undecided': frontier,
+    return {'valid': out[VALID], 'invalid': out[INVALID],
             'verdicts': verdicts, 'search': search, 'oracle_calls': n_oracle,
             'num_graphs': len(combos),
             'num_possible': calc_number_of_possibilities(node_types)}
 
 
-# Verify the propagation against brute force on the same target: the two
-# partitions must be identical graph-for-graph. Returns the comparison plus
-# the oracle-call saving, so the mechanism can be audited rather than
-# trusted.
+# Compare the propagated sweep against the brute-force one on the same
+# target. Disagreements are expected where the attractivity filter is the
+# binding constraint (see sweep_all); the exhaustive run is the one that
+# finds more. Returns the comparison plus the oracle-call saving.
 def check_propagation(sigma_target, target_mode_ids, node_types, **kwargs) -> Dict:
     fast = sweep_all(sigma_target, target_mode_ids, node_types, propagate=True, **kwargs)
     full = sweep_all(sigma_target, target_mode_ids, node_types, propagate=False, **kwargs)
@@ -776,8 +649,8 @@ def reduce_witness(triu, info, num_modes: int, rel_tol: float = 1e-7):
 # The root must be VALID, not merely feasible — the prune pass starts there,
 # and a root that is only stationary (the frozen point, feasible on every
 # graph) would descend through nothing. That is why §8 Move 1's gap
-# maximiser matters most at this call: an UNDECIDED root would wrongly push
-# the search to an extra auxiliary mode it does not need.
+# maximiser matters most at this call: a root the filter misses would
+# wrongly push the search to an extra auxiliary mode it does not need.
 def find_minimum_auxiliary_modes(
     sigma_target: np.ndarray,
     target_mode_ids: List[int],

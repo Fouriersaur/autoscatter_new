@@ -1,15 +1,15 @@
 """
 linear_oracle.py
 ================
-The certifying continuous oracle of state_stabilization_algorithm.md §2.1/§4.
+The continuous oracle of state_stabilization_algorithm.md §2.1/§4.
 
 Replaces the gradient-descent inner loop of covariance_optimizer.py with an
 exact linear solve. The whole point: fix the target covariance V and the
 stationarity equation A V + V A^T + D = 0 becomes LINEAR in the unknown
 Hamiltonian matrix G and dissipation matrix Upsilon = C^dag C. A linear
 problem is solved globally by one SVD — no initial guess, no restarts, no
-local minima, and (unlike the old optimiser) a failure is a CERTIFICATE that
-no Hamiltonian on this graph works, not a report that a search gave up.
+local minima. A failure still means "no Hamiltonian on this graph was found
+to work"; see the verdict note below for how far that is to be trusted.
 
 INPUT IS A COVARIANCE MATRIX ONLY.
 There is no target_predicate here, and this is structural rather than a
@@ -61,25 +61,25 @@ Pipeline per graph (see `decide`):
      exactly such a spurious solution — G = 0, mode simply undriven).
      Search the solution set for a strictly Hurwitz member.
 
-  5. THREE-VALUED VERDICT (§4C). VALID (explicit witness), INVALID
-     (certificate), UNDECIDED (solutions exist but no Hurwitz member
-     found). UNDECIDED propagates NOWHERE — this is what stops the one
-     remaining nonconvex step (4) from manufacturing false invalids and
-     poisoning a whole down-set.
+  5. TWO-VALUED VERDICT. VALID (explicit, fully verified witness) or
+     INVALID (no such witness was found). INVALID is a SEARCH OUTCOME,
+     NOT A PROOF. Step (4) is the one remaining nonconvex step, so a graph
+     that objectively admits a Hurwitz member can still be filed INVALID
+     when the sampler misses its cone, and the search prunes on it all the
+     same. The consequence is deliberate and must be understood by anyone
+     reading the output: the valid graphs that come back are minimal
+     ENOUGH and genuinely verified, but the invalid set is not certified
+     and the minimal-valid set is not guaranteed complete.
 
 Joint (G, Upsilon) mode — §4B without an SDP solver:
   `decide(..., joint=True)` makes Upsilon a free Hermitian unknown on the
   auxiliary block instead of fixing vacuum baths. That covers every
   Gaussian bath (thermal, squeezed, cross-correlated between drains) in one
   linear space. The PSD constraint Upsilon >= 0 is NOT imposed by the
-  linear solve, which makes it a RELAXATION — and that is exactly what
-  makes a nonzero residual a sound INVALID certificate, since a relaxation
-  that is infeasible implies the true problem is infeasible. On the VALID
-  side nothing is lost either: witnesses are verified numerically
-  (Upsilon >= 0 AND A Hurwitz AND forward Lyapunov solve reproduces V), so
-  a returned VALID is always genuine. cvxpy only sharpens the boundary
-  between INVALID and UNDECIDED; if it is installed, `use_sdp=True` runs
-  the real §4B feasibility program.
+  linear solve, which makes it a RELAXATION. Nothing is lost on the VALID
+  side: witnesses are verified numerically (Upsilon >= 0 AND A Hurwitz AND
+  forward Lyapunov solve reproduces V), so a returned VALID is always
+  genuine.
 
 Not implemented here (deliberate, see doc §6): limit-only targets. At
 Gamma_signal = 0 with a pure target this oracle returns the exact finite
@@ -96,11 +96,13 @@ from reservoir_engineering.topology_search import (
     NO_COUPLING, BEAMSPLITTER, TWO_MODE_SQUEEZING, PARAMETRIC,
     BEAMSPLITTER_AND_TWO_MODE_SQUEEZING)
 
-# Verdict constants (§4C). Only VALID and INVALID may propagate through the
-# search's up-/down-sets; UNDECIDED is reported and otherwise inert.
-VALID     = 'VALID'
-INVALID   = 'INVALID'
-UNDECIDED = 'UNDECIDED'
+# Verdict constants. VALID means a verified witness was produced; INVALID
+# means none was found. Both propagate through the search's up-/down-sets —
+# VALID soundly (the witness embeds in every supergraph), INVALID only
+# heuristically (a subgraph has a smaller solution set, so if nothing was
+# found here nothing is expected below either).
+VALID   = 'VALID'
+INVALID = 'INVALID'
 
 # 2x2 blocks. Every real symmetric 2x2 is spanned by {I2, sx, sz}; every
 # real 2x2 by {I2, J2, sx, sz}. J2 is the one-mode symplectic form.
@@ -175,8 +177,8 @@ def symplectic_form(n: int) -> np.ndarray:
 #
 # nu_aux is the doc's separate fallback for when the drain-PURITY argument
 # is unavailable: pass symplectic eigenvalues nu_m >= 1/2 for mixed drains.
-# Verdicts are then pointwise in nu — a grid-wide failure is UNDECIDED,
-# never INVALID.
+# Verdicts are then pointwise in nu — a grid-wide failure says nothing
+# about the values between grid points.
 #
 # Everything here is general in the number of auxiliary modes, with ONE
 # caveat about coverage that only bites for two or more drains. The
@@ -506,7 +508,7 @@ def _residual_is_zero(resid_norm: float, M: np.ndarray, b: np.ndarray,
 # solve_stationarity(V, h_basis, d_basis, Y_fixed) -> dict describing the
 # affine solution set of (**) restricted to the admissible subspace:
 #   'feasible'   — residual is zero (a stationary solution exists)
-#   'residual'   — the least-squares residual norm (the §4A certificate)
+#   'residual'   — the least-squares residual norm (§4A)
 #   'z0'         — minimum-norm particular solution
 #   'nullspace'  — orthonormal basis of the remaining freedom
 # The SVD makes this global: there is no initial guess and no local minimum
@@ -600,10 +602,11 @@ def _is_psd(Y: np.ndarray, tol: float = 1e-9) -> bool:
 # minimum-norm point, then K random draws, then a direct maximisation of
 # the stability margin over the nullspace coefficients.
 #
-# A FAILURE HERE IS NOT EVIDENCE OF INVALIDITY. Callers must map it to
-# UNDECIDED, never INVALID — that asymmetry is what confines this one
-# nonconvex step to a completeness gap on a single graph instead of letting
-# it poison the whole down-set through the search's propagation rules.
+# A FAILURE HERE IS NOT EVIDENCE OF INVALIDITY — it is the one nonconvex
+# step left, and it can miss a thin feasible cone. `decide` files such a
+# failure as INVALID anyway and the search prunes on it, so this filter's
+# recall is what bounds how complete the returned minimal-valid set is.
+# That is the deliberate trade: minimal-enough schemes, cheaply.
 #
 # `seed` is derived from the graph by the caller so the verdict is
 # reproducible: §5(iii)'s bidirectional-agreement assertion compares
@@ -622,7 +625,7 @@ def _is_psd(Y: np.ndarray, tol: float = 1e-9) -> bool:
 #       depends continuously on (G,Upsilon) and the Hurwitz set is open), so
 #       a genuine interior ascent finds a witness whenever one exists, while
 #       an early-exit sampler can miss a thin feasible cone. This is the
-#       move that converts UNDECIDED graphs to VALID.
+#       move that rescues graphs the cheap filter would file INVALID.
 #   (b) FIGURE OF MERIT. gamma* IS the dissipative gap, so the oracle that
 #       decides validity also returns the relaxation rate the resource-vs-gap
 #       comparison needs — no separate optimisation.
@@ -664,8 +667,8 @@ def attractivity_filter(
     # a beamsplitter-only network stabilising a cluster state through one
     # squeezed drain — the physical region is a thin cone inside the
     # solution space: random Gaussian sampling of a 7-dimensional nullspace
-    # scored 0 PSD hits out of 2000. With -inf rejection the filter reported
-    # UNDECIDED; with the penalty it finds a witness at normalised margin
+    # scored 0 PSD hits out of 2000. With -inf rejection the filter found
+    # nothing; with the penalty it finds a witness at normalised margin
     # 0.0279, better than any active scheme found by descent. A whole class
     # of schemes was invisible for want of this.
     psd_weight = 1e3
@@ -728,502 +731,6 @@ def attractivity_filter(
         if m > margin_tol and not maximise:
             return True, z, m
     return (best_m > margin_tol), best_z, best_m
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# structural certificates — the sound INVALID verdicts
-# ───────────────────────────────────────────────────────────────────────────
-# AMENDMENT to state_stabilization_algorithm.md §4A/§4B, found by running
-# the oracle: the doc's residual-based INVALID certificate CANNOT FIRE at
-# Gamma_signal = 0, so on its own it prunes nothing.
-#
-# Why. With no bath on the signal modes, (G, Upsilon) = (0, 0) gives A = 0
-# and D = 0, so (**) holds for ANY V whatsoever — the "everything frozen"
-# configuration is stationary for every target on every graph. In the joint
-# path this is worse than a nuisance: the linear system is HOMOGENEOUS
-# (b = 0, since nothing is moved to the right-hand side), so z = 0 solves
-# it exactly and the least-squares residual is identically zero no matter
-# what the graph or target are. Verified numerically. The doc notices the
-# frozen point in §4A — it is the "minimum-norm least-squares point is
-# G = 0" example — but does not notice that its existence makes the
-# residual test vacuous as a GRAPH-level verdict.
-#
-# The correct reading: a zero residual carries no information here, and the
-# real question is entirely the attractivity one — does the solution set
-# contain a Hurwitz member? That is not a least-squares residual and not an
-# SDP; deciding whether an affine matrix family contains a Hurwitz member
-# is hard in general. So INVALID has to come from somewhere else.
-#
-# Below are two certificates that are cheap, exact, and provable. They are
-# graph-structural rather than numerical, which is why they can be trusted
-# to prune. Everything they do not catch is UNDECIDED — the search is then
-# slower but never wrong, since UNDECIDED propagates nowhere.
-#
-# structural_certificate(...) -> None if nothing is proved, else a dict
-# describing the proof.
-#
-# (a) UNDAMPED COMPONENT. All dissipation lives on the auxiliary modes
-#     (Upsilon is supported there — this is the same Gamma_signal = 0
-#     idealisation that makes §2.1's state completion exact). If a
-#     connected component of the coupling graph contains a signal mode but
-#     no auxiliary mode, then on that component D = 0 and A = Omega G with
-#     G symmetric, so tr A = tr(Omega G) = 0 — the trace of an
-#     antisymmetric times a symmetric matrix. Eigenvalues summing to zero
-#     cannot all have negative real part, so A is not Hurwitz for ANY
-#     admissible G. No Hamiltonian on this graph stabilises anything there.
-#
-# (b) CORRELATION ACROSS A CUT. Distinct components have no coupling and
-#     (with one independent reservoir per drain) no shared bath, so their
-#     dynamics and noise are independent and the steady state factorises:
-#     the cross-covariance between modes in different components is zero.
-#     If V_target demands a nonzero correlation between two signal modes
-#     that this graph places in different components, no solution exists.
-#     This is the certificate that does the real pruning work on entangled
-#     targets — EPR, cluster states — where most sparse graphs fail it.
-#
-#     Gated on coupled_drains=False: a reservoir shared between two drains
-#     could correlate their components, and then the argument fails.
-# _orthonormal / _nullspace / _restrict: small subspace helpers for the
-# undamped-subspace certificate below. Columns are always kept orthonormal
-# so that C @ C.T is the orthogonal projector onto the subspace.
-# `ref` is the scale the singular values are judged against. It MUST be
-# passed whenever the matrix can legitimately be zero, which is exactly the
-# case in the invariant-subspace iterations below: there the block being
-# nulled is (I - P) M W, and it vanishes precisely when W is already
-# invariant under M — the success case. Judging it against its OWN largest
-# singular value then compares 1e-16 with 1e-16, declares full rank, and
-# collapses the subspace to nothing, so the certificate silently fails on
-# the graphs it is meant to catch.
-#
-# That is not hypothetical: with the tolerance self-referenced, the same
-# physical problem gave 156 INVALID with the drain labelled mode 2 and only
-# 80 with it labelled mode 0 — 92 graphs whose verdict flipped under a
-# relabelling that cannot change the physics. Passing the generator norm as
-# `ref` makes the test scale-correct and the verdict permutation-invariant.
-def _orthonormal(X: np.ndarray, rtol: float = 1e-10) -> np.ndarray:
-    if X.size == 0:
-        return X
-    U, s, _ = np.linalg.svd(X, full_matrices=False)
-    rank = int(np.sum(s > rtol * max(float(s[0]), 1e-300)))
-    return U[:, :rank]
-
-
-def _nullspace(M: np.ndarray, rtol: float = 1e-10,
-                ref: Optional[float] = None) -> np.ndarray:
-    if M.size == 0:
-        return np.eye(M.shape[1] if M.ndim == 2 else 0)
-    _, s, Vt = np.linalg.svd(M)
-    scale = float(s[0]) if (ref is None and s.size) else (ref or 0.0)
-    rank = int(np.sum(s > rtol * max(scale, 1e-300)))
-    return Vt[rank:].T
-
-
-# undamped_subspace(triu, num_modes, aux_ids) -> basis for the largest
-# subspace W such that, for EVERY admissible (G, Upsilon) on this graph,
-#     A(G,Upsilon)^T W subset W    and    D(Upsilon) W = 0.
-#
-# §4A's "a mode (or Bogoliubov combination) left undamped — unreachable by
-# any dissipative channel through the graph", in its general form.
-#
-# Why a nonzero W certifies invalidity. Pick w in W an eigenvector of the
-# restriction of A^T to W (it exists over C). Then w is a left eigenvector
-# of A, and D w = 0, so by §3's identity 2 Re(lambda) w^dag V w =
-# -w^dag D w = 0, giving Re lambda = 0. A is therefore non-Hurwitz for
-# every admissible choice, so no attractive solution exists on this graph.
-# Sound with no numerical solve at all — it is a property of the generator
-# subspaces, not of any particular solution.
-#
-# The computation is the standard largest-invariant-subspace iteration:
-# start from the directions no diffusion generator can reach, then
-# repeatedly discard anything the drift generators push out, until stable.
-#
-# This SUBSUMES the whole-mode connectivity argument (a disconnected
-# signal component's coordinates form such a W) while also catching
-# collective/Bogoliubov dark modes that no per-mode reachability test can
-# see. Measured on the two-mode-squeezed target it certifies exactly the
-# same 80 graphs as the connectivity argument — there the dark modes of
-# the remaining graphs are parameter-DEPENDENT, so no common W exists —
-# but it is the correct general statement and costs microseconds.
-def undamped_subspace(triu_array, num_modes: int, aux_ids: List[int],
-                       coupled_drains: bool = False, rtol: float = 1e-9) -> np.ndarray:
-    dim = 2 * num_modes
-    h_basis = hamiltonian_basis(triu_array, num_modes,
-                                include_detunings=True, allow_phases=True)
-    d_basis = dissipation_basis(aux_ids, num_modes, coupled_drains=coupled_drains)
-    Om = symplectic_form(num_modes)
-
-    # W must be annihilated by every diffusion generator D_c = Om Re(Y_c) Om^T.
-    Ds = [Om @ Sc @ Om.T for _, Sc, _ in d_basis]
-    W = _nullspace(np.vstack(Ds), rtol) if Ds else np.eye(dim)
-
-    # A^T = -(G - Im Y) Om, so its generators are -G_b Om and +Im(Y_c) Om.
-    gens = [-Gb @ Om for _, Gb in h_basis] + [Tc @ Om for _, _, Tc in d_basis]
-
-    for _ in range(dim + 2):
-        if W.shape[1] == 0:
-            break
-        cur = W
-        for M in gens:
-            if cur.shape[1] == 0:
-                break
-            P = cur @ cur.T                      # cur is orthonormal
-            # ref = ||M||: the block below is zero exactly when cur is
-            # already M-invariant, so it has no meaningful scale of its own.
-            K = _nullspace((np.eye(dim) - P) @ M @ cur, rtol,
-                            ref=float(np.linalg.norm(M, 2)))
-            cur = _orthonormal(cur @ K) if K.shape[1] else np.zeros((dim, 0))
-        if cur.shape[1] == W.shape[1]:
-            W = cur
-            break
-        W = cur
-    return W
-
-
-# solution_set_dark_subspace(triu, V, ...) -> dimension of the largest
-# subspace W with, for EVERY solution (G, Upsilon) of (**) at this V,
-#     A(G,Upsilon)^T W subset W    and    D(Upsilon) W = 0.
-#
-# Nonzero => every point of the solution set carries a left eigenvector with
-# Re(lambda) = 0, so no attractive solution exists AT THIS V. A certificate,
-# not a failed search.
-#
-# This is undamped_subspace's condition applied to the SOLUTION SET rather
-# than to the whole admissible set S_G x S_Upsilon, and that distinction is
-# the entire content. Quantifying over every setting the graph permits is
-# far too strong: a generic admissible point is not dark (measured
-# ||w^T A|| = 0.560 on a graph whose solution set is uniformly dark), so
-# undamped_subspace returns 0 and certifies nothing. Restricted to the
-# solutions — the only settings that produce the target at all — the dark
-# subspace is the SAME for every point, with only the oscillation frequency
-# varying (measured: six sampled solutions, dark subspaces agreeing to
-# ||P_i - P_0|| ~ 4e-16).
-#
-# Measured effect on the two-mode-squeezed target, all 512 graphs, r = 0.5,
-# one auxiliary drain, fixed vacuum frame:
-#     connectivity certificates alone     :  80 INVALID, 376 UNDECIDED
-#     with this one                       : 456 INVALID,   0 UNDECIDED
-# i.e. the partition is COMPLETE — every graph is decided, and the 56 VALID
-# graphs are exactly the complement. Audited three ways: no graph carrying a
-# Hurwitz witness is condemned (0 of 56); the verdict is invariant under
-# relabelling the drain; and on 456 graphs x 5 independently drawn solution
-# points the universal claim holds numerically, ||D W|| = 0 exactly and the
-# A^T-invariance defect <= 8.4e-15.
-#
-# Earlier revisions of this file reported 156 INVALID / 300 UNDECIDED here.
-# That figure was a TOLERANCE ARTEFACT, not a weaker certificate: the rank
-# test inside the iteration judged the block (I - P) M W against its own
-# largest singular value, which is ~1e-16 exactly when the subspace IS
-# invariant, so the success case was read as full rank and the subspace
-# collapsed. See _nullspace's header. The give-away was that 156 depended on
-# which mode the drain was called (92 graphs flipped verdict under a
-# relabelling); scale-correct tolerances removed the dependence and the
-# undecided stratum with it.
-#
-# SCOPE: this certifies the graph AT THE GIVEN V. It is frame-dependent —
-# the drain state enters through the solution set — so a graph certified
-# here at a vacuum drain may still be valid with a squeezed one. That is
-# not hypothetical: the two-beamsplitter scheme is exactly such a graph. So
-# `decide` (fixed V) may propagate this verdict, while `optimise_aux_state`
-# (which ranges over drain states) must not treat it as graph-level.
-#
-# return_basis=True returns the (complex, generally non-orthonormal) basis
-# itself instead of its dimension, which is what pbh_certificate needs to
-# exhibit the offending direction rather than merely count it.
-def solution_set_dark_subspace(triu_array, V: np.ndarray, num_modes: int,
-                                aux_ids: List[int], coupled_drains: bool = False,
-                                rtol: float = 1e-9, return_basis: bool = False):
-    dim = 2 * num_modes
-    h_basis = hamiltonian_basis(triu_array, num_modes,
-                                include_detunings=True, allow_phases=True)
-    d_basis = dissipation_basis(aux_ids, num_modes, coupled_drains=coupled_drains)
-    sol = solve_stationarity(V, h_basis, d_basis, None, rtol=rtol)
-    N = sol['nullspace']
-    if N.shape[1] == 0:
-        return np.zeros((dim, 0), dtype=complex) if return_basis else 0
-
-    # Complex counterparts of _nullspace / _orthonormal, with the same
-    # scale-reference discipline: `ref` must be supplied wherever the block
-    # can legitimately be zero (see _nullspace's header for what goes wrong
-    # otherwise — a verdict that depends on which mode the drain is called).
-    def null_c(M, ref=None):
-        if M.size == 0:
-            return np.eye(M.shape[1] if M.ndim == 2 else 0, dtype=complex)
-        _, s, Vh = np.linalg.svd(M)
-        scale = float(s[0]) if (ref is None and s.size) else (ref or 0.0)
-        rank = int(np.sum(s > rtol * max(scale, 1e-300)))
-        return Vh[rank:].conj().T
-
-    def orth_c(X):
-        if X.size == 0:
-            return X
-        U, s, _ = np.linalg.svd(X, full_matrices=False)
-        rank = int(np.sum(s > rtol * max(float(s[0]), 1e-300)))
-        return U[:, :rank]
-
-    As, Ds = [], []
-    for k in range(N.shape[1]):
-        G, Y = _assemble(N[:, k], h_basis, d_basis, None, dim)
-        As.append(drift_matrix(G, Y).T.astype(complex))
-        Ds.append(diffusion_matrix(Y).astype(complex))
-
-    W = orth_c(null_c(np.vstack(Ds)))
-    for _ in range(dim + 2):
-        if W.shape[1] == 0:
-            break
-        cur = W
-        for M in As:
-            if cur.shape[1] == 0:
-                break
-            # cur is kept orthonormal, so P is the projector and ||M|| is the
-            # right scale for the residual block (I - P) M cur.
-            P = cur @ cur.conj().T
-            K = null_c((np.eye(dim) - P) @ M @ cur,
-                        ref=float(np.linalg.norm(M, 2)))
-            cur = orth_c(cur @ K) if K.shape[1] else np.zeros((dim, 0), dtype=complex)
-        if cur.shape[1] == W.shape[1]:
-            W = cur
-            break
-        W = cur
-    return W if return_basis else W.shape[1]
-
-
-# pbh_certificate(...) -> None, or a dict exhibiting an UNCONTROLLABLE
-# IMAGINARY MODE. §8 Move 2, and the auditable form of the two dark-subspace
-# certificates above.
-#
-# The logic chain the doc sets out, in one place:
-#   §3      every solution of (**) with V > 0 already has Re lambda <= 0, so
-#           "not Hurwitz" can only mean an eigenvalue exactly ON the
-#           imaginary axis — there is nothing to check off it.
-#   PBH     (Popov-Belevitch-Hautus) the pair (A, B) with D = B B^T is
-#           uncontrollable at lambda iff rank[A - lambda I | B] < 2n, and the
-#           deficiency is witnessed by a left null vector w:
-#               w^T (A - lambda I) = 0   and   w^T B = 0.
-#   here    D w = B B^T w = 0 is EQUIVALENT to w^T B = 0, so "dark direction"
-#           and "uncontrollable mode" are the same object. A dark mode is an
-#           uncontrollable imaginary mode.
-#
-# So the subspace computations above (undamped_subspace over the whole
-# admissible family; solution_set_dark_subspace over the solution set) do not
-# merely suggest invalidity — each hands over a w that FAILS the PBH rank
-# test, which is a single numerical quantity anyone can recompute. This
-# function produces that number, together with the lambda it sits at.
-#
-# scope='admissible' quantifies over every (G, Upsilon) the graph permits and
-# is therefore FRAME-INDEPENDENT — safe to propagate as a graph-level verdict
-# regardless of drain state. scope='solution_set' quantifies only over the
-# solutions at this V; it is far stronger (80 -> 456 of 512 on the
-# two-mode-squeezed target, emptying the undecided stratum) but
-# frame-DEPENDENT, so a caller that ranges over drain states must not treat
-# it as graph-level. Both are returned; callers pick by scope.
-def pbh_certificate(triu_array, V: np.ndarray, num_modes: int,
-                     aux_ids: List[int], coupled_drains: bool = False,
-                     rtol: float = 1e-9, scope: str = 'solution_set'
-                     ) -> Optional[Dict]:
-    dim = 2 * num_modes
-    h_basis = hamiltonian_basis(triu_array, num_modes,
-                                include_detunings=True, allow_phases=True)
-    d_basis = dissipation_basis(aux_ids, num_modes, coupled_drains=coupled_drains)
-
-    if scope == 'admissible':
-        W = undamped_subspace(triu_array, num_modes, aux_ids,
-                              coupled_drains=coupled_drains, rtol=rtol
-                              ).astype(complex)
-    elif scope == 'solution_set':
-        W = solution_set_dark_subspace(triu_array, V, num_modes, aux_ids,
-                                        coupled_drains=coupled_drains,
-                                        rtol=rtol, return_basis=True)
-    else:
-        raise ValueError("scope must be 'admissible' or 'solution_set'")
-    if W.shape[1] == 0:
-        return None
-
-    # A representative point of the set being quantified over. The subspace
-    # claim is that EVERY point is dark on W, so any representative exhibits
-    # the failure — but the representative must be PHYSICAL, or the PBH rank
-    # test degenerates. A point with Upsilon not PSD has a diffusion matrix
-    # with negative eigenvalues, D = B B^T has no real factor, B comes back
-    # empty, and rank[A - lambda I | B] < 2n reduces to "A - lambda I is
-    # singular" — true by construction and therefore proving nothing. So
-    # draw until Upsilon >= 0 and D != 0, and record whether that succeeded.
-    rng = np.random.default_rng(12345)
-    if scope == 'solution_set':
-        sol = solve_stationarity(V, h_basis, d_basis, None, rtol=rtol)
-        N = sol['nullspace']
-        draw = lambda: N @ rng.normal(0., 1., N.shape[1])
-    else:
-        nz = len(h_basis) + len(d_basis)
-        draw = lambda: rng.normal(0., 1., nz)
-
-    G = Y = None
-    psd_point = False
-    for _ in range(64):
-        z = draw()
-        Gc, Yc = _assemble(z, h_basis, d_basis, None, dim)
-        if G is None:
-            G, Y = Gc, Yc                    # fall-back representative
-        if _is_psd(Yc) and np.linalg.norm(diffusion_matrix(Yc)) > 1e-12:
-            G, Y, psd_point = Gc, Yc, True
-            break
-
-    A = drift_matrix(G, Y)
-    D = diffusion_matrix(Y)
-    # D = B B^T with B from the PSD square root; only its column space
-    # matters to the rank test, so the symmetric root is as good as any
-    # Cholesky factor and does not need D to be nonsingular.
-    ew, ev = np.linalg.eigh((D + D.T) / 2)
-    keep = ew > rtol * max(float(np.max(np.abs(ew))) if ew.size else 1.0, 1e-300)
-    B = (ev[:, keep] * np.sqrt(np.clip(ew[keep], 0., None))) if np.any(keep) \
-        else np.zeros((dim, 0))
-
-    # Restrict A^T to W and diagonalise: every eigenvalue of the restriction
-    # is an eigenvalue of A whose left eigenvector lies in W, hence is dark.
-    Q, _ = np.linalg.qr(W)
-    M = Q.conj().T @ A.T.astype(complex) @ Q
-    lam, vec = np.linalg.eig(M)
-
-    best = None
-    for k in range(len(lam)):
-        w = Q @ vec[:, k]
-        nw = float(np.linalg.norm(w))
-        if nw < 1e-300:
-            continue
-        w = w / nw
-        eig_res = float(np.linalg.norm(A.T.astype(complex) @ w - lam[k] * w))
-        dark_res = float(np.linalg.norm(B.T.astype(complex) @ w)) if B.size \
-            else 0.0
-        stacked = np.hstack([A.astype(complex) - lam[k] * np.eye(dim),
-                             B.astype(complex)]) if B.size else \
-            (A.astype(complex) - lam[k] * np.eye(dim))
-        s = np.linalg.svd(stacked, compute_uv=False)
-        rank = int(np.sum(s > rtol * max(float(s[0]), 1e-300)))
-        cand = {'kind': 'pbh_uncontrollable', 'scope': scope,
-                'dim': int(W.shape[1]), 'lambda': complex(lam[k]),
-                'pbh_rank': rank, 'full_rank': dim,
-                'eigen_residual': eig_res, 'darkness_residual': dark_res,
-                'psd_point': psd_point, 'n_channels': int(B.shape[1]) if B.size else 0,
-                'frame_dependent': (scope == 'solution_set'),
-                'note': ('w^T A = lambda w^T with Re(lambda) = {:.2e} and w^T B = 0, '
-                          'so rank[A - lambda I | B] = {} < {}: the mode is '
-                          'uncontrollable, hence undamped, for every point of the '
-                          '{} set — A can never be Hurwitz there'
-                          .format(float(np.real(lam[k])), rank, dim,
-                                  'solution' if scope == 'solution_set' else 'admissible'))}
-        if rank >= dim:
-            continue                       # not actually rank-deficient; skip
-        if best is None or abs(np.real(lam[k])) < abs(np.real(best['lambda'])):
-            best = cand
-    return best
-
-
-def structural_certificate(
-    triu_array,
-    V: np.ndarray,
-    target_mode_ids: List[int],
-    node_types: List[str],
-    coupled_drains: bool = False,
-    corr_tol: float = 1e-10,
-    include_solution_set: bool = True,
-    attach_pbh: bool = True,
-) -> Optional[Dict]:
-    n = len(node_types)
-    rows, cols = np.triu_indices(n)
-    aux = set(i for i in range(n) if i not in target_mode_ids)
-
-    # Connectivity is over Hamiltonian edges AND shared dissipators (§4A:
-    # "the graph's connectivity (Hamiltonian edges and shared dissipators)").
-    # With coupled_drains the auxiliary modes may share one reservoir, which
-    # correlates them and therefore bridges components the edges alone leave
-    # separate — so those links must be added before any cut argument.
-    adj = [[] for _ in range(n)]
-    for k, (i, j) in enumerate(zip(rows, cols)):
-        if i != j and int(triu_array[k]) != NO_COUPLING:
-            adj[i].append(j)
-            adj[j].append(i)
-    if coupled_drains:
-        aux_list = sorted(aux)
-        for a, b in zip(aux_list, aux_list[1:]):
-            adj[a].append(b)
-            adj[b].append(a)
-
-    comp = [-1] * n
-    for start in range(n):
-        if comp[start] != -1:
-            continue
-        stack, cid = [start], start
-        while stack:
-            u = stack.pop()
-            if comp[u] != -1:
-                continue
-            comp[u] = cid
-            stack.extend(v for v in adj[u] if comp[v] == -1)
-
-    # (a) undamped component containing a signal mode
-    for c in set(comp):
-        members = [i for i in range(n) if comp[i] == c]
-        if any(i in target_mode_ids for i in members) and not any(i in aux for i in members):
-            return {'kind': 'undamped_component', 'component': members,
-                    'note': ('signal modes {} lie in a component with no auxiliary mode, so '
-                              'D = 0 there and tr A = tr(Omega G) = 0; eigenvalues summing to '
-                              'zero cannot all have Re < 0, so A is not Hurwitz for any G'
-                              .format([i for i in members if i in target_mode_ids]))}
-
-    # (a2) undamped SUBSPACE — the general form of (a), covering collective
-    # and Bogoliubov dark modes that a per-mode connectivity test cannot
-    # see. Checked after (a) only because (a) is cheaper and yields a more
-    # readable certificate when it applies; (a2) subsumes it.
-    W = undamped_subspace(triu_array, n, sorted(aux), coupled_drains=coupled_drains)
-    if W.shape[1] > 0:
-        cert = {'kind': 'undamped_subspace', 'dim': int(W.shape[1]),
-                'basis': W,
-                'note': ('a {}-dimensional subspace is annihilated by every admissible '
-                          'diffusion generator AND invariant under every admissible drift '
-                          'generator, so it carries a left eigenvector with Re(lambda) = 0 '
-                          'for EVERY (G, Upsilon) on this graph; A can never be Hurwitz'
-                          .format(W.shape[1]))}
-        # §8 Move 2: restate the subspace claim as a PBH rank deficiency, the
-        # form that can be recomputed and audited as one number.
-        if attach_pbh:
-            cert['pbh'] = pbh_certificate(triu_array, V, n, sorted(aux),
-                                           coupled_drains=coupled_drains,
-                                           scope='admissible')
-        return cert
-
-    # (b) target demands correlation across a cut
-    if not coupled_drains:
-        for a in target_mode_ids:
-            for b in target_mode_ids:
-                if a >= b or comp[a] == comp[b]:
-                    continue
-                blk = V[2 * a:2 * a + 2, 2 * b:2 * b + 2]
-                if np.linalg.norm(blk) > corr_tol:
-                    return {'kind': 'correlation_across_cut', 'modes': (a, b),
-                            'block_norm': float(np.linalg.norm(blk)),
-                            'note': ('target requires correlation between signal modes {} and {}, '
-                                      'but this graph puts them in disconnected components with '
-                                      'independent baths, so their steady state factorises'
-                                      .format(a, b))}
-
-    # (c) uniformly dark solution set — the general certificate, and the one
-    # that does the most work (80 -> 456 of 512 on the two-mode-squeezed
-    # target, leaving nothing undecided there).
-    # FRAME-DEPENDENT: it certifies this graph at THIS V only, so a caller
-    # ranging over drain states must not propagate it as a graph-level
-    # verdict — see solution_set_dark_subspace's scope note.
-    if include_solution_set:
-        d = solution_set_dark_subspace(triu_array, V, n, sorted(aux),
-                                        coupled_drains=coupled_drains)
-        if d > 0:
-            cert = {'kind': 'solution_set_dark', 'dim': int(d), 'frame_dependent': True,
-                    'note': ('every solution of (**) at this drain state shares a '
-                              '{}-dimensional dark subspace, so all of them have '
-                              'Re(lambda) = 0 and none is attractive'.format(d))}
-            if attach_pbh:
-                cert['pbh'] = pbh_certificate(triu_array, V, n, sorted(aux),
-                                               coupled_drains=coupled_drains,
-                                               scope='solution_set')
-            return cert
-    return None
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1433,423 +940,32 @@ def squeeze_symplectic(r: float, theta: float = 0.0) -> np.ndarray:
     return R @ np.diag([np.exp(-r), np.exp(r)]) @ R.T
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# §4B optional SDP path (requires cvxpy; not a hard dependency)
-# ───────────────────────────────────────────────────────────────────────────
-# sdp_feasibility(V, h_basis, d_basis) -> (status, G, Upsilon).
-#
-# The real §4B: find G in S_G, Upsilon Hermitian PSD in S_Upsilon satisfying
-# (**). The Hurwitz condition is deliberately ABSENT from the program — with
-# V fixed it is equivalent to the absence of a dark mode, i.e. a
-# rank/detectability condition and not a linear matrix inequality, so
-# including it would destroy both convexity and the dual certificate that
-# makes an INVALID verdict sound. It is recovered afterwards by
-# attractivity_filter.
-#
-# Returns 'infeasible' (sound INVALID, with a dual certificate available
-# from the solver), 'feasible' (a CANDIDATE only — still needs the filter),
-# or 'unavailable' when cvxpy is not installed.
-#
-# MEASURED LIMITATION — the doc's §4B expects the infeasible branch to be
-# the main source of INVALID certificates. It cannot fire in this regime,
-# and the reason is structural rather than numerical.
-#
-# With lossless signal modes there is a point available on EVERY graph for
-# EVERY pure target: damp the drain with plain loss and leave the signal
-# modes entirely uncoupled (G = 0). The drain relaxes to its own vacuum,
-# the signal modes are frozen at whatever V_TT says, and (**) is satisfied
-# EXACTLY. It is PSD, and it survives any normalisation (its tr(Re Y) can
-# be scaled to 1), so adding tr(Upsilon) = 1 to exclude Upsilon = 0 does
-# not remove it either. Verified: residual 0.00e+00, PSD True, margin 0.
-#
-# So the feasible set is never empty, cvxpy returns 'optimal' for every
-# graph tested — passive, active, and the empty graph alike — and no dual
-# certificate is ever produced. This is the same frozen solution that makes
-# §4A's least-squares residual identically zero; the SDP inherits it
-# because it is a relaxation of the same equations.
-#
-# The consequence is that the doc's two certificate routes (§4A residual,
-# §4B duality) both collapse at Gamma_signal = 0, and INVALID has to come
-# from the structural certificates instead — see structural_certificate.
-# What the SDP still provides is §4B's OTHER contribution: a feasible point
-# whose Upsilon can be factored to read off the reservoir (see
-# factor_dissipator), which works exactly as described.
-def sdp_feasibility(V: np.ndarray, h_basis, d_basis):
-    try:
-        import cvxpy as cp
-    except ImportError:
-        return 'unavailable', None, None
-
-    dim = V.shape[0]
-    g = cp.Variable(len(h_basis)) if h_basis else None
-    y = cp.Variable(len(d_basis)) if d_basis else None
-
-    G = sum((g[k] * h_basis[k][1] for k in range(len(h_basis))),
-            np.zeros((dim, dim))) if h_basis else np.zeros((dim, dim))
-    ReY = sum((y[k] * d_basis[k][1] for k in range(len(d_basis))),
-              np.zeros((dim, dim))) if d_basis else np.zeros((dim, dim))
-    ImY = sum((y[k] * d_basis[k][2] for k in range(len(d_basis))),
-              np.zeros((dim, dim))) if d_basis else np.zeros((dim, dim))
-
-    Om = symplectic_form(dim // 2)
-    eq = Om @ (G + ImY) @ V - V @ (G - ImY) @ Om + Om @ ReY @ Om.T
-
-    # Upsilon >= 0 for the Hermitian S + iT is equivalent to the real
-    # symmetric 2d x 2d matrix [[S, -T], [T, S]] being PSD — the standard
-    # complex-to-real lifting, used so this works with any real SDP solver.
-    lift = cp.bmat([[ReY, -ImY], [ImY, ReY]])
-    prob = cp.Problem(cp.Minimize(0), [eq == 0, lift >> 0])
-    try:
-        prob.solve()
-    except Exception:
-        return 'unavailable', None, None
-
-    if prob.status in ('infeasible', 'infeasible_inaccurate'):
-        return 'infeasible', None, None
-    if prob.status in ('optimal', 'optimal_inaccurate'):
-        Gv = sum(float(g.value[k]) * h_basis[k][1] for k in range(len(h_basis))) \
-             if h_basis else np.zeros((dim, dim))
-        Yv = sum(float(y.value[k]) * (d_basis[k][1] + 1j * d_basis[k][2])
-                 for k in range(len(d_basis))) if d_basis else np.zeros((dim, dim), complex)
-        return 'feasible', Gv, Yv
-    return 'unavailable', None, None
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# §8 Move 3: a decision procedure for the residue
-# ───────────────────────────────────────────────────────────────────────────
-# Everything above decides a graph by finding a witness (VALID) or by
-# exhibiting a subspace that is dark at every solution (INVALID). What
-# survives both is UNDECIDED, and Move 3 is the expensive machinery aimed at
-# exactly that residue. Move 4 is why it is affordable: the residue that
-# matters is only the graphs sitting one edge below a valid graph, which is
-# a handful rather than the whole stratum.
-#
-# The key structural fact both halves lean on: at Gamma_signal = 0 the
-# stationarity system is HOMOGENEOUS, so the solution set is a linear
-# subspace and
-#       A(alpha) = sum_j alpha_j A_j
-# is LINEAR in the coordinates alpha of that subspace. The problem is
-# therefore "does this linear matrix family contain a Hurwitz member?",
-# which is what makes both routes below tractable.
-#
-# ---------------------------------------------------------------------------
-# solution_set_drift_basis: the A_j above, plus the generator bases needed to
-# rebuild (G, Upsilon) from alpha.
-def solution_set_drift_basis(triu_array, V: np.ndarray, num_modes: int,
-                              aux_ids: List[int], coupled_drains: bool = False,
-                              rtol: float = 1e-9):
-    dim = 2 * num_modes
-    h_basis = hamiltonian_basis(triu_array, num_modes,
-                                include_detunings=True, allow_phases=True)
-    d_basis = dissipation_basis(aux_ids, num_modes, coupled_drains=coupled_drains)
-    sol = solve_stationarity(V, h_basis, d_basis, None, rtol=rtol)
-    N = sol['nullspace']
-    As = []
-    for k in range(N.shape[1]):
-        G, Y = _assemble(N[:, k], h_basis, d_basis, None, dim)
-        As.append(drift_matrix(G, Y))
-    return {'A_basis': As, 'nullspace': N, 'h_basis': h_basis,
-            'd_basis': d_basis, 'dim': dim}
-
-
-# _hurwitz_minors(a): leading principal minors Delta_1..Delta_n of the Hurwitz
-# matrix of p(s) = s^n + a_1 s^{n-1} + ... + a_n, i.e. H_ij = a_{2i-j} with
-# a_0 = 1 and a_k = 0 outside 0..n.
-#
-# Routh-Hurwitz: A is Hurwitz iff every Delta_k > 0. The contrapositive is
-# what Move 3 uses on the INVALID side — if any single Delta_k vanishes
-# IDENTICALLY over the family, no member can be Hurwitz.
-#
-# Returned RELATIVE to the Hadamard bound |det M| <= prod_i ||row_i(M)||,
-# which is the size of the largest term in the determinant expansion. That
-# ratio measures cancellation and is the only scale-correct way to ask
-# "is this determinant zero?".
-#
-# Using the raw value instead is a trap, and one this file has now fallen
-# into twice (see _nullspace for the first). A genuinely Hurwitz 6x6 has
-# Delta_5 ~ 1e-3 and Delta_6 ~ 1e-6 after normalising ||A|| = 1, and an 8x8
-# has Delta_8 ~ 1e-11 — so any absolute threshold loose enough to call a
-# true zero "zero" also condemns every stable matrix in sight. Measured on
-# this problem the relative minor separates cleanly: VALID graphs land in
-# 1.3e-6 .. 1.5e-3, INVALID graphs at or below 8.4e-12.
-def _hurwitz_minors(a: np.ndarray, relative: bool = True) -> np.ndarray:
-    n = len(a)
-
-    def ext(k):
-        if k == 0:
-            return 1.0
-        return float(a[k - 1]) if 1 <= k <= n else 0.0
-
-    H = np.array([[ext(2 * i - j) for j in range(1, n + 1)]
-                  for i in range(1, n + 1)], dtype=float)
-    out = []
-    for k in range(1, n + 1):
-        Hk = H[:k, :k]
-        d = float(np.linalg.det(Hk))
-        if not relative:
-            out.append(d)
-            continue
-        had = 1.0
-        for i in range(k):
-            had *= float(np.linalg.norm(Hk[i, :]))
-        # A zero row makes the bound vanish, but then the determinant is
-        # exactly zero too, which is a genuine vanishing rather than a
-        # numerical one.
-        out.append(0.0 if had < 1e-300 else abs(d) / had)
-    return np.array(out)
-
-
-# move3_invalid_certificate(...) -> None, or a proof that NO member of the
-# family is Hurwitz.
-#
-# The universal side of Move 3, and the piece the dark-subspace certificate
-# cannot supply. That certificate needs ONE subspace dark at every solution
-# point. When the dark direction ROTATES as you move through the solution set
-# — which is what leaves the product-target graphs undecided, with per-point
-# dark projectors differing by ||P_i - P_0|| ~ 1.5-2.0 — the intersection is
-# empty and it certifies nothing, even though every individual point is
-# marginal. This test does not care where the dark direction points.
-#
-# How it works. Each Hurwitz minor Delta_k(alpha) is a POLYNOMIAL in alpha of
-# degree at most n*k, because A(alpha) is linear and the characteristic
-# coefficients a_i are degree i. Restrict to a random line alpha(t) = alpha_0
-# + t*u: Delta_k(t) becomes a UNIVARIATE polynomial of degree at most n*k. A
-# univariate polynomial of degree d vanishing at d+1 distinct points is the
-# zero polynomial — no fitting, no threshold on a derivative, just the
-# fundamental theorem of algebra. Sampling n*k+2 points therefore PROVES
-# vanishing along that line, and repeating on independent random lines
-# extends it to the whole family (a nonzero polynomial cannot vanish on a
-# Zariski-dense set of lines).
-#
-# This is the honest strength of the result: it is exact up to floating point,
-# in the same sense as the dark-subspace certificate, whose residuals sit at
-# ~1e-14. It is NOT the moment-SOS / Positivstellensatz route the doc's Move 3
-# proposes — that would need the solution basis itself in exact arithmetic,
-# and this basis comes from an SVD. What is gained over sampling the spectral
-# abscissa is the quantifier: "this polynomial is identically zero" covers the
-# continuum, where "400 sampled points were all marginal" does not.
-#
-# Scale, twice over. A(alpha) is divided by ||A(alpha)|| before the
-# characteristic polynomial is taken, so the coefficients do not depend on
-# where on the line the sample sits; and the minor itself is reported
-# relative to its Hadamard bound, because the minors of a perfectly stable
-# matrix are themselves minute (see _hurwitz_minors). Skip either and the
-# test condemns every graph, valid ones included — which is exactly what the
-# first version of this function did.
-def move3_invalid_certificate(triu_array, V: np.ndarray, num_modes: int,
-                               aux_ids: List[int], coupled_drains: bool = False,
-                               n_lines: int = 8, rtol: float = 1e-9,
-                               seed: int = 0) -> Optional[Dict]:
-    basis = solution_set_drift_basis(triu_array, V, num_modes, aux_ids,
-                                      coupled_drains=coupled_drains)
-    As, m, n = basis['A_basis'], basis['nullspace'].shape[1], basis['dim']
-    if m == 0:
-        return None
-    rng = np.random.default_rng(seed)
-
-    def minors_at(alpha):
-        A = sum(alpha[j] * As[j] for j in range(m))
-        nrm = float(np.linalg.norm(A))
-        if nrm < 1e-300:
-            return None, 0.0
-        a = np.real(np.poly(A / nrm))[1:]          # normalised: scale-free
-        return _hurwitz_minors(a), 1.0
-
-    vanishing = [True] * n
-    worst = [0.0] * n
-    for _ in range(n_lines):
-        alpha0 = rng.normal(0., 1., m)
-        u = rng.normal(0., 1., m)
-        for k in range(1, n + 1):
-            if not vanishing[k - 1]:
-                continue
-            npts = n * k + 2                       # > degree bound n*k
-            for t in np.linspace(-1.0, 1.0, npts):
-                mins, _ = minors_at(alpha0 + t * u)
-                if mins is None:
-                    continue
-                val = abs(float(mins[k - 1]))
-                worst[k - 1] = max(worst[k - 1], val)
-                if val > rtol:
-                    vanishing[k - 1] = False
-                    break
-
-    for k in range(1, n + 1):
-        if vanishing[k - 1]:
-            return {'kind': 'move3_hurwitz_minor_vanishes', 'minor': k,
-                    'max_abs_over_samples': worst[k - 1],
-                    'lines': n_lines, 'degree_bound': n * k,
-                    'samples_per_line': n * k + 2,
-                    'solution_dim': int(m),
-                    'note': ('Hurwitz minor Delta_{} of the normalised characteristic '
-                              'polynomial vanishes identically on the solution set '
-                              '(checked on {} random lines at {} points each, above the '
-                              'degree bound {}), so by Routh-Hurwitz no member of the '
-                              'family is Hurwitz — the graph is impossible, and this '
-                              'holds even though the dark direction varies from point '
-                              'to point'.format(k, n_lines, n * k + 2, n * k))}
-    return None
-
-
-# move3_witness(...) -> None, or a VALID witness carrying an explicit
-# Lyapunov certificate.
-#
-# The existential side of Move 3, stated in the doc as
-#     exists (G, Upsilon) in F, exists P > 0 :  A^T P + P A < 0.
-# This is exact rather than a relaxation — a feasible point together with the
-# Lyapunov matrix that proves it stable. It is a BILINEAR matrix inequality,
-# since the product P*A couples the unknowns, so it is not one convex solve.
-#
-# But it is bilinear in a very usable way: A is LINEAR in alpha, so the
-# inequality is an LMI in P for fixed alpha, and an LMI in alpha for fixed P.
-# Alternating between the two convex problems, from many random starts, is
-# the standard treatment, and every fixed point it reports is checked
-# directly, so a returned witness is sound regardless of how it was found.
-# Failure to converge proves nothing (this half is existential), which is why
-# the invalid certificate above is run as well.
-#
-# The normalisation tr(Re Upsilon) = 1 is needed because the family is a cone:
-# without it the solver would drive alpha to zero, where the inequality is
-# trivially non-strict.
-def move3_witness(triu_array, V: np.ndarray, num_modes: int, aux_ids: List[int],
-                   coupled_drains: bool = False, n_starts: int = 8,
-                   n_iters: int = 12, seed: int = 0,
-                   margin_tol: float = MARGIN_TOL_DEFAULT) -> Optional[Dict]:
-    try:
-        import cvxpy as cp
-    except ImportError:
-        return None
-
-    basis = solution_set_drift_basis(triu_array, V, num_modes, aux_ids,
-                                      coupled_drains=coupled_drains)
-    As, N = basis['A_basis'], basis['nullspace']
-    h_basis, d_basis, dim = basis['h_basis'], basis['d_basis'], basis['dim']
-    m = N.shape[1]
-    if m == 0:
-        return None
-
-    # tr(Re Upsilon) as a linear functional of alpha, for the normalisation.
-    tr_re = np.array([float(np.trace(_assemble(N[:, j], h_basis, d_basis,
-                                                None, dim)[1].real))
-                      for j in range(m)])
-    if np.linalg.norm(tr_re) < 1e-300:
-        return None
-
-    rng = np.random.default_rng(seed)
-
-    def solve_P(A):
-        P = cp.Variable((dim, dim), symmetric=True)
-        eps = cp.Variable()
-        cons = [P >> np.eye(dim), A.T @ P + P @ A << -eps * np.eye(dim), eps <= 1e3]
-        try:
-            cp.Problem(cp.Maximize(eps), cons).solve()
-        except Exception:
-            return None, -np.inf
-        if P.value is None:
-            return None, -np.inf
-        return np.array(P.value), float(eps.value)
-
-    def solve_alpha(P):
-        al = cp.Variable(m)
-        t = cp.Variable()
-        A = sum(al[j] * As[j] for j in range(m))
-        ReY = sum(al[j] * _assemble(N[:, j], h_basis, d_basis, None, dim)[1].real
-                  for j in range(m))
-        ImY = sum(al[j] * _assemble(N[:, j], h_basis, d_basis, None, dim)[1].imag
-                  for j in range(m))
-        cons = [A.T @ P + P @ A << t * np.eye(dim),
-                cp.bmat([[ReY, -ImY], [ImY, ReY]]) >> 0,
-                tr_re @ al == 1.0]
-        try:
-            cp.Problem(cp.Minimize(t), cons).solve()
-        except Exception:
-            return None
-        return None if al.value is None else np.array(al.value)
-
-    for s in range(n_starts):
-        alpha = rng.normal(0., 1., m)
-        if abs(float(tr_re @ alpha)) < 1e-9:
-            continue
-        alpha = alpha / float(tr_re @ alpha)
-        for _ in range(n_iters):
-            A = sum(alpha[j] * As[j] for j in range(m))
-            P, eps = solve_P(A)
-            if P is None:
-                break
-            # Verify directly rather than trusting the solver's status.
-            G, Y = _assemble(N @ alpha, h_basis, d_basis, None, dim)
-            A = drift_matrix(G, Y)
-            if _is_psd(Y) and normalised_margin(A) > margin_tol:
-                Q = A.T @ P + P @ A
-                if (np.linalg.eigvalsh((P + P.T) / 2)[0] > 0 and
-                        np.linalg.eigvalsh((Q + Q.T) / 2)[-1] < 0):
-                    return {'alpha': alpha, 'G': G, 'Upsilon': Y, 'P': P,
-                            'margin': normalised_margin(A), 'start': s}
-            nxt = solve_alpha(P)
-            if nxt is None:
-                break
-            alpha = nxt
-    return None
-
-
-# move3_resolve(...): run both halves on ONE graph and return a verdict.
-#
-# Order matters only for cost: the witness search is the cheaper of the two
-# when it succeeds, and the polynomial test is the one that settles the
-# impossible cases. Either outcome is a certificate; neither firing leaves
-# the graph UNDECIDED, exactly as before.
-def move3_resolve(triu_array, V: np.ndarray, target_mode_ids: List[int],
-                   node_types: List[str], coupled_drains: bool = False,
-                   n_lines: int = 8, n_starts: int = 8, seed: int = 0) -> Dict:
-    num_modes = len(node_types)
-    aux_ids = [i for i in range(num_modes) if i not in target_mode_ids]
-
-    w = move3_witness(triu_array, V, num_modes, aux_ids,
-                       coupled_drains=coupled_drains, n_starts=n_starts, seed=seed)
-    if w is not None:
-        out = _witness(w['G'], w['Upsilon'], V, w['margin'], 'move3_bmi')
-        out['lyapunov_P'] = w['P']
-        out['path'] = 'move3_bmi'
-        return out
-
-    cert = move3_invalid_certificate(triu_array, V, num_modes, aux_ids,
-                                      coupled_drains=coupled_drains,
-                                      n_lines=n_lines, seed=seed)
-    if cert is not None:
-        return {'verdict': INVALID, 'certificate': cert, 'path': 'move3_routh'}
-
-    return {'verdict': UNDECIDED, 'path': 'move3',
-            'reason': ('Move 3 found neither a Lyapunov witness nor an identically '
-                        'vanishing Hurwitz minor; the graph survives the strongest '
-                        'test implemented')}
 
 
 # ───────────────────────────────────────────────────────────────────────────
 # the oracle
 # ───────────────────────────────────────────────────────────────────────────
 # decide(triu_array, V, target_mode_ids, node_types, ...) -> dict with
-# 'verdict' in {VALID, INVALID, UNDECIDED} plus the witness or certificate.
+# 'verdict' in {VALID, INVALID} plus the witness when there is one.
 #
 # Pipeline (doc §4):
-#   structural — the sound INVALID certificates (see structural_certificate;
-#                these REPLACE the doc's residual-based certificate, which
-#                is provably vacuous at Gamma_signal = 0).
 #   fast path  — fix vacuum baths on the drains, solve linearly for G (4A),
 #                then filter for a Hurwitz member.
 #   joint path — free Hermitian Upsilon on the auxiliary block (4B), which
 #                covers every Gaussian bath (thermal, squeezed,
 #                cross-correlated) in one linear space; filter for a member
 #                that is simultaneously PSD and Hurwitz.
-#   gap max    — §8 Move 1: before conceding UNDECIDED, stop asking whether
+#   gap max    — §8 Move 1: before conceding INVALID, stop asking whether
 #                the feasible set contains a Hurwitz point and MAXIMISE the
 #                spectral gap over it instead. Costs gap_effort x the
 #                sampling budget, but only on the graphs that would
-#                otherwise be undecided.
+#                otherwise be filed INVALID.
 #   verdict    — VALID only with a fully verified witness (residual zero,
 #                Upsilon >= 0, A Hurwitz, and the FORWARD Lyapunov solve
-#                reproducing V). Feasible-but-unwitnessed is UNDECIDED,
-#                never INVALID.
+#                reproducing V). Everything else is INVALID, including
+#                feasible-but-unwitnessed: no impossibility proof is
+#                attempted, so INVALID means "no witness found here" and
+#                the search is free to prune on it.
 def decide(
     triu_array,
     V: np.ndarray,
@@ -1859,12 +975,10 @@ def decide(
     allow_phases: bool = True,
     coupled_drains: bool = False,
     joint: bool = True,
-    use_sdp: bool = False,
     num_samples: int = 32,
     seed: Optional[int] = None,
     rtol: float = RESIDUAL_RTOL_DEFAULT,
     margin_tol: float = MARGIN_TOL_DEFAULT,
-    include_solution_set: bool = True,
     gap_effort: int = 8,
 ) -> Dict:
     num_modes = len(node_types)
@@ -1884,16 +998,6 @@ def decide(
     out = {'triu': np.asarray(triu_array), 'n_hamiltonian_dof': len(h_basis),
            'seed': seed, 'path': None}
 
-    # ---- structural certificates: the sound INVALID verdicts --------------
-    cert = structural_certificate(triu_array, V, target_mode_ids, node_types,
-                                   coupled_drains=coupled_drains,
-                                   include_solution_set=include_solution_set)
-    if cert is not None:
-        out['verdict'] = INVALID
-        out['certificate'] = cert
-        out['path'] = 'structural'
-        return out
-
     # ---- fast path (§4A): fixed vacuum drains, solve for G alone ----------
     Y_vac = vacuum_dissipation(aux_node_ids, num_modes, rate=1.0)
     sol_fast = solve_stationarity(V, h_basis, None, Y_vac, rtol=rtol)
@@ -1909,21 +1013,20 @@ def decide(
             return out
 
     if not joint:
-        # Without the joint path a nonzero residual only rules out THIS
-        # dissipator structure, so the honest verdict is undecided.
-        out['verdict'] = UNDECIDED
-        out['reason'] = ('no attractive solution with fixed vacuum drains; '
-                          'joint=False so the graph itself was not decided')
+        # Without the joint path only THIS dissipator structure was tried.
+        out['verdict'] = INVALID
+        out['reason'] = ('no attractive solution with fixed vacuum drains, and '
+                          'joint=False so no other dissipator was tried')
         return out
 
     # ---- joint path (§4B): free Hermitian Upsilon on the aux block --------
     d_basis = dissipation_basis(aux_node_ids, num_modes, coupled_drains=coupled_drains)
     out['n_dissipation_dof'] = len(d_basis)
     # NOTE this system is HOMOGENEOUS (b = 0), so z = 0 always solves it and
-    # sol['residual'] is identically zero — see structural_certificate's
-    # header. It is recorded for diagnostics only and must never be read as
-    # a verdict. The information is entirely in the nullspace: the graph is
-    # valid iff that nullspace contains a PSD, Hurwitz member.
+    # sol['residual'] is identically zero. It is recorded for diagnostics
+    # only and must never be read as a verdict. The information is entirely
+    # in the nullspace: the graph is valid iff that nullspace contains a
+    # PSD, Hurwitz member.
     sol = solve_stationarity(V, h_basis, d_basis, None, rtol=rtol)
     out['residual_joint'] = sol['residual']
     out['solution_dim'] = int(sol['nullspace'].shape[1])
@@ -1937,7 +1040,7 @@ def decide(
         out.update(_witness(G, Y, V, margin, 'joint'))
         return out
 
-    # ---- §8 Move 1: gap maximisation before conceding UNDECIDED ------------
+    # ---- §8 Move 1: gap maximisation before conceding INVALID --------------
     # The cheap decision-mode filter stops at the first witness and can miss
     # a thin feasible cone entirely. The doc's Move 1 is to replace the
     # feasibility question with the OPTIMISATION
@@ -1945,10 +1048,10 @@ def decide(
     # on the grounds that a valid graph's Hurwitz members form a relatively
     # open, positive-measure subset, so a genuine interior ascent finds one
     # whenever it exists. Run at gap_effort x the sampling budget, with no
-    # early exit, and only on graphs about to be filed UNDECIDED — so the
+    # early exit, and only on graphs about to be filed INVALID — so the
     # cost lands exactly on the stratum it is meant to shrink and nowhere
-    # else. gamma* > 0 is a sound VALID witness; gamma* = 0 still proves
-    # nothing (Move 1 attacks the VALID side only).
+    # else. gamma* > 0 is a sound VALID witness; gamma* = 0 proves nothing
+    # (Move 1 attacks the VALID side only) and the graph is filed INVALID.
     if gap_effort and gap_effort > 0 and sol['nullspace'].shape[1] > 0:
         # Budget split: samples scale with gap_effort (each costs one
         # eigenvalue decomposition) while the Nelder-Mead restarts, which are
@@ -1967,25 +1070,15 @@ def decide(
             out.update(_witness(G, Y, V, margin, 'joint_gap_max'))
             return out
 
-    if use_sdp:
-        status, G, Y = sdp_feasibility(V, h_basis, d_basis)
-        out['sdp_status'] = status
-        if status == 'infeasible':
-            out['verdict'] = INVALID
-            out['certificate'] = {'kind': 'sdp_dual', 'note':
-                                   'SDP feasibility program infeasible (§4B)'}
-            return out
-
-    # Solutions exist but none of them was shown to be attractive. NOT
-    # invalid — the search must not prune on this (§4C).
-    # Feasible, no Hurwitz member found, no impossibility certificate: §4C's
-    # third outcome. The true category exists — the graph objectively either
-    # has a Hurwitz member or does not — but the procedure has not computed
-    # it, so it must NOT be pruned on (§4C, §5(i)).
-    out['verdict'] = UNDECIDED
+    # Stationary solutions exist but none of them was shown to be attractive.
+    # Filed INVALID, and pruned on. This is where completeness is traded for
+    # simplicity: the graph objectively either has a Hurwitz member or does
+    # not, and this procedure has not decided which. Raising
+    # gap_effort/num_samples shrinks the stratum where the two differ.
+    out['verdict'] = INVALID
     out['reason'] = ('feasible (stationary solutions exist) but no strictly Hurwitz, '
-                      'PSD member was found and no universal certificate applies; '
-                      'raise gap_effort/num_samples, or decide it with §8 Move 3')
+                      'PSD member was found; raise gap_effort/num_samples if a '
+                      'scheme is expected here')
     out['best_margin'] = margin
     return out
 
@@ -2002,8 +1095,9 @@ def decide(
 # the solution sits at r_aux = r, and the solution-space dimension jumps
 # sharply there (numerically: dim 3 -> 5 at exactly r_aux = r for the
 # two-mode-squeezed target on the Vitali triangle). Verdicts are pointwise
-# in the grid: a hit is a genuine VALID witness, but a grid-wide miss is
-# UNDECIDED, never INVALID, since the grid proves nothing between points.
+# in the grid: a hit is a genuine VALID witness; a grid-wide miss is
+# reported as INVALID, but note it says nothing about the drain states
+# BETWEEN grid points.
 #
 # MULTIPLE DRAINS. The default grid is the SHARED-squeezing slice — every
 # drain given the same (r, theta) — because an independent per-drain grid
@@ -2056,8 +1150,9 @@ def scan_aux_squeezing(
             return out
         if best is None or out.get('best_margin', -np.inf) > best.get('best_margin', -np.inf):
             best = out
-    # A grid-wide miss decides nothing between grid points.
-    best['verdict'] = UNDECIDED if best['verdict'] != INVALID else INVALID
+    # A grid-wide miss. Nothing was found anywhere on the grid, so INVALID —
+    # which is a statement about the grid, not about every drain state.
+    best['verdict'] = INVALID
     return best
 
 
@@ -2123,11 +1218,6 @@ def optimise_aux_state(
     # in `objective` below is what drives r to 0 when no squeezing is
     # needed. Both give the same answer — the flag only trades a little
     # compute for having one fewer hand-written rule in the loop.
-    # The solution-set certificate is FRAME-DEPENDENT, and this function
-    # ranges over drain states, so it must not be allowed to stamp a
-    # graph-level INVALID. Only the frame-independent structural
-    # certificates (connectivity) may do that here.
-    decide_kwargs = dict(decide_kwargs, include_solution_set=False)
     V_vac = complete_covariance(sigma_target, target_mode_ids, num_modes)
     out_vac = decide(triu_array, V_vac, target_mode_ids, node_types, **decide_kwargs)
     if prefer_vacuum and out_vac['verdict'] == VALID:

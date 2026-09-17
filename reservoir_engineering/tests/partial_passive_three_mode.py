@@ -16,8 +16,8 @@ Two facts make this the interesting question for this target:
     other, so every anomalous resource must be imported through the drains.
 
 The result below is that those two together are expensive: FREE, one drain
-suffices; under partial passivity one and two drains are INVALID with a
-certificate, and THREE drains are needed. The scheme is then sparsified
+suffices; under partial passivity one and two drains come back INVALID, and
+THREE drains are needed. The scheme is then sparsified
 greedily, so what is reported is a small graph rather than the complete one.
 
 Frame note. The constraint is not a gauge artefact of the unsqueezed-drain
@@ -116,11 +116,11 @@ def full_graph(n, with_parametric=True):
                      for i in range(n) for j in range(i, n)])
 
 
-# audit_solution_set: an independent check on an INVALID verdict. The
-# certificate says NO member of the constrained solution set is Hurwitz;
-# sampling it cannot prove that, but a max margin at 1e-17 over tens of
-# thousands of draws is what the claim predicts, and a single positive draw
-# would refute it.
+# audit_solution_set: an independent check on an INVALID verdict, and the
+# only evidence there is now that the oracle's INVALID carries no proof. It
+# samples the constrained solution set directly: a max margin at 1e-17 over
+# tens of thousands of draws is what a genuinely impossible graph looks
+# like, and a single positive draw would refute the verdict.
 def audit_solution_set(triu, V, ctx, cset, n_draws=20000, seed=0):
     _, h, d = sc.constrained_bases(triu, ctx, cset)
     sol = solve_stationarity(V, h, d, None)
@@ -179,12 +179,12 @@ def report_scheme(triu, info, n, node_types, target_mode_ids, label=''):
 # sparsify(triu, ...): greedy edge removal, keeping only what the verdict
 # needs.
 #
-# The full lattice at six modes is 2^6 * 4^15 graphs, so the certified BFS is
-# out of reach here; greedy removal is not a minimality PROOF (it finds a
-# locally minimal graph, not necessarily a globally minimal one) but every
-# graph it reports is decided by the same oracle, so the scheme itself is as
-# sound as any other. Downgrades are cheap because only VALID matters: the
-# expensive INVALID certificates are switched off inside the loop.
+# The full lattice at six modes is 2^6 * 4^15 graphs, so a full BFS is out of
+# reach here; greedy removal is not a minimality proof (it finds a locally
+# minimal graph, not necessarily a globally minimal one) but every graph it
+# reports is decided by the same oracle, so the scheme itself is as sound as
+# any other. Downgrades are cheap because only VALID matters, so the loop
+# runs at a low gap_effort.
 def sparsify(triu, V, target_mode_ids, node_types, constraints, order=None):
     n = len(node_types)
     cur = np.array(triu, dtype=int, copy=True)
@@ -201,8 +201,7 @@ def sparsify(triu, V, target_mode_ids, node_types, constraints, order=None):
                 trial[k] = cand
                 out = sc.constrained_decide(trial, V, target_mode_ids, node_types,
                                             constraints=constraints,
-                                            include_solution_set=False,
-                                            use_routh=False, gap_effort=2)
+                                            gap_effort=2)
                 if out['verdict'] == VALID:
                     cur = trial
                     changed = True
@@ -258,10 +257,9 @@ def main():
               f'path {info["path"]}   [{time.time() - t0:.1f}s]')
 
         if info['verdict'] != VALID:
-            cert = info.get('certificate', {})
-            print(f'    certificate: {cert.get("kind")}')
-            if 'note' in cert:
-                print('    ' + cert['note'])
+            print(f'    path: {info["path"]}')
+            if 'reason' in info:
+                print('    ' + info['reason'])
             aud = audit_solution_set(root, V, ctx, cset)
             print(f'    audit: constrained solution set has dim '
                   f'{aud["nullspace"]} (dof_G {aud.get("dof_G")}, '

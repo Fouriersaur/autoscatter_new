@@ -2,7 +2,7 @@
 cayley_cluster_certified.py
 ===========================
 The four-mode Cayley cluster state on the path graph P4 (1-2-3-4), searched
-with the CERTIFYING oracle (linear_oracle.py) instead of gradient descent.
+with the linear oracle (linear_oracle.py) instead of gradient descent.
 
 This is cayley_cluster_rediscovery.py's problem, done as a real search.
 That file had to give up on the search and hand-pick six topologies:
@@ -19,24 +19,24 @@ Two things changed, and together they put a genuine search back in reach:
 
   1. The oracle is one SVD plus an eigenvalue check, not 30 restarts of
      L-BFGS-B around a Lyapunov solve. Milliseconds, not seconds.
-  2. The structural certificates prune before any linear algebra runs. For
-     THIS target they are unusually strong: every pair of signal modes is
+  2. A connectivity pre-filter prunes before any linear algebra runs. For
+     THIS target it is unusually strong: every pair of signal modes is
      correlated in the Cayley covariance (verified below, all six
      cross-blocks nonzero), so any graph leaving the five nodes in more
-     than one connected component is INVALID by the correlation-across-a-
-     cut argument -- disconnected components have independent baths and no
-     coupling, so their steady state factorises and cannot carry the
-     required correlation. That kills 81% of graphs at complexity 4 and
-     ~78% overall, with no numerics at all.
+     than one connected component cannot work -- disconnected components
+     have independent baths and no coupling, so their steady state
+     factorises and cannot carry the required correlation. That kills 81%
+     of graphs at complexity 4 and ~78% overall, with no numerics at all.
+     Unlike the oracle's own INVALID, this one IS an exact argument.
 
 What is searched, and what the answer means. The search walks complexity
 levels low to high (as covariance_optimizer's BFS does) and reports the
 IRREDUCIBLE valid graphs -- ones no valid subgraph is contained in. Within
-the complexity budget the claim is a real minimality claim, not the curated
-file's "these six work". Beyond the budget nothing is claimed: unreached
-levels are simply unexplored, and UNDECIDED graphs inside the budget are
-reported separately since the oracle declined to decide them (it never
-guesses -- an UNDECIDED is not an invalid).
+the complexity budget that is minimality with respect to WHAT THE ORACLE
+FOUND, which is stronger than the curated file's "these six work" but is not
+a proof: an INVALID from the oracle means no witness was found, not that
+none exists. Beyond the budget nothing is claimed at all -- unreached levels
+are simply unexplored.
 
 Convention note. The target is built by cayley_cluster_rediscovery's own
 constructor, so the xxpp -> xpxp reordering and the vacuum = I -> I/2
@@ -69,9 +69,9 @@ _ALPHABET = [([lo.NO_COUPLING, 3] if i == j else [0, 1, 2, 4])
 
 
 # Cheap pre-filter, run before any linear algebra: is the graph connected?
-# For this target that is exactly the structural certificate — every signal
-# pair is correlated, so all five nodes must share one component (the four
-# signal modes to carry the correlations, the drain to damp them).
+# For this target that is an exact argument — every signal pair is
+# correlated, so all five nodes must share one component (the four signal
+# modes to carry the correlations, the drain to damp them).
 def _connected(triu) -> bool:
     adj = [[] for _ in range(N_NODES)]
     for k, (i, j) in enumerate(zip(_ROWS, _COLS)):
@@ -123,15 +123,15 @@ def readout(info, num_modes: int, triu) -> dict:
     return {'couplings': couplings, 'drains': drains}
 
 
-# Layered certified search. Walks complexity levels low -> high; at each
-# level the structural pre-filter runs first, then the oracle on survivors.
+# Layered search. Walks complexity levels low -> high; at each level the
+# connectivity pre-filter runs first, then the oracle on survivors.
 #
 # Graphs containing an already-valid graph are skipped: they are valid by
 # upward propagation and cannot be irreducible, so the level counts below
 # report what was actually DECIDED, not the full lattice.
 def layered_search(V, max_complexity: int, num_samples: int = 24,
                     time_budget: float = None, verbose: bool = True):
-    valid, undecided = [], []
+    valid = []
     n_invalid_structural = n_invalid_oracle = n_skipped_super = 0
     stats = []
     t_start = time.time()
@@ -158,13 +158,9 @@ def layered_search(V, max_complexity: int, num_samples: int = 24,
             n_tested += 1
             if res['verdict'] == lo.VALID:
                 valid.append(triu)
-                undecided_entry = dict(res)
-                undecided_entry['triu'] = triu
                 n_valid_here += 1
-            elif res['verdict'] == lo.INVALID:
-                n_invalid_oracle += 1
             else:
-                undecided.append(triu)
+                n_invalid_oracle += 1
         stats.append({'complexity': c, 'candidates': len(by_level[c]),
                       'tested': n_tested, 'valid': n_valid_here,
                       'seconds': time.time() - t0})
@@ -178,7 +174,7 @@ def layered_search(V, max_complexity: int, num_samples: int = 24,
                 print(f'  [time budget {time_budget:.0f}s reached at complexity {c}]')
             break
 
-    return {'valid': valid, 'undecided': undecided, 'stats': stats,
+    return {'valid': valid, 'stats': stats,
             'invalid_structural': n_invalid_structural,
             'invalid_oracle': n_invalid_oracle,
             'skipped_supergraph': n_skipped_super,
@@ -205,13 +201,12 @@ def layered_search(V, max_complexity: int, num_samples: int = 24,
 # genuinely distinct schemes rather than one repeated answer.
 #
 # WHAT "IRREDUCIBLE" MEANS HERE, precisely. A descent stops when no
-# prune-neighbour was SHOWN valid. Because the oracle is three-valued, that
-# is weaker than true minimality: a neighbour returning UNDECIDED is not
-# known to be invalid, so it might be a valid simpler scheme the oracle
-# merely declined to decide. Endpoints are therefore locally irreducible
-# with respect to what the oracle could prove, and the honest claim is
-# "no simpler scheme was found", not "none exists". The layered search is
-# what supplies the other half — a certified lower bound.
+# prune-neighbour was SHOWN valid. That is weaker than true minimality: a
+# neighbour is INVALID only in the sense that the oracle found no witness
+# for it, so it might be a simpler scheme whose Hurwitz cone the filter
+# missed. Endpoints are locally irreducible with respect to what the oracle
+# found, and the honest claim is "no simpler scheme was found", not "none
+# exists".
 def descent_search(V, n_starts: int = 120, num_samples: int = 24, seed: int = 0,
                     verbose: bool = True):
     from reservoir_engineering.certified_search import _neighbours
@@ -275,12 +270,12 @@ def print_report(z, target, checks, out, curated=None):
     print(f'  max |eig - e^(±2z)/2|    : {checks["eig_max_dev"]:.3e}   -> flat BM spectrum')
     print(f'  nullifier variances      : {np.array2string(checks["nullifiers"], precision=5)}\n')
 
-    print('Signal-mode cross-correlations in the target (drives the cut certificate):')
+    print('Signal-mode cross-correlations in the target (drives the cut argument):')
     for a in range(4):
         row = [f'{np.linalg.norm(target[2*a:2*a+2, 2*b:2*b+2]):.3f}' for b in range(4)]
         print('   ' + '  '.join(row))
     print('  all off-diagonal entries nonzero -> every signal pair must share a')
-    print('  connected component, so any disconnected graph is INVALID by certificate.\n')
+    print('  connected component, so any disconnected graph is INVALID.\n')
 
     tot = 4 ** 10 * 2 ** 5
     reached = max(s['complexity'] for s in out['stats']) if out['stats'] else -1
@@ -290,20 +285,19 @@ def print_report(z, target, checks, out, curated=None):
     print(f'  complexity levels searched : 0..{reached}'
           + (f'  [stopped early at {out["stopped_early"]}]' if out['stopped_early'] is not None else ''))
     print(f'  graphs in those levels     : {n_cand:,}')
-    print(f'  killed by structural cert. : {out["invalid_structural"]:,} '
+    print(f'  killed by connectivity     : {out["invalid_structural"]:,} '
           f'({100 * out["invalid_structural"] / max(n_cand, 1):.1f}%, no numerics)')
     print(f'  skipped as supergraph of a valid : {out["skipped_supergraph"]:,}')
     print(f'  oracle calls               : {n_test:,}')
-    print(f'  INVALID by oracle          : {out["invalid_oracle"]:,}')
-    print(f'  UNDECIDED                  : {len(out["undecided"]):,}   (not invalid — oracle declined)')
+    print(f'  INVALID by oracle          : {out["invalid_oracle"]:,}   (no witness found)')
     print(f'  VALID                      : {len(out["valid"]):,}')
     print(f'  wall time                  : {out["elapsed"]:.1f}s\n')
 
     irr = irreducible(out['valid'])
     if not irr:
         print(f'No valid scheme at complexity <= {reached}.')
-        print('That is NOT a proof none exists: it means every graph in these levels was')
-        print('either certified invalid or left UNDECIDED. Raise the complexity budget.')
+        print('That is NOT a proof none exists: it means no witness was found for any')
+        print('graph in these levels. Raise the complexity budget or num_samples.')
     else:
         print(f'{len(irr)} IRREDUCIBLE valid scheme(s) found — minimal within the budget:\n')
         V_full = lo.complete_covariance(target, TARGET_MODE_IDS, N_NODES)
@@ -441,11 +435,11 @@ if __name__ == '__main__':
     checks = validate_target(target, ADJACENCY_P4, z)
     V = lo.complete_covariance(target, TARGET_MODE_IDS, N_NODES)
 
-    # Phase 1 — layered sweep from below: certifies a LOWER BOUND on the
-    # complexity of any scheme. Affordable only for small complexity, which
-    # is fine: that is exactly where a lower bound is wanted.
+    # Phase 1 — layered sweep from below: an empirical LOWER BOUND on the
+    # complexity of any scheme the oracle can find. Affordable only for small
+    # complexity, which is fine: that is exactly where a bound is wanted.
     print(f'Certified search: Cayley cluster on P4, z={z}')
-    print(f'\nPhase 1 — layered sweep, complexity <= {max_c} (certifies a lower bound)')
+    print(f'\nPhase 1 — layered sweep, complexity <= {max_c} (empirical lower bound)')
     out = layered_search(V, max_c, num_samples=24, time_budget=budget)
 
     # Phase 2 — multi-start descent from the lattice maximum: FINDS schemes.

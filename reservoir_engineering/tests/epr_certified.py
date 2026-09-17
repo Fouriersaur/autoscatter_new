@@ -22,8 +22,8 @@ requires, with nothing told to the search about which frame to look in.
 Reading the output:
   reservoir = vacuum    the graph works with an unsqueezed drain
   reservoir = squeezed  the drain must be squeezed, and r* says by how much
-  reservoir = none      no drain state makes this graph work (or the
-                        attractivity search declined — see UNDECIDED)
+  reservoir = none      no drain state was found that makes this graph
+                        work (which is not a proof that none exists)
 
 Usage:
     python3 epr_certified.py          # r = 0.5
@@ -60,9 +60,9 @@ VITALI_TRIU = (0, 1, 1, 0, 1, 0)
 #                  shrink the solution set, so no Hurwitz member appears)
 #     VALID    =>  every SUPERgraph is VALID   (the witness embeds unchanged,
 #                  drain state included)
-#     UNDECIDED => implies nothing, propagates nowhere
-# Both directions stay sound with auto_reservoir on, since the drain state
-# travels as part of the witness.
+# The VALID direction is sound; the INVALID one is a heuristic, since INVALID
+# only means no witness was found. Both survive auto_reservoir, since the
+# drain state travels as part of the witness.
 def sweep(target, num_samples: int = 32, propagate: bool = True):
     t0 = time.time()
     out = sweep_all(target, TARGET_MODE_IDS, NODE_TYPES,
@@ -128,18 +128,9 @@ def report(r, target, sweep_out, elapsed):
     n_tot = sweep_out['num_graphs']
     print(f'\nSubgraph propagation: {n_call} oracle calls for {n_tot} graphs '
           f'({100 * (1 - n_call / n_tot):.0f}% skipped).')
-    print('  INVALID settles every subgraph, VALID settles every supergraph,')
-    print('  UNDECIDED settles nothing — which is why the saving is modest here:')
-    print(f'  {counts.get(lo.UNDECIDED, 0)} of {n_tot} graphs carry a verdict that cannot propagate.')
-
-    # §8 Move 4: of the undecided graphs, only those sitting one edge below a
-    # valid one actually obstruct the answer — they are where the search
-    # cannot tell whether a simpler scheme exists. The rest are interior and
-    # cost nothing, so this number, not the raw undecided count, is the size
-    # of the remaining problem.
-    frontier = sweep_out.get('frontier_undecided', [])
-    print(f'  of those, {len(frontier)} sit one edge below a VALID graph and so')
-    print('  genuinely block a minimality claim (§8 Move 4); the rest are interior.')
+    print('  INVALID settles every subgraph, VALID settles every supergraph.')
+    print('  INVALID is not a proof, so the pruning it does is a heuristic: a')
+    print('  scheme whose Hurwitz cone the filter missed takes its down-set with it.')
 
     # The VALID count above is a count of GRAPHS, not of reservoir classes:
     # most of those graphs were settled by propagation, which carries a

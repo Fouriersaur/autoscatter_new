@@ -17,13 +17,12 @@ The pipeline, §5 end to end:
            can stabilise the target. If IT cannot, no subgraph can, so the
            mode count must go up.
 
-  Phase 1  Bidirectional certified search on that mode count. Prune from
-           the lattice maximum, grow from the empty graph, with verdicts
-           propagating: INVALID settles every subgraph, VALID settles every
-           supergraph, UNDECIDED settles nothing. §5(iii) then requires the
-           two directions to imply the SAME partition — a deterministic
-           oracle cannot depend on traversal order, so a disagreement is an
-           implementation bug, not a lost scheme.
+  Phase 1  Bidirectional search on that mode count. Prune from the lattice
+           maximum, grow from the empty graph, with verdicts propagating:
+           INVALID settles every subgraph, VALID settles every supergraph.
+           §5(iii) compares what the two directions imply; they usually
+           agree, but since INVALID is not a proof a disagreement can also
+           be the attractivity filter rather than a bug.
 
   Phase 2  Report. Each surviving scheme is reduced to the edges its
            witness actually uses (§5 graph reduction), the reservoir is
@@ -36,10 +35,10 @@ What the oracle decides per graph, with nothing assumed:
     much — from optimise_aux_state, and cross-checked by factoring Upsilon;
   - how many dissipative channels the scheme needs, from rank(Upsilon).
 
-Verdicts are three-valued. VALID carries an explicit witness, INVALID a
-certificate, and UNDECIDED means the oracle declined — it is never treated
-as invalid and never prunes anything. So "no simpler scheme was found" is
-the claim being made, not "none exists"; only the INVALID set is proven.
+Verdicts are two-valued. VALID carries an explicit, independently verified
+witness; INVALID means no such witness was found, which is not the same as
+impossible. The search prunes on it anyway, so the claim being made is "no
+simpler scheme was found", never "none exists".
 
 Usage:
     python3 discover_two_mode_squeezed.py            # r = 0.5
@@ -203,12 +202,12 @@ def main(r=0.5, quick=False, num_samples=24):
     print(f'  wall time                  {elapsed:.0f}s')
     if agree is not None:
         print(f'  §5(iii) bidirectional agreement: {agree}'
-              + ('' if agree else '   <-- IMPLEMENTATION BUG, not a lost scheme'))
+              + ('' if agree else '   <-- the two passes differ; see run_bidirectional'))
 
     from collections import Counter
     counts = Counter(v['verdict'] for v in search.cache.values())
     print(f'  verdicts among graphs actually decided: {dict(counts)}')
-    print('  (UNDECIDED is not "invalid" — the oracle declined, and it prunes nothing)')
+    print('  (INVALID = no witness found, which is not a proof of impossibility)')
 
     # ---- Phase 2: report ------------------------------------------------
     print(f'\n{"=" * 76}')
@@ -276,58 +275,35 @@ def main(r=0.5, quick=False, num_samples=24):
               f'graphs in the lattice are valid')
         print('  (every valid graph contains an irreducible one as a subgraph —')
         print('   the extras are the same schemes with redundant edges added)')
-        # ---- Phase 3: §8 Move 4 — what is actually still open ------------
+        # ---- Phase 3: how far the minimality claim reaches ---------------
         #
-        # "N irreducible schemes" is only a complete answer if the lattice
-        # is fully decided. Where it is not, the claim must be qualified
-        # PRECISELY, and the qualification is much narrower than the raw
-        # UNDECIDED count: a graph left undecided in the interior of the
-        # invalid region blocks nothing, because nothing is trying to
-        # descend through it. What blocks the answer is an undecided graph
-        # sitting one edge BELOW a valid one — there the search cannot tell
-        # whether a simpler scheme exists. Those, and only those, are where
-        # an exact backstop (Move 3) would have to run.
+        # "N irreducible schemes" is a claim about what this search FOUND.
+        # Every graph in the lattice carries a verdict (INVALID is the
+        # default for anything no witness was found for), so the partition
+        # below is complete — but its INVALID side is only as good as the
+        # attractivity filter that produced it.
         verdicts = search.lattice_verdicts()
         from collections import Counter as _C
         tally = _C(verdicts.values())
-        frontier = search.frontier_undecided(verdicts)
         print(f'\n{"-" * 76}')
-        print('Lattice status (§4C three-way verdict, closed under propagation):')
-        for k in (lo.VALID, lo.INVALID, lo.UNDECIDED):
+        print('Lattice status (closed under propagation):')
+        for k in (lo.VALID, lo.INVALID):
             print(f'  {k:10s} {tally.get(k, 0):5d}')
-        print(f'\n§8 Move 4 — undecided graphs that actually OBSTRUCT the answer')
-        print(f'  (one edge below a valid graph): {len(frontier)} of '
-              f'{tally.get(lo.UNDECIDED, 0)} undecided')
 
         status = _C()
         for triu, _ in rows:
-            status[search.certify_irreducible(triu, verdicts)['status']] += 1
-        print(f'\nIrreducibility of the {len(rows)} reported schemes:')
-        print(f'  certified irreducible (every one-edge deletion proven INVALID) '
-              f'{status["irreducible"]}')
-        print(f'  minimality UNPROVEN (some deletion is undecided)              '
-              f'{status["unresolved"]}')
+            status[search.is_minimal(triu, verdicts)['status']] += 1
+        print(f'\nMinimality of the {len(rows)} reported schemes:')
+        print(f'  minimal (no one-edge deletion was found valid)               '
+              f'{status["minimal"]}')
         # 'reducible' is not a contradiction here: minimality was taken
         # WITHIN a reservoir class, so a vacuum-drain scheme is kept even
         # when a subgraph of it is valid with a squeezed drain. Neither
         # dominates — one trades couplings for not needing a squeezed source.
         print(f'  has a valid subgraph in the OTHER reservoir class            '
               f'{status["reducible"]}')
-        if status['unresolved']:
-            print('  -> for those, a simpler scheme may exist; the oracle has not')
-            print('     ruled it out. Move 3 is what decides them.')
-        if frontier:
-            # Move 3 quantifies over the solution set at ONE V, so it is a
-            # graph-level statement only in a fixed frame. This search ranges
-            # over drain states, so it cannot be applied here — rerun in the
-            # vacuum gauge (auto_reservoir=False) to resolve the frontier.
-            print('\n  Move 3 not applied: this run searches the drain state, and a')
-            print('  solution-set argument at one drain state is not a graph verdict.')
-            print('  Rerun with auto_reservoir=False to clear the frontier.')
-        if not tally.get(lo.UNDECIDED, 0):
-            print('\nThe lattice is FULLY DECIDED: every graph is VALID or INVALID')
-            print('by certificate, so this irreducible set is complete, not partial.')
-
+        print('\n  "Minimal" here means no simpler scheme was found, not that none')
+        print('  exists. Raise gap_effort/num_samples to tighten it.')
 
 if __name__ == '__main__':
     args = [a for a in sys.argv[1:] if not a.startswith('--')]

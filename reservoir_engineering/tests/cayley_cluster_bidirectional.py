@@ -19,9 +19,10 @@ frontier (certified_search.run):
            INVALID it stops, and the whole down-set is invalid unvisited.
     grow   ascends from the empty graph through invalid territory; on VALID
            it stops, and the whole up-set is valid unvisited.
-UNDECIDED propagates nothing in either direction, so both passes step past it
-instead of pruning — which is what keeps a failed attractivity search from
-poisoning a whole down-set.
+Note what that costs: INVALID means only that no witness was found, so a
+graph whose Hurwitz cone the attractivity filter missed takes its whole
+down-set with it. The result is minimal-ENOUGH schemes, not a certified
+irreducible set.
 
 It also files the REDUCED witness (reduce_witness): the edges the solution
 actually uses, not the edges the tested graph allowed. That enlarges the valid
@@ -29,10 +30,10 @@ up-set and so strengthens the pruning, and it is the reason the answer here is
 "schemes that cannot be further reduced" rather than "graphs that happened to
 be tested".
 
-run_bidirectional then asserts the two passes never CONTRADICT — no graph
-VALID in one and INVALID in the other. That is a soundness check on the
-propagation, not a completeness proof; the passes are expected to differ in
-UNDECIDED coverage (see certified_search.closure_partition).
+run_bidirectional then compares what the two passes imply. Agreement is a
+good sign and a disagreement is worth a look, but it is a diagnostic rather
+than an assertion: pruning on an unproven INVALID is direction-dependent, so
+the passes can legitimately differ (see certified_search.closure_partition).
 
 Budget guard
 ------------
@@ -43,9 +44,8 @@ the oracle with a counter and a wall-clock deadline that raises, so a pass
 that overruns yields PARTIAL results instead of nothing.
 
 A truncated pass changes what may be claimed, and the report says so: the
-minimal-valid set is then "minimal among what was reached", and the certified
-lower bound is lost. Only a pass that ran to exhaustion supports the strong
-claim.
+minimal-valid set is then "minimal among what was reached". Only a pass that
+ran to exhaustion supports even the weaker claim.
 
 Usage:
     python3 cayley_cluster_bidirectional.py                  # z=0.6, 1800s/pass
@@ -91,7 +91,7 @@ class Budgeted(CertifiedSearch):
         self._tag = tag
         self._t0 = time.time()
         if not hasattr(self, 'found_valid'):
-            self.found_valid, self.found_invalid, self.found_undecided = [], [], []
+            self.found_valid, self.found_invalid = [], []
 
     # Lift the guard once the traversals are done. The deadline must not apply
     # to the REPORTING calls that follow — reduce_witness and the per-scheme
@@ -112,14 +112,11 @@ class Budgeted(CertifiedSearch):
             t = np.asarray(triu)
             if info['verdict'] == lo.VALID:
                 self.found_valid.append(t)
-            elif info['verdict'] == lo.INVALID:
-                self.found_invalid.append(t)
             else:
-                self.found_undecided.append(t)
+                self.found_invalid.append(t)
             if self._calls % 200 == 0:
                 print(f'    [{self._tag}] {self._calls} calls, '
-                      f'{len(self.found_valid)}V / {len(self.found_invalid)}I / '
-                      f'{len(self.found_undecided)}U, '
+                      f'{len(self.found_valid)}V / {len(self.found_invalid)}I, '
                       f'{time.time() - self._t0:.0f}s', flush=True)
         return info
 
@@ -135,8 +132,7 @@ def _save(search, tag):
         np.savez_compressed(
             STATE_PATH,
             valid=np.array(search.found_valid, dtype=int).reshape(-1, 15),
-            invalid=np.array(search.found_invalid, dtype=int).reshape(-1, 15),
-            undecided=np.array(search.found_undecided, dtype=int).reshape(-1, 15))
+            invalid=np.array(search.found_invalid, dtype=int).reshape(-1, 15))
         print(f'    [state saved {tag}: {STATE_PATH}]', flush=True)
     except Exception as e:                      # never let saving kill a run
         print(f'    [state save failed ({tag}): {e}]', flush=True)
@@ -149,14 +145,12 @@ def guarded_pass(search, direction, seconds):
     try:
         res = search.run(direction)
         print(f'    {direction} COMPLETED: visited {res["visited"]}, '
-              f'valid {len(res["valid"])}, invalid {len(res["invalid"])}, '
-              f'undecided {len(res["undecided"])}', flush=True)
+              f'valid {len(res["valid"])}, invalid {len(res["invalid"])}', flush=True)
         return res, True
     except TimeoutError as e:
         print(f'    {direction} TRUNCATED: {e}', flush=True)
         print(f'    partial: {len(search.found_valid)} valid, '
-              f'{len(search.found_invalid)} invalid, '
-              f'{len(search.found_undecided)} undecided', flush=True)
+              f'{len(search.found_invalid)} invalid', flush=True)
         return None, False
 
 
@@ -234,10 +228,9 @@ if __name__ == '__main__':
         ptd = search.closure_partition(td)
         pbu = search.closure_partition(bu)
         disagree = [g for g in ptd if ptd[g] != pbu[g]]
-        contra = [g for g in disagree if {ptd[g], pbu[g]} == {lo.VALID, lo.INVALID}]
-        print(f'  bidirectional agreement (no VALID/INVALID contradiction): '
-              f'{not contra}   ({len(contra)} contradictions, '
-              f'{len(disagree)} differing only by UNDECIDED coverage)')
+        print(f'  the two passes imply the same partition: {not disagree}'
+              f'   ({len(disagree)} graphs differ — the attractivity filter, '
+              f'not necessarily a bug)')
 
     # minimal_valid over everything either pass filed. reduce_witness has
     # already stripped unused edges, so these are irreducible on the evidence
@@ -258,13 +251,12 @@ if __name__ == '__main__':
     print(f'  oracle verdicts cached : {len(search.cache):,}')
     print(f'  VALID     graphs found : {len(search.found_valid):,}')
     print(f'  INVALID   graphs found : {len(search.found_invalid):,}')
-    print(f'  UNDECIDED graphs found : {len(search.found_undecided):,}')
     print(f'\n{len(minimal)} VALID scheme(s) that cannot be further reduced:\n')
 
     if not (bu_done and td_done):
         print('  WARNING: at least one pass was truncated by the budget. These are')
-        print('  minimal among the graphs REACHED, and no lower bound is certified —')
-        print('  a simpler scheme may exist in the unexplored region.\n')
+        print('  minimal among the graphs REACHED — a simpler scheme may exist in')
+        print('  the unexplored region.\n')
 
     for rank, triu in enumerate(minimal, 1):
         report_scheme(rank, triu, search, target)

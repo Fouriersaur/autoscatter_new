@@ -37,10 +37,8 @@ anti-squeezes p; a Bloch-Messiah mode with the LARGE variance in x needs the
 opposite orientation, i.e. -r or equivalently theta = pi/2. Both signs are
 seeded.
 
-A grid or an optimiser proves nothing between its points, so a miss here is
-UNDECIDED and never INVALID — except where the certificate is
-frame-independent (the structural connectivity ones), which is why the scan
-runs with include_solution_set=False.
+A grid or an optimiser proves nothing between its points, so a miss here
+means "no drain state on the grid worked", not "none exists".
 """
 
 import time
@@ -60,9 +58,8 @@ MAX_AUX = 3
 CONSTRAINTS = [sc.passive_hamiltonian()]
 
 # Cheap settings for the scan: a grid point only has to answer "is there a
-# witness here?", and the expensive INVALID certificates cannot fire usefully
-# at a single drain state anyway (they are frame-dependent).
-SCAN_KW = dict(include_solution_set=False, use_routh=False, gap_effort=2)
+# witness here?".
+SCAN_KW = dict(gap_effort=2)
 
 
 # rank_drop_detector(...): the cheap signal that a drain state is SPECIAL.
@@ -210,8 +207,8 @@ def main():
 
         if hit is None:
             print('\n     no drain state found that works at this drain count '
-                  '(a scan proves nothing between its points, so this is '
-                  'UNDECIDED, not impossible)')
+                  '(a scan proves nothing between its points, so this is not '
+                  'an impossibility result)')
             continue
 
         label, aux, V, info = hit

@@ -2,7 +2,7 @@
 cayley_cluster_zv_frame.py
 ==========================
 Feed the CAYLEY CLUSTER covariance matrix of cayley_cluster_rediscovery.py to
-the certifying linear oracle, with the DRAIN SQUEEZED AT r = z — the same
+the linear oracle, with the DRAIN SQUEEZED AT r = z — the same
 squeezing the target covariance itself carries — and let the oracle discover
 which topologies stabilise it.
 
@@ -34,13 +34,13 @@ What is claimed
 ---------------
 Descent from the lattice maximum, multi-start with randomised neighbour order,
 so different starts land in different corners of the valid region. Each
-endpoint is LOCALLY IRREDUCIBLE with respect to what the oracle could prove:
-the descent stops when no prune-neighbour was SHOWN valid, and an UNDECIDED
-neighbour is not known to be invalid. So the honest claim is "no simpler
-scheme was found from here", not "none exists". No lower bound is certified in
-this frame — cayley_cluster_certified.py's Phase 1 bound is a VACUUM-frame
-bound and does not transfer, since a squeezed drain is a resource that sweep
-never had.
+endpoint is LOCALLY IRREDUCIBLE with respect to what the oracle FOUND: the
+descent stops when no prune-neighbour was shown valid, and an INVALID
+neighbour only means no witness was found for it. So the honest claim is "no
+simpler scheme was found from here", not "none exists". No lower bound is
+established in this frame either — cayley_cluster_certified.py's Phase 1
+bound is a VACUUM-frame bound and does not transfer, since a squeezed drain
+is a resource that sweep never had.
 
 Usage:
     python3 cayley_cluster_zv_frame.py              # z=0.6, 40 descent starts
@@ -96,9 +96,9 @@ def lo_describe(triu):
 # Exhaustive sweep by complexity level, IN THIS FRAME.
 #
 # Unlike the descent, this ENUMERATES: every graph up to the budget is either
-# certified INVALID, shown VALID, or filed UNDECIDED. So it yields both the
-# verdict counts and a genuine minimality claim — "no valid scheme exists
-# below complexity C" — which the descent cannot give.
+# shown VALID or filed INVALID. So it yields both the verdict counts and a
+# minimality statement — "no valid scheme was FOUND below complexity C" —
+# which the descent cannot give.
 #
 # The claim is frame-local. cayley_cluster_certified.py's Phase 1 runs the
 # same sweep with UNSQUEEZED drains and its bound does not transfer here: a
@@ -117,29 +117,27 @@ def sweep_report(V_zv, target, max_c, budget=None, num_samples=24):
           + (f', stopped early at {out["stopped_early"]}' if out['stopped_early'] is not None else '')
           + ')\n')
     print(f'  graphs in these levels          : {n_cand:,}')
-    print(f'  INVALID by structural certificate: {out["invalid_structural"]:,} '
+    print(f'  INVALID by connectivity          : {out["invalid_structural"]:,} '
           f'({100 * out["invalid_structural"] / max(n_cand, 1):.1f}%, no numerics)')
     print(f'  skipped as supergraph of a valid : {out["skipped_supergraph"]:,}')
     print(f'  oracle calls                     : {n_test:,}')
-    print(f'  INVALID by oracle                : {out["invalid_oracle"]:,}')
-    print(f'  UNDECIDED                        : {len(out["undecided"]):,}'
-          '   (NOT invalid — the oracle declined)')
+    print(f'  INVALID by oracle                : {out["invalid_oracle"]:,}'
+          '   (no witness found)')
     print(f'  VALID                            : {len(out["valid"]):,}')
     print(f'  wall time                        : {out["elapsed"]:.1f}s')
 
     irr = irreducible(out['valid'])
     if not irr:
         print(f'\nNo valid scheme at complexity <= {reached} in this frame.')
-        print('That is not a proof none exists: every graph here was either certified')
-        print('invalid or left UNDECIDED. Raise the budget.')
+        print('That is not a proof none exists: no witness was found for any graph')
+        print('here. Raise the budget.')
         return out
 
     lowest = int(np.sum(irr[0]))
     print(f'\n{len(irr)} IRREDUCIBLE valid scheme(s); lowest complexity {lowest}.')
-    print(f'Certified: NO valid scheme exists below complexity {lowest} with the drain')
-    print(f'squeezed at r = z, theta = 0 — every lower graph was certified INVALID')
-    print(f'or left UNDECIDED (see the UNDECIDED count above; those are not proven '
-          'invalid).\n')
+    print(f'No valid scheme was FOUND below complexity {lowest} with the drain')
+    print('squeezed at r = z, theta = 0. That is a statement about this search, '
+          'not a lower bound.\n')
 
     for rank, triu in enumerate(irr):
         info = lo.decide(triu, V_zv, TARGET_MODE_IDS, NODE_TYPES, num_samples=96)

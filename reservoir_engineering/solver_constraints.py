@@ -11,9 +11,7 @@ the physics menu — passivity, reality, vacuum vs squeezed reservoir,
 reciprocity, geometry masks, equivariance — is a LINEAR condition on those
 same objects, so it is not an extra test at all: it shrinks S_G / S_Upsilon
 to a subspace and the SAME single solve then runs inside it. Nothing about
-the method degrades. In particular the INVALID certificates stay sound,
-because every certificate here is of the form "no member of this affine
-family is Hurwitz", and a constraint only makes the family smaller.
+the method degrades.
 
 The three tiers of solver_constraints.md, and where each enters:
 
@@ -52,17 +50,16 @@ Typical use:
     V = complete_covariance(two_mode_squeezed(0.5), [0, 1], 3)
     cons = [sc.passive_hamiltonian(), sc.VacuumReservoir()]
     out = sc.constrained_decide(triu, V, [0, 1], ['cavity']*3, constraints=cons)
-    out['verdict']              # VALID / INVALID / UNDECIDED, under the constraints
+    out['verdict']              # VALID or INVALID, under the constraints
     out['constraint_report']    # per-constraint satisfaction of the witness
 
 and for a whole sweep, `ConstrainedSearch` is `certified_search.CertifiedSearch`
 with the constrained oracle substituted in.
 
 Soundness notes, in one place:
-  - INVALID from `structural_certificate` is computed on the UNCONSTRAINED
-    admissible set. Sound here (smaller family, same conclusion), just not as
-    sharp as it could be — which is why the constrained solution set gets its
-    own dark-subspace and Routh-Hurwitz certificates below.
+  - INVALID is NOT a proof. It means "no constraint-satisfying witness was
+    found", so an over-tight sampler and a genuinely impossible graph look
+    the same from outside. See linear_oracle's verdict note.
   - `admits_graph` (degree bounds and friends) excludes a graph by fiat. That
     verdict is reported with propagates=False, because it is NOT monotone in
     the subgraph order the search propagates along: a graph can violate a
@@ -83,11 +80,11 @@ from reservoir_engineering.topology_search import NO_COUPLING
 # VALID is re-exported rather than used directly: witnesses are stamped VALID
 # by linear_oracle._witness, which is the only place allowed to mint one.
 from reservoir_engineering.linear_oracle import (
-    VALID, INVALID, UNDECIDED, MARGIN_TOL_DEFAULT, RESIDUAL_RTOL_DEFAULT,
+    VALID, INVALID, MARGIN_TOL_DEFAULT, RESIDUAL_RTOL_DEFAULT,
     squeeze_symplectic, hamiltonian_basis, dissipation_basis,
     vacuum_dissipation, solve_stationarity, drift_matrix, diffusion_matrix,
-    normalised_margin, structural_certificate, factor_dissipator,
-    _assemble, _is_psd, _witness, _hurwitz_minors)
+    normalised_margin, factor_dissipator,
+    _assemble, _is_psd, _witness)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1148,121 +1145,10 @@ def constrained_attractivity_filter(
     return (best_m > margin_tol), best_z, best_m
 
 
-# constrained_dark_subspace(sol, ...) -> dimension of the subspace that is
-# dark at EVERY point of the CONSTRAINED solution set.
-#
-# linear_oracle.solution_set_dark_subspace computes the same object over the
-# unconstrained solution set. Recomputing it here is not redundancy: the
-# constrained solution set is smaller, so the intersection defining the dark
-# subspace is over fewer points and can only be LARGER. That means this
-# certificate fires on graphs the unconstrained one leaves undecided — which
-# is the entire reason a constrained search can prune harder than the free one.
-def constrained_dark_subspace(sol: Dict, h_basis, d_basis, dim: int,
-                              rtol: float = 1e-9) -> int:
-    N = sol['nullspace']
-    if N.size == 0 or N.shape[1] == 0:
-        return 0
-
-    def null_c(M, ref=None):
-        if M.size == 0:
-            return np.eye(M.shape[1] if M.ndim == 2 else 0, dtype=complex)
-        _, s, Vh = np.linalg.svd(M)
-        scale = float(s[0]) if (ref is None and s.size) else (ref or 0.0)
-        rank = int(np.sum(s > rtol * max(scale, 1e-300)))
-        return Vh[rank:].conj().T
-
-    def orth_c(X):
-        if X.size == 0:
-            return X
-        U, s, _ = np.linalg.svd(X, full_matrices=False)
-        rank = int(np.sum(s > rtol * max(float(s[0]), 1e-300)))
-        return U[:, :rank]
-
-    As, Ds = [], []
-    for k in range(N.shape[1]):
-        G, Y = _assemble(N[:, k], h_basis, d_basis, None, dim)
-        As.append(drift_matrix(G, Y).T.astype(complex))
-        Ds.append(diffusion_matrix(Y).astype(complex))
-
-    W = orth_c(null_c(np.vstack(Ds)))
-    for _ in range(dim + 2):
-        if W.shape[1] == 0:
-            break
-        cur = W
-        for M in As:
-            if cur.shape[1] == 0:
-                break
-            P = cur @ cur.conj().T
-            K = null_c((np.eye(dim) - P) @ M @ cur,
-                       ref=float(np.linalg.norm(M, 2)))
-            cur = orth_c(cur @ K) if K.shape[1] else np.zeros((dim, 0), dtype=complex)
-        if cur.shape[1] == W.shape[1]:
-            W = cur
-            break
-        W = cur
-    return int(W.shape[1])
-
-
-# constrained_routh_certificate(sol, ...): Move 3's universal half, run on the
-# constrained solution set.
-#
-# A(alpha) is linear in the coordinates of the solution set, so each Hurwitz
-# minor Delta_k(alpha) is a polynomial of degree <= n*k; sampling n*k+2 points
-# on a random line PROVES it vanishes there (fundamental theorem of algebra),
-# and repeating on independent lines extends it to the family. If any minor
-# vanishes identically, Routh-Hurwitz says no member is Hurwitz — a sound
-# INVALID for the constrained problem, and one that does not care whether the
-# dark direction rotates from point to point.
-def constrained_routh_certificate(sol: Dict, h_basis, d_basis, dim: int,
-                                  n_lines: int = 8, rtol: float = 1e-9,
-                                  seed: int = 0) -> Optional[Dict]:
-    N = sol['nullspace']
-    if N.size == 0 or N.shape[1] == 0:
-        return None
-    As = [drift_matrix(*_assemble(N[:, k], h_basis, d_basis, None, dim))
-          for k in range(N.shape[1])]
-    m, n = len(As), dim
-    rng = np.random.default_rng(seed)
-
-    def minors_at(alpha):
-        A = sum(alpha[j] * As[j] for j in range(m))
-        nrm = float(np.linalg.norm(A))
-        if nrm < 1e-300:
-            return None
-        return _hurwitz_minors(np.real(np.poly(A / nrm))[1:])
-
-    vanishing = [True] * n
-    worst = [0.0] * n
-    for _ in range(n_lines):
-        alpha0, u = rng.normal(0., 1., m), rng.normal(0., 1., m)
-        for k in range(1, n + 1):
-            if not vanishing[k - 1]:
-                continue
-            for t in np.linspace(-1.0, 1.0, n * k + 2):
-                mins = minors_at(alpha0 + t * u)
-                if mins is None:
-                    continue
-                val = abs(float(mins[k - 1]))
-                worst[k - 1] = max(worst[k - 1], val)
-                if val > rtol:
-                    vanishing[k - 1] = False
-                    break
-
-    for k in range(1, n + 1):
-        if vanishing[k - 1]:
-            return {'kind': 'constrained_hurwitz_minor_vanishes', 'minor': k,
-                    'max_abs_over_samples': worst[k - 1], 'lines': n_lines,
-                    'degree_bound': n * k, 'solution_dim': int(m),
-                    'note': ('Hurwitz minor Delta_{} vanishes identically on the '
-                             'CONSTRAINED solution set (checked on {} random lines '
-                             'at {} points each, above the degree bound {}), so by '
-                             'Routh-Hurwitz no admissible member is Hurwitz'
-                             .format(k, n_lines, n * k + 2, n * k))}
-    return None
 
 
 # constrained_decide(...): linear_oracle.decide, run inside the constrained
-# subspaces. Same three-valued contract, same witness verification, plus a
+# subspaces. Same two-valued contract, same witness verification, plus a
 # per-constraint report on whatever it returns.
 #
 # Pipeline, and where each verdict may come from:
@@ -1270,24 +1156,15 @@ def constrained_routh_certificate(sol: Dict, h_basis, d_basis, dim: int,
 #                   Returned as INVALID with propagates=False: sound for THIS
 #                   graph, but not monotone in the subgraph order, so the
 #                   search must not propagate it (see the module docstring).
-#   structural    — linear_oracle's certificates on the masked graph. Computed
-#                   over the UNCONSTRAINED admissible set, hence still sound
-#                   (a smaller family cannot contain a Hurwitz member if the
-#                   larger one does not) and unchanged in cost.
 #   trivial       — the constraints left no free generator at all, so the only
 #                   admissible point is (0, 0), whose A = 0 is not Hurwitz.
-#                   INVALID, and this is the verdict that makes an
-#                   over-constrained question answer itself rather than
-#                   silently returning UNDECIDED.
+#                   INVALID, and exactly (not merely heuristically) so: this
+#                   is how an over-constrained question answers itself.
 #   fast path     — fixed dissipator (vacuum, or whatever a reservoir
 #                   constraint pins) and solve for G alone. Skipped when the
 #                   pinned Upsilon violates a Y-constraint.
 #   joint path    — free Upsilon inside the constrained S_Upsilon.
-#   constrained
-#   certificates  — dark subspace and Routh-Hurwitz over the CONSTRAINED
-#                   solution set, both strictly sharper than their
-#                   unconstrained counterparts.
-#   gap max       — Move 1's ascent before conceding UNDECIDED.
+#   gap max       — Move 1's ascent before conceding INVALID.
 #
 # VALID is only ever returned with a fully verified witness (_witness checks
 # the residual, PSD, Hurwitz and the forward Lyapunov solve) that ALSO
@@ -1307,9 +1184,7 @@ def constrained_decide(
     seed: Optional[int] = None,
     rtol: float = RESIDUAL_RTOL_DEFAULT,
     margin_tol: float = MARGIN_TOL_DEFAULT,
-    include_solution_set: bool = True,
     gap_effort: int = 8,
-    use_routh: bool = True,
 ) -> Dict:
     cset = as_constraint_set(constraints)
     num_modes = len(node_types)
@@ -1328,11 +1203,11 @@ def constrained_decide(
         out['verdict'] = INVALID
         out['propagates'] = False
         out['path'] = 'constraint_gate'
-        out['certificate'] = {
-            'kind': 'excluded_by_constraint', 'constraint': offender.name,
-            'note': ('the graph itself is excluded by a combinatorial constraint; '
-                     'this verdict is NOT monotone in the subgraph order and must '
-                     'not be propagated by the search')}
+        out['reason'] = ('the graph itself is excluded by the combinatorial '
+                         'constraint {!r}; this verdict is NOT monotone in the '
+                         'subgraph order and must not be propagated by the '
+                         'search'.format(offender.name))
+        out['excluded_by'] = offender.name
         return out
 
     triu_eff, h_basis, d_basis = constrained_bases(
@@ -1342,24 +1217,13 @@ def constrained_decide(
     out['n_hamiltonian_dof'] = len(h_basis)
     out['n_dissipation_dof'] = len(d_basis)
 
-    # ---- structural certificates (unconstrained family; still sound) -------
-    cert = structural_certificate(triu_eff, V, target_mode_ids, node_types,
-                                  coupled_drains=coupled_drains,
-                                  include_solution_set=include_solution_set)
-    if cert is not None:
-        out['verdict'] = INVALID
-        out['certificate'] = cert
-        out['path'] = 'structural'
-        return out
-
     # ---- the constraints left nothing to solve with -----------------------
     if not h_basis and not d_basis:
         out['verdict'] = INVALID
         out['path'] = 'constraint_trivial'
-        out['certificate'] = {
-            'kind': 'empty_admissible_subspace',
-            'note': ('the constraints leave no admissible generator, so the only '
-                     'point is (G, Upsilon) = (0, 0), whose A = 0 is not Hurwitz')}
+        out['reason'] = ('the constraints leave no admissible generator, so the '
+                         'only point is (G, Upsilon) = (0, 0), whose A = 0 is not '
+                         'Hurwitz')
         return out
 
     # ---- fast path: pinned dissipator, solve for G alone -------------------
@@ -1383,9 +1247,9 @@ def constrained_decide(
         out['fast_path'] = 'skipped: pinned Upsilon violates a constraint'
 
     if not joint:
-        out['verdict'] = UNDECIDED
-        out['reason'] = ('no attractive solution with the pinned dissipator; '
-                         'joint=False so the graph itself was not decided')
+        out['verdict'] = INVALID
+        out['reason'] = ('no attractive solution with the pinned dissipator, and '
+                         'joint=False so no other dissipator was tried')
         return out
 
     # ---- joint path: free Upsilon inside the constrained subspace ----------
@@ -1400,10 +1264,8 @@ def constrained_decide(
     if sol['nullspace'].shape[1] == 0:
         out['verdict'] = INVALID
         out['path'] = 'constraint_trivial'
-        out['certificate'] = {
-            'kind': 'trivial_solution_set',
-            'note': ('the only constrained solution of (**) is (G, Upsilon) = '
-                     '(0, 0), whose A = 0 is not Hurwitz')}
+        out['reason'] = ('the only constrained solution of (**) is (G, Upsilon) = '
+                         '(0, 0), whose A = 0 is not Hurwitz')
         return out
 
     ok, z, margin = constrained_attractivity_filter(
@@ -1414,20 +1276,6 @@ def constrained_decide(
         out.update(_witness(G, Y, V, margin, 'constrained_joint'))
         out['constraint_report'] = cset.report(G, Y, ctx)
         return out
-
-    # ---- certificates over the CONSTRAINED solution set --------------------
-    if include_solution_set:
-        d_dark = constrained_dark_subspace(sol, h_basis, d_basis, dim)
-        if d_dark > 0:
-            out['verdict'] = INVALID
-            out['path'] = 'constrained_dark'
-            out['certificate'] = {
-                'kind': 'constrained_solution_set_dark', 'dim': d_dark,
-                'frame_dependent': True,
-                'note': ('every solution of (**) inside the constrained subspace '
-                         'shares a {}-dimensional dark subspace, so none of them '
-                         'is attractive'.format(d_dark))}
-            return out
 
     # ---- Move 1: gap maximisation before conceding -------------------------
     if gap_effort and gap_effort > 0:
@@ -1443,20 +1291,11 @@ def constrained_decide(
             out['constraint_report'] = cset.report(G, Y, ctx)
             return out
 
-    # ---- Move 3's universal half, on the constrained family ----------------
-    if use_routh:
-        rc = constrained_routh_certificate(sol, h_basis, d_basis, dim, seed=seed)
-        if rc is not None:
-            out['verdict'] = INVALID
-            out['path'] = 'constrained_routh'
-            out['certificate'] = rc
-            return out
-
-    out['verdict'] = UNDECIDED
+    out['verdict'] = INVALID
     out['best_margin'] = margin
     out['reason'] = ('constrained solutions exist but no strictly Hurwitz, PSD, '
-                     'constraint-satisfying member was found, and no certificate '
-                     'applies; raise gap_effort/num_samples')
+                     'constraint-satisfying member was found; raise '
+                     'gap_effort/num_samples if a scheme is expected here')
     return out
 
 
@@ -1510,9 +1349,9 @@ def format_scan(rows: List[Dict]) -> str:
 # The propagation rules survive every LINEAR constraint unchanged: they rest
 # on "shrinking the admissible subspace can only shrink the solution set",
 # and intersecting with a fixed subspace commutes with adding graph edges. A
-# combinatorial constraint (DegreeBound) breaks that, so its verdicts are
-# marked propagates=False and are converted to UNDECIDED here rather than
-# being allowed to seed the invalid set.
+# combinatorial constraint (DegreeBound) breaks that, so its verdicts carry
+# propagates=False and certified_search files them for that graph alone —
+# never into the invalid set that prunes other graphs.
 class ConstrainedSearch:
     def __init__(self, *args, constraints=None, **kwargs):
         from reservoir_engineering.certified_search import CertifiedSearch
@@ -1527,14 +1366,9 @@ class ConstrainedSearch:
         s = self._search
         key = tuple(int(x) for x in np.asarray(triu))
         if key not in s.cache:
-            kw = {k: v for k, v in s._oracle_kwargs.items() if k != 'use_sdp'}
-            out = constrained_decide(np.array(key), s.V, s.target_mode_ids,
-                                     s.node_types, constraints=self.cset, **kw)
-            if out.get('propagates') is False:
-                out = dict(out, verdict=UNDECIDED,
-                           reason='excluded by a non-monotone constraint; not '
-                                  'propagated (see solver_constraints)')
-            s.cache[key] = out
+            s.cache[key] = constrained_decide(
+                np.array(key), s.V, s.target_mode_ids, s.node_types,
+                constraints=self.cset, **s._oracle_kwargs)
         return s.cache[key]
 
     def __getattr__(self, item):
